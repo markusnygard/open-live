@@ -6,6 +6,7 @@ import type { ProductionDoc, ProductionSourceAssignment } from '../db/types.js';
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
+import { setTally } from '../services/tally.service.js';
 import { config } from '../config.js';
 
 // ---------------------------------------------------------------------------
@@ -138,12 +139,33 @@ async function runActivationFlow(
           return;
         }
 
+        // Derive initial tally from first two source assignments so the
+        // controller shows selected sources immediately on first connect.
+        const reloadedDoc = await getDb().get(productionId);
+        const sortedSources = [...reloadedDoc.sources].sort((a, b) =>
+          a.mixerInput.localeCompare(b.mixerInput),
+        );
+        const initialTally = {
+          pgm: sortedSources[0]?.mixerInput ?? null,
+          pvw: sortedSources[1]?.mixerInput ?? null,
+        };
+        setTally(productionId, initialTally);
+
+        // NOTE: Do NOT call strom.mixer.transition() here.
+        // Strom's trigger_transition API ignores from_input/to_input — it always
+        // transitions from the current PGM to the current PVW in its overlay state.
+        // Strom initialises with PGM=0 and PVW=1 by default, which already matches
+        // our initialTally (pgm=video_in_0, pvw=video_in_1). Calling transition()
+        // would fire an unintended TAKE that swaps PGM and PVW, making the
+        // multiview show the opposite of what the controller displays.
+
         await updateProductionDoc(productionId, {
           status: 'active',
           whepEndpoint,
+          tally: initialTally,
         });
 
-        log.info({ productionId, stromFlowId, whepEndpoint }, 'Production activated — flow playing');
+        log.info({ productionId, stromFlowId, whepEndpoint, initialTally }, 'Production activated — flow playing');
         return;
       }
 
@@ -267,6 +289,21 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.delete<{ Params: { id: string } }>('/api/v1/productions/:id', async (req, reply) => {
     try {
       const doc = await getDb().get(req.params.id);
+
+      // Cancel any in-progress activation loop
+      const abortCtrl = activationAbortControllers.get(doc._id);
+      if (abortCtrl) {
+        abortCtrl.abort();
+        activationAbortControllers.delete(doc._id);
+      }
+
+      // Stop and delete the Strom flow if one is running
+      if (doc.stromFlowId) {
+        const stromToken = await getStromToken(config.stromToken).catch(() => undefined);
+        const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
+        await deactivateStromFlow(doc.stromFlowId, strom).catch(() => undefined);
+      }
+
       await getDb().destroy(doc._id, doc._rev!);
       return reply.status(204).send();
     } catch {

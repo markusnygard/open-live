@@ -142,6 +142,7 @@ export interface Flow {
   name: string
   description?: string
   running?: boolean
+  ephemeral?: boolean
   elements?: FlowElement[]
   blocks?: BlockInstance[]
   links?: FlowLink[]

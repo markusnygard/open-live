@@ -9,10 +9,10 @@ import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
 
 type InboundMessage =
-  | { type: 'CUT'; sourceId: string }
-  | { type: 'TRANSITION'; sourceId: string; transitionType: string; durationMs?: number }
+  | { type: 'CUT'; mixerInput: string }
+  | { type: 'TRANSITION'; mixerInput: string; transitionType: string; durationMs?: number }
   | { type: 'TAKE' }
-  | { type: 'SET_PVW'; sourceId: string }
+  | { type: 'SET_PVW'; mixerInput: string }
   | { type: 'FTB'; active?: boolean; durationMs?: number }
   | { type: 'SET_OVL'; alpha: number }
   | { type: 'GO_LIVE' }
@@ -25,11 +25,6 @@ type InboundMessage =
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function getMixerInput(doc: ProductionDoc, sourceId: string | null): string | null {
-  if (!sourceId) return null;
-  return doc.sources.find((s) => s.sourceId === sourceId)?.mixerInput ?? null;
-}
 
 /**
  * Extracts the numeric index from a mixer pad name like "video_in_2" → 2.
@@ -53,26 +48,29 @@ async function makeStromClient(): Promise<StromClient> {
 
 async function stromTransition(
   doc: ProductionDoc,
-  fromSourceId: string | null,
-  toSourceId: string | null,
+  fromMixerInput: string | null,
+  toMixerInput: string | null,
   transitionType: StromTransitionType,
   durationMs?: number,
 ): Promise<void> {
   if (!doc.stromFlowId || !doc.mixerBlockId) return;
-  const toInputPad = getMixerInput(doc, toSourceId);
-  if (!toInputPad) {
-    console.warn('[controller] Strom transition skipped — no mixer input mapping for sourceId:', toSourceId);
+  if (!toMixerInput) {
+    console.warn('[controller] Strom transition skipped — no toMixerInput');
     return;
   }
-  const toIndex = padToIndex(toInputPad);
+  const toIndex = padToIndex(toMixerInput);
   if (toIndex === null) {
-    console.warn('[controller] Strom transition skipped — cannot parse index from pad:', toInputPad);
+    console.warn('[controller] Strom transition skipped — cannot parse index from pad:', toMixerInput);
     return;
   }
-  const fromInputPad = getMixerInput(doc, fromSourceId) ?? toInputPad;
-  const fromIndex = padToIndex(fromInputPad) ?? toIndex;
+  // Strom's trigger_transition API always transitions from its current PGM to
+  // its current PVW — it ignores from_input/to_input entirely (they are only
+  // fallbacks when no overlay state exists). We must therefore call selectPreview
+  // first to ensure Strom's PVW is the input we want to cut/transition to.
+  const fromIndex = fromMixerInput ? (padToIndex(fromMixerInput) ?? toIndex) : toIndex;
   try {
     const strom = await makeStromClient();
+    await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { input: toIndex });
     await strom.mixer.transition(doc.stromFlowId, doc.mixerBlockId, {
       from_input: fromIndex,
       to_input: toIndex,
@@ -113,22 +111,22 @@ async function handleMessage(
   switch (msg.type) {
     case 'CUT': {
       const tally = getTally(productionId);
-      const newTally = { pgm: msg.sourceId, pvw: tally.pgm };
+      const newTally = { pgm: msg.mixerInput, pvw: tally.pgm };
       setTally(productionId, newTally);
       const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
       await db.insert(updated);
       broadcast(productionId, { type: 'TALLY', ...newTally });
-      await stromTransition(doc, tally.pgm, msg.sourceId, 'cut');
+      await stromTransition(doc, tally.pgm, msg.mixerInput, 'cut');
       break;
     }
     case 'TRANSITION': {
       const tally = getTally(productionId);
-      const newTally = { pgm: msg.sourceId, pvw: tally.pgm };
+      const newTally = { pgm: msg.mixerInput, pvw: tally.pgm };
       setTally(productionId, newTally);
       const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
       await db.insert(updated);
       broadcast(productionId, { type: 'TALLY', ...newTally, transitionType: msg.transitionType, durationMs: msg.durationMs });
-      await stromTransition(doc, tally.pgm, msg.sourceId, toStromTransition(msg.transitionType), msg.durationMs);
+      await stromTransition(doc, tally.pgm, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
       break;
     }
     case 'TAKE': {
@@ -143,14 +141,13 @@ async function handleMessage(
     }
     case 'SET_PVW': {
       const tally = getTally(productionId);
-      const newTally = { pgm: tally.pgm, pvw: msg.sourceId };
+      const newTally = { pgm: tally.pgm, pvw: msg.mixerInput };
       setTally(productionId, newTally);
       const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
       await db.insert(updated);
       broadcast(productionId, { type: 'TALLY', ...newTally });
       if (doc.stromFlowId && doc.mixerBlockId) {
-        const inputPad = getMixerInput(doc, msg.sourceId);
-        const inputIndex = inputPad ? padToIndex(inputPad) : null;
+        const inputIndex = padToIndex(msg.mixerInput);
         if (inputIndex !== null) {
           try {
             const strom = await makeStromClient();
@@ -158,8 +155,6 @@ async function handleMessage(
           } catch (err) {
             console.warn('[controller] Strom selectPreview error:', err);
           }
-        } else {
-          console.warn('[controller] SET_PVW: no mixer input mapping for sourceId:', msg.sourceId);
         }
       }
       break;
@@ -241,22 +236,29 @@ async function handleMessage(
         const action = macro.actions[i];
         try {
           const currentDoc = await getDb().get(productionId);
+          // Macros reference sourceId; resolve to mixerInput for tally/Strom
+          const resolveInput = (sourceId: string) =>
+            currentDoc.sources.find((s) => s.sourceId === sourceId)?.mixerInput ?? null;
           if (action.type === 'CUT' && action.sourceId) {
+            const mixerInput = resolveInput(action.sourceId);
+            if (!mixerInput) break;
             const tally = getTally(productionId);
-            const newTally = { pgm: action.sourceId, pvw: tally.pgm };
+            const newTally = { pgm: mixerInput, pvw: tally.pgm };
             setTally(productionId, newTally);
             const updated: ProductionDoc = { ...currentDoc, tally: newTally, updatedAt: new Date().toISOString() };
             await getDb().insert(updated);
             broadcast(productionId, { type: 'TALLY', ...newTally });
-            await stromTransition(currentDoc, tally.pgm, action.sourceId, 'cut');
+            await stromTransition(currentDoc, tally.pgm, mixerInput, 'cut');
           } else if (action.type === 'TRANSITION' && action.sourceId) {
+            const mixerInput = resolveInput(action.sourceId);
+            if (!mixerInput) break;
             const tally = getTally(productionId);
-            const newTally = { pgm: action.sourceId, pvw: tally.pgm };
+            const newTally = { pgm: mixerInput, pvw: tally.pgm };
             setTally(productionId, newTally);
             const updated: ProductionDoc = { ...currentDoc, tally: newTally, updatedAt: new Date().toISOString() };
             await getDb().insert(updated);
             broadcast(productionId, { type: 'TALLY', ...newTally, transitionType: action.transitionType, durationMs: action.durationMs });
-            await stromTransition(currentDoc, tally.pgm, action.sourceId, toStromTransition(action.transitionType ?? 'cut'), action.durationMs);
+            await stromTransition(currentDoc, tally.pgm, mixerInput, toStromTransition(action.transitionType ?? 'cut'), action.durationMs);
           } else if (action.type === 'TAKE') {
             const tally = getTally(productionId);
             const newTally = { pgm: tally.pvw, pvw: tally.pgm };
@@ -317,6 +319,16 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       const { id } = req.params;
       subscribe(id, socket);
 
+      // Register message/close handlers immediately so no messages are dropped
+      // while we perform the async connect-time sync below.
+      socket.on('message', (raw: Buffer | string) => {
+        void handleMessage(id, socket, raw.toString());
+      });
+
+      socket.on('close', () => {
+        unsubscribe(id, socket);
+      });
+
       // Fetch production doc once for connect-time sync
       let connectDoc: ProductionDoc | null = null;
       try {
@@ -347,14 +359,6 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       } else if (connectDoc?.overlayAlpha !== undefined) {
         socket.send(JSON.stringify({ type: 'OVL_STATE', alpha: connectDoc.overlayAlpha }));
       }
-
-      socket.on('message', (raw: Buffer | string) => {
-        void handleMessage(id, socket, raw.toString());
-      });
-
-      socket.on('close', () => {
-        unsubscribe(id, socket);
-      });
     }
   );
 };

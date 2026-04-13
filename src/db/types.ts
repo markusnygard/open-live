@@ -31,7 +31,7 @@ export interface AudioElement {
 
 // --------------- Source types ---------------
 
-export type StreamType = 'srt' | 'whip';
+export type StreamType = 'srt' | 'efp' | 'whip' | 'test1' | 'test2';
 
 export type SourceStatus = 'active' | 'inactive';
 
@@ -80,17 +80,12 @@ export interface FlowBlock {
 
 /**
  * Describes a parametric input slot in a template.
- * When activating a production, the flow generator patches
- * the source address into the block identified by `blockId`,
- * at the property path `addressProperty`.
+ * id must match `mixerInput` in ProductionSourceAssignment (e.g. 'video_in_0').
+ * Input blocks are generated dynamically at activation time based on source type —
+ * no blockId or addressProperty needed.
  */
 export interface TemplateInputSlot {
-  /** Logical input name — must match `mixerInput` in ProductionSourceAssignment */
   id: string;
-  /** ID of the block in the flow's blocks[] array that receives this source */
-  blockId: string;
-  /** Property name on that block that takes the source address (e.g. 'uri', 'address') */
-  addressProperty: string;
 }
 
 export interface StromFlowTemplate {
@@ -106,6 +101,7 @@ export interface StromFlowTemplate {
    * without fighting the type system.
    */
   flow: {
+    ephemeral?: boolean;
     elements: Record<string, unknown>[];
     blocks: Record<string, unknown>[];
     links: Record<string, unknown>[];
