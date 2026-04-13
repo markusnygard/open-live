@@ -137,12 +137,18 @@ export interface BlockInstance {
   position: { x: number; y: number }
 }
 
+export interface FlowProperties {
+  ephemeral?: boolean
+  description?: string
+  clock_type?: string
+  auto_restart?: boolean
+}
+
 export interface Flow {
   id: string
   name: string
-  description?: string
   running?: boolean
-  ephemeral?: boolean
+  properties?: FlowProperties
   elements?: FlowElement[]
   blocks?: BlockInstance[]
   links?: FlowLink[]
@@ -165,6 +171,7 @@ export interface FlowListResponse {
 export type CreateFlowRequest = Flow
 
 export interface UpdateFlowPropertiesRequest {
+  ephemeral?: boolean
   description?: string
   clock_type?: string
 }

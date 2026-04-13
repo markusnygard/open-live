@@ -161,8 +161,10 @@ export async function activateStromFlow(
   const created = await strom.flows.create({
     id: randomUUID(),
     name: flowName,
-    description: `prod:${production._id}`,
-    ephemeral: true,
+    properties: {
+      description: `prod:${production._id}`,
+      ephemeral: true,
+    },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     elements: flow.elements as any,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
