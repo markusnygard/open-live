@@ -21,7 +21,6 @@ const DEFAULT_TEMPLATE: Omit<StromFlowTemplate, '_id' | '_rev'> = {
         block_definition_id: 'builtin.vision_mixer',
         name: 'Mixer',
         properties: {
-          compositor_preference: 'cpu',
           num_inputs: '10',
           multiview_resolution: '640x360',
           pgm_resolution: '640x360',
