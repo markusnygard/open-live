@@ -23,7 +23,7 @@ export async function buildServer() {
   });
 
   await fastify.register(cors, {
-    origin: config.corsOrigin.split(','),
+    origin: config.corsOrigin === '*' ? true : config.corsOrigin.split(','),
   });
 
   await fastify.register(websocket);
