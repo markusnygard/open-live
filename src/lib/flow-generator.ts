@@ -162,7 +162,7 @@ export async function activateStromFlow(
     id: randomUUID(),
     name: flowName,
     description: `prod:${production._id}`,
-    ...(flow.ephemeral !== undefined ? { ephemeral: flow.ephemeral } : {}),
+    ephemeral: true,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     elements: flow.elements as any,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

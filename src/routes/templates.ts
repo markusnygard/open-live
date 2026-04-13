@@ -36,6 +36,7 @@ const TemplateInput = z.object({
   name: z.string().min(1),
   description: z.string().optional(),
   flow: z.object({
+    ephemeral: z.boolean().optional(),
     elements: z.array(FlowElementSchema).default([]),
     blocks: z.array(FlowBlockSchema).default([]),
     links: z.array(FlowLinkSchema).default([]),
@@ -48,6 +49,7 @@ const TemplatePatch = z.object({
   name: z.string().min(1).optional(),
   description: z.string().optional(),
   flow: z.object({
+    ephemeral: z.boolean().optional(),
     elements: z.array(FlowElementSchema).optional(),
     blocks: z.array(FlowBlockSchema).optional(),
     links: z.array(FlowLinkSchema).optional(),
