@@ -8,7 +8,7 @@ export const config = {
   port: parseInt(process.env['PORT'] ?? '3000', 10),
   couchdbUrl: requireEnv('COUCHDB_URL'),
   couchdbName: process.env['COUCHDB_NAME'] ?? 'open-live',
-  corsOrigin: process.env['CORS_ORIGIN'] ?? '*',
+  corsOrigin: process.env['CORS_ORIGIN'] ?? 'http://localhost:5173',
   stromUrl: process.env['STROM_URL'] ?? 'http://localhost:7000',
   stromToken: process.env['STROM_TOKEN'] ?? undefined,
   /** 'osc' = PAT→SAT exchange via token.svc.prod.osaas.io (default for OSC-hosted Strom)
