@@ -22,8 +22,8 @@ const DEFAULT_TEMPLATE: Omit<StromFlowTemplate, '_id' | '_rev'> = {
         name: 'Mixer',
         properties: {
           num_inputs: '10',
-          multiview_resolution: '640x360',
-          pgm_resolution: '640x360',
+          multiview_resolution: '1920x1080',
+          pgm_resolution: '1920x1080',
         },
         position: { x: 750.0, y: 300.0 },
       },

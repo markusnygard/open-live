@@ -125,7 +125,7 @@ export async function activateStromFlow(
         id: fmtId,
         block_definition_id: 'builtin.videoformat',
         name: `Format V${padIndex}`,
-        properties: { resolution: '640x360' },
+        properties: { resolution: '1920x1080' },
         position: { x: 300, y: yPos },
       });
       flow.links.push(
