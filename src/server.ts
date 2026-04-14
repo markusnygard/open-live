@@ -28,6 +28,7 @@ export async function buildServer() {
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     maxAge: 86400,
+    strictPreflight: false,
   });
 
   await fastify.register(websocket);
