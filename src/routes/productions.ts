@@ -354,6 +354,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         ?? req.protocol
         ?? 'https'
       const host = (req.headers['x-forwarded-host'] as string | undefined)
+        ?? (req.headers.host as string | undefined)
         ?? req.hostname
       const publicBaseUrl = `${proto}://${host}`
 
