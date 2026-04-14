@@ -159,6 +159,8 @@ export interface ProductionDoc {
   stromFlowId?: string;
   /** WHEP multiview endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
   whepEndpoint?: string;
+  /** WHIP ingest endpoint URLs for each __whip__ source assignment — set on activate, cleared on deactivate */
+  whipEndpoints?: Array<{ mixerInput: string; url: string }>;
   pipeline: Pipeline;
   graphics: GraphicOverlay[];
   macros: Macro[];

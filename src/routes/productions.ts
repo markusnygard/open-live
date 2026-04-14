@@ -142,6 +142,16 @@ async function runActivationFlow(
         // Derive initial tally from first two source assignments so the
         // controller shows selected sources immediately on first connect.
         const reloadedDoc = await getDb().get(productionId);
+
+        // Compute WHIP ingest endpoints for __whip__ source assignments
+        const endpointSuffix = productionId.replace(/^prod-/, '').slice(0, 8);
+        const whipEndpoints = reloadedDoc.sources
+          .filter((s) => s.sourceId === 'Whip')
+          .map((s) => {
+            const padMatch = /video_in_(\d+)$/.exec(s.mixerInput);
+            const padIndex = padMatch ? parseInt(padMatch[1], 10) : 0;
+            return { mixerInput: s.mixerInput, url: `${config.stromUrl}/whip/whip-${padIndex}-${endpointSuffix}` };
+          });
         const sortedSources = [...reloadedDoc.sources].sort((a, b) =>
           a.mixerInput.localeCompare(b.mixerInput),
         );
@@ -162,6 +172,7 @@ async function runActivationFlow(
         await updateProductionDoc(productionId, {
           status: 'active',
           whepEndpoint,
+          whipEndpoints: whipEndpoints.length > 0 ? whipEndpoints : undefined,
           tally: initialTally,
         });
 
@@ -196,6 +207,7 @@ async function runActivationFlow(
       stromFlowId: undefined,
       mixerBlockId: undefined,
       whepEndpoint: undefined,
+      whipEndpoints: undefined,
     }).catch((resetErr) => {
       log.error({ resetErr, productionId }, 'Failed to reset production to inactive after activation failure');
     });
@@ -381,6 +393,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         stromFlowId: undefined,
         mixerBlockId: undefined,
         whepEndpoint: undefined,
+        whipEndpoints: undefined,
         updatedAt: new Date().toISOString(),
       };
       const response = await getDb().insert(updated);

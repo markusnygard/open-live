@@ -24,6 +24,7 @@ export async function activateStromFlow(
 
   // Virtual source IDs for test streams — no DB lookup needed
   const VIRTUAL_SOURCES: Record<string, Pick<SourceDoc, 'streamType' | 'address' | 'name'>> = {
+    'Whip': { streamType: 'whip', address: '', name: 'WHIP Input' },
     '__test1__': { streamType: 'test1', address: '', name: 'Test - Pinwheel' },
     '__test2__': { streamType: 'test2', address: '', name: 'Test - Colors' },
   };
