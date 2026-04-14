@@ -71,6 +71,7 @@ async function runActivationFlow(
   productionId: string,
   signal: AbortSignal,
   log: { error: (obj: unknown, msg: string) => void; info: (obj: unknown, msg: string) => void },
+  publicBaseUrl: string,
 ): Promise<void> {
   let stromFlowId: string | undefined;
   let mixerBlockId: string | undefined;
@@ -143,15 +144,14 @@ async function runActivationFlow(
         // controller shows selected sources immediately on first connect.
         const reloadedDoc = await getDb().get(productionId);
 
-        // Compute WHIP ingest endpoints for __whip__ source assignments
-        const endpointSuffix = productionId.replace(/^prod-/, '').slice(0, 8);
+        // Compute WHIP ingest endpoints for __whip__ source assignments.
+        // URLs point to the Open Live WHIP proxy — Strom URL stays internal.
         const whipEndpoints = reloadedDoc.sources
           .filter((s) => s.sourceId === 'Whip')
-          .map((s) => {
-            const padMatch = /video_in_(\d+)$/.exec(s.mixerInput);
-            const padIndex = padMatch ? parseInt(padMatch[1], 10) : 0;
-            return { mixerInput: s.mixerInput, url: `${config.stromUrl}/whip/whip-${padIndex}-${endpointSuffix}` };
-          });
+          .map((s) => ({
+            mixerInput: s.mixerInput,
+            url: `${publicBaseUrl}/api/v1/productions/${productionId}/whip/${encodeURIComponent(s.mixerInput)}`,
+          }));
         const sortedSources = [...reloadedDoc.sources].sort((a, b) =>
           a.mixerInput.localeCompare(b.mixerInput),
         );
@@ -349,8 +349,16 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       const abortController = new AbortController();
       activationAbortControllers.set(doc._id, abortController);
 
+      // Derive public base URL for WHIP endpoint construction
+      const proto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim()
+        ?? req.protocol
+        ?? 'https'
+      const host = (req.headers['x-forwarded-host'] as string | undefined)
+        ?? req.hostname
+      const publicBaseUrl = `${proto}://${host}`
+
       // Fire-and-forget — must never let a rejection escape to the global handler
-      void runActivationFlow(doc._id, abortController.signal, fastify.log).catch((err) => {
+      void runActivationFlow(doc._id, abortController.signal, fastify.log, publicBaseUrl).catch((err) => {
         fastify.log.error({ err, productionId: doc._id }, 'Unhandled error in runActivationFlow');
       });
 

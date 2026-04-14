@@ -13,6 +13,7 @@ import audioRoutes from './routes/audio.js';
 import statsRoutes from './routes/stats.js';
 import iceServersRoutes from './routes/ice-servers.js';
 import whepProxyRoutes from './routes/whep-proxy.js';
+import whipRoutes from './routes/whip.js';
 import controllerWs from './ws/controller.js';
 
 export async function buildServer() {
@@ -60,6 +61,7 @@ export async function buildServer() {
   await fastify.register(statsRoutes);
   await fastify.register(iceServersRoutes);
   await fastify.register(whepProxyRoutes);
+  await fastify.register(whipRoutes);
   await fastify.register(controllerWs);
 
   return fastify;
