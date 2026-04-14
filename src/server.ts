@@ -23,9 +23,7 @@ export async function buildServer() {
   });
 
   await fastify.register(cors, {
-    // Reflect the request origin — auth is token-based so origin restriction
-    // adds no security, but a hardcoded list breaks cross-domain deploys.
-    origin: true,
+    origin: config.corsOrigin.split(','),
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     maxAge: 86400,
