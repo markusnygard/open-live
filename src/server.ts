@@ -24,6 +24,9 @@ export async function buildServer() {
 
   await fastify.register(cors, {
     origin: config.corsOrigin.split(','),
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    maxAge: 86400,
   });
 
   await fastify.register(websocket);
