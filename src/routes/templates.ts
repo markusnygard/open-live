@@ -2,7 +2,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getTemplatesDb } from '../db/index.js';
-import type { StromFlowTemplate, AudioElement } from '../db/types.js';
+import type { StromFlowTemplate, AudioElement, TemplateProperty } from '../db/types.js';
 
 // Flow content uses open-ended schemas to accommodate the full Strom block
 // shape (block_definition_id, position, computed_external_pads, etc.) as
@@ -32,6 +32,14 @@ const AudioElementSchema = z.object({
   label: z.string().min(1),
 });
 
+const TemplatePropertySchema = z.object({
+  id: z.string().min(1),
+  label: z.string().min(1),
+  type: z.enum(['select', 'text', 'number']),
+  default: z.union([z.string(), z.number()]),
+  options: z.array(z.object({ value: z.string(), label: z.string() })).optional(),
+});
+
 const TemplateInput = z.object({
   name: z.string().min(1),
   description: z.string().optional(),
@@ -43,6 +51,7 @@ const TemplateInput = z.object({
   }),
   inputs: z.array(TemplateInputSlotSchema).default([]),
   audioElements: z.array(AudioElementSchema).default([]),
+  properties: z.array(TemplatePropertySchema).optional(),
 });
 
 const TemplatePatch = z.object({
@@ -56,6 +65,7 @@ const TemplatePatch = z.object({
   }).optional(),
   inputs: z.array(TemplateInputSlotSchema).optional(),
   audioElements: z.array(AudioElementSchema).optional(),
+  properties: z.array(TemplatePropertySchema).optional(),
 });
 
 function toApi(doc: StromFlowTemplate) {
@@ -83,6 +93,7 @@ const templatesRoutes: FastifyPluginAsync = async (fastify) => {
       flow: body.flow,
       inputs: body.inputs,
       audioElements: body.audioElements as AudioElement[],
+      ...(body.properties !== undefined && { properties: body.properties as TemplateProperty[] }),
       createdAt: now,
       updatedAt: now,
     };
@@ -119,6 +130,7 @@ const templatesRoutes: FastifyPluginAsync = async (fastify) => {
         }),
         ...(body.inputs !== undefined && { inputs: body.inputs }),
         ...(body.audioElements !== undefined && { audioElements: body.audioElements as AudioElement[] }),
+        ...(body.properties !== undefined && { properties: body.properties as TemplateProperty[] }),
         updatedAt: new Date().toISOString(),
       };
       const response = await getTemplatesDb().insert(updated as never);

@@ -22,35 +22,51 @@ async function reconcileProductionStatuses(
 ): Promise<void> {
   const db = getDb();
 
+  let liveFlows: import('./lib/strom.js').Flow[];
   let liveFlowIds: Set<string>;
   try {
     const stromToken = await getStromToken(config.stromToken);
     const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
-    const { flows } = await strom.flows.list();
-    liveFlowIds = new Set(flows.map((f) => f.id));
-    log.info({ count: liveFlowIds.size }, '[startup] Fetched Strom flows for reconciliation');
+    ({ flows: liveFlows } = await strom.flows.list());
+    liveFlowIds = new Set(liveFlows.map((f) => f.id));
+    log.debug({ count: liveFlowIds.size }, '[reconcile] Fetched Strom flows');
   } catch (err) {
-    log.warn({ err }, '[startup] Could not reach Strom — skipping reconciliation');
+    log.warn({ err }, '[reconcile] Could not reach Strom — skipping');
     return;
+  }
+
+  // Build a map from production ID → flow ID using the description tag every
+  // Open Live flow carries: properties.description = "prod:PROD_ID".
+  // This catches flows whose ID was never written back to the production doc.
+  const flowByProdId = new Map<string, string>();
+  for (const flow of liveFlows) {
+    const desc = (flow.properties as { description?: string } | undefined)?.description ?? '';
+    const match = /^prod:(.+)$/.exec(desc);
+    if (match) flowByProdId.set(match[1], flow.id);
   }
 
   const result = await db.find({ selector: { type: 'production' } });
   for (const doc of result.docs as ProductionDoc[]) {
-    const flowAlive = doc.stromFlowId != null && liveFlowIds.has(doc.stromFlowId);
+    // A flow is alive if the stored stromFlowId exists in Strom, OR if a flow
+    // tagged with this production's ID is present (covers the case where the
+    // stromFlowId write failed after the flow was created).
+    const liveFlowId = (doc.stromFlowId && liveFlowIds.has(doc.stromFlowId))
+      ? doc.stromFlowId
+      : (flowByProdId.get(doc._id) ?? null);
 
-    if (flowAlive && doc.status !== 'active') {
+    if (liveFlowId && (doc.status !== 'active' || doc.stromFlowId !== liveFlowId)) {
       try {
-        await db.insert({ ...doc, status: 'active', updatedAt: new Date().toISOString() } as ProductionDoc);
-        log.info({ productionId: doc._id, stromFlowId: doc.stromFlowId }, '[startup] Restored production to active');
+        await db.insert({ ...doc, stromFlowId: liveFlowId, status: 'active', updatedAt: new Date().toISOString() } as ProductionDoc);
+        log.info({ productionId: doc._id, stromFlowId: liveFlowId }, '[reconcile] Restored production to active');
       } catch (err) {
-        log.error({ err, productionId: doc._id }, '[startup] Failed to restore production to active');
+        log.error({ err, productionId: doc._id }, '[reconcile] Failed to restore production to active');
       }
-    } else if (!flowAlive && (doc.status === 'active' || doc.status === 'activating')) {
+    } else if (!liveFlowId && (doc.status === 'active' || doc.status === 'activating')) {
       try {
-        await db.insert({ ...doc, status: 'inactive', updatedAt: new Date().toISOString() } as ProductionDoc);
-        log.info({ productionId: doc._id }, '[startup] Reset stale production to inactive');
+        await db.insert({ ...doc, status: 'inactive', stromFlowId: undefined, updatedAt: new Date().toISOString() } as ProductionDoc);
+        log.info({ productionId: doc._id }, '[reconcile] Reset stale production to inactive');
       } catch (err) {
-        log.error({ err, productionId: doc._id }, '[startup] Failed to reset production to inactive');
+        log.error({ err, productionId: doc._id }, '[reconcile] Failed to reset production to inactive');
       }
     }
   }
@@ -62,6 +78,11 @@ async function main() {
 
   const app = await buildServer();
   await reconcileProductionStatuses(app.log);
+
+  // Re-run reconciliation every 30 seconds so a flow that started after the
+  // activation timeout is automatically detected without requiring a restart.
+  setInterval(() => { void reconcileProductionStatuses(app.log); }, 30_000);
+
   await app.listen({ port: config.port, host: '0.0.0.0' });
 }
 

@@ -1,0 +1,26 @@
+import type { FastifyPluginAsync } from 'fastify';
+import { isDbReady } from '../db/index.js';
+import { StromClient } from '../lib/strom.js';
+import { getStromToken } from '../lib/strom-token.js';
+import { config } from '../config.js';
+
+const statusRoutes: FastifyPluginAsync = async (fastify) => {
+  fastify.get('/api/v1/status', async (_req, reply) => {
+    const [db, strom] = await Promise.all([
+      isDbReady(),
+      (async () => {
+        try {
+          const token = await getStromToken(config.stromToken);
+          const client = new StromClient({ baseUrl: config.stromUrl, token: token ?? undefined });
+          await client.system.version();
+          return true;
+        } catch {
+          return false;
+        }
+      })(),
+    ]);
+    return reply.send({ db, strom });
+  });
+};
+
+export default statusRoutes;

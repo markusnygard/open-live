@@ -1,8 +1,8 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
-import { getDb } from '../db/index.js';
-import type { ProductionDoc, ProductionSourceAssignment } from '../db/types.js';
+import { getDb, getOutputsDb, getTemplatesDb } from '../db/index.js';
+import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc } from '../db/types.js';
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
@@ -75,21 +75,37 @@ async function runActivationFlow(
 ): Promise<void> {
   let stromFlowId: string | undefined;
   let mixerBlockId: string | undefined;
+  let whepOutputEntries: Array<{ outputId: string; endpointId: string }> | undefined;
 
   try {
     // Load the current production doc
     const doc = await getDb().get(productionId);
+
+    // Load assigned output docs; '__whep__' is a virtual output (no DB entry)
+    const outputDocs: OutputDoc[] = [];
+    for (const a of doc.outputAssignments ?? []) {
+      if (a.outputId === '__whep__') {
+        outputDocs.push({ _id: '__whep__', type: 'output', outputType: 'whep', name: 'WHEP Output', createdAt: '', updatedAt: '' });
+        continue;
+      }
+      try {
+        const od = await getOutputsDb().get(a.outputId) as unknown as OutputDoc;
+        outputDocs.push(od);
+      } catch {
+        // skip outputs that no longer exist
+      }
+    }
 
     const stromToken = await getStromToken(config.stromToken);
     const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
 
     // Step 1: Start the Strom flow
     if (signal.aborted) return;
-    stromFlowId = await activateStromFlow(doc, strom);
+    ({ flowId: stromFlowId, whepOutputEntries } = await activateStromFlow(doc, strom, config.stromUrl, outputDocs.length > 0 ? outputDocs : undefined));
 
-    // Resolve mixerBlockId from template
+    // Resolve mixerBlockId from template (templates live in the templates DB, not the main DB)
     if (doc.templateId) {
-      const tmpl = await getDb().get(doc.templateId).catch(() => null);
+      const tmpl = await getTemplatesDb().get(doc.templateId).catch(() => null);
       if (tmpl) {
         const mixerBlock = (tmpl as unknown as { flow?: { blocks?: Array<Record<string, unknown>> } })
           .flow?.blocks?.find((b) => (b['block_definition_id'] as string | undefined)?.includes('vision_mixer'));
@@ -169,10 +185,23 @@ async function runActivationFlow(
         // would fire an unintended TAKE that swaps PGM and PVW, making the
         // multiview show the opposite of what the controller displays.
 
+        // Build WHEP output URLs from endpoint IDs. Strom serves each WHEP
+        // output at /whep/{endpoint_id} — construct the URL directly rather
+        // than calling listStreams() whose response type lacks a url field.
+        const whepOutputUrls: Array<{ outputId: string; url: string }> | undefined =
+          whepOutputEntries && whepOutputEntries.length > 0
+            ? whepOutputEntries.map(({ outputId, endpointId }) => ({
+                outputId,
+                url: `${config.stromUrl}/whep/${endpointId}`,
+              }))
+            : undefined;
+
         await updateProductionDoc(productionId, {
           status: 'active',
           whepEndpoint,
           whipEndpoints: whipEndpoints.length > 0 ? whipEndpoints : undefined,
+          srtOutputUri: undefined,
+          whepOutputUrls: whepOutputUrls && whepOutputUrls.length > 0 ? whepOutputUrls : undefined,
           tally: initialTally,
         });
 
@@ -227,11 +256,21 @@ const ProductionInput = z.object({
 const ProductionPatch = z.object({
   name: z.string().min(1).optional(),
   templateId: z.string().nullable().optional(),
+  values: z.record(z.union([z.string(), z.number()])).optional(),
 });
 
 const SourceAssignmentInput = z.object({
   sourceId: z.string().min(1),
   mixerInput: z.string().min(1),
+});
+
+const GraphicAssignmentInput = z.object({
+  graphicId: z.string().min(1),
+  dskInput: z.string().min(1),
+});
+
+const OutputAssignmentInput = z.object({
+  outputId: z.string().min(1),
 });
 
 // ---------------------------------------------------------------------------
@@ -285,9 +324,8 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       const updated: ProductionDoc = {
         ...doc,
         ...(body.name !== undefined && { name: body.name }),
-        ...(body.templateId !== undefined && {
-          templateId: body.templateId ?? undefined,
-        }),
+        ...(body.templateId !== undefined && { templateId: body.templateId ?? undefined }),
+        ...(body.values !== undefined && { values: body.values }),
         updatedAt: new Date().toISOString(),
       };
       const response = await getDb().insert(updated);
@@ -403,6 +441,8 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         mixerBlockId: undefined,
         whepEndpoint: undefined,
         whipEndpoints: undefined,
+        srtOutputUri: undefined,
+        whepOutputUrls: undefined,
         updatedAt: new Date().toISOString(),
       };
       const response = await getDb().insert(updated);
@@ -444,6 +484,83 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         const updated: ProductionDoc = {
           ...doc,
           sources: doc.sources.filter((s) => s.mixerInput !== req.params.mixerInput),
+          updatedAt: new Date().toISOString(),
+        };
+        await getDb().insert(updated);
+        return reply.status(204).send();
+      } catch {
+        return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+      }
+    }
+  );
+
+  // Assign a graphic to a DSK pad
+  fastify.post<{ Params: { id: string } }>('/api/v1/productions/:id/graphics', async (req, reply) => {
+    const body = GraphicAssignmentInput.parse(req.body);
+    try {
+      const doc = await getDb().get(req.params.id);
+      const existing = (doc.graphicAssignments ?? []).findIndex((g) => g.dskInput === body.dskInput);
+      const assignment: ProductionGraphicAssignment = { graphicId: body.graphicId, dskInput: body.dskInput };
+      const graphicAssignments = existing !== -1
+        ? (doc.graphicAssignments ?? []).map((g, i) => (i === existing ? assignment : g))
+        : [...(doc.graphicAssignments ?? []), assignment];
+      const updated: ProductionDoc = { ...doc, graphicAssignments, updatedAt: new Date().toISOString() };
+      const response = await getDb().insert(updated);
+      return reply.status(201).send({ ...assignment, _rev: response.rev });
+    } catch {
+      return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+    }
+  });
+
+  // Remove a graphic assignment by DSK pad
+  fastify.delete<{ Params: { id: string; dskInput: string } }>(
+    '/api/v1/productions/:id/graphics/:dskInput',
+    async (req, reply) => {
+      try {
+        const doc = await getDb().get(req.params.id);
+        const exists = (doc.graphicAssignments ?? []).some((g) => g.dskInput === req.params.dskInput);
+        if (!exists) return reply.status(404).send({ error: 'Graphic assignment not found', statusCode: 404 });
+        const updated: ProductionDoc = {
+          ...doc,
+          graphicAssignments: (doc.graphicAssignments ?? []).filter((g) => g.dskInput !== req.params.dskInput),
+          updatedAt: new Date().toISOString(),
+        };
+        await getDb().insert(updated);
+        return reply.status(204).send();
+      } catch {
+        return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+      }
+    }
+  );
+
+  // Assign an output to a production
+  fastify.post<{ Params: { id: string } }>('/api/v1/productions/:id/outputs', async (req, reply) => {
+    const body = OutputAssignmentInput.parse(req.body);
+    try {
+      const doc = await getDb().get(req.params.id);
+      const already = (doc.outputAssignments ?? []).some((o) => o.outputId === body.outputId);
+      if (already) return reply.status(409).send({ error: 'Output already assigned', statusCode: 409 });
+      const assignment: ProductionOutputAssignment = { outputId: body.outputId };
+      const outputAssignments = [...(doc.outputAssignments ?? []), assignment];
+      const updated: ProductionDoc = { ...doc, outputAssignments, updatedAt: new Date().toISOString() };
+      const response = await getDb().insert(updated);
+      return reply.status(201).send({ ...assignment, _rev: response.rev });
+    } catch {
+      return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+    }
+  });
+
+  // Remove an output assignment
+  fastify.delete<{ Params: { id: string; outputId: string } }>(
+    '/api/v1/productions/:id/outputs/:outputId',
+    async (req, reply) => {
+      try {
+        const doc = await getDb().get(req.params.id);
+        const exists = (doc.outputAssignments ?? []).some((o) => o.outputId === req.params.outputId);
+        if (!exists) return reply.status(404).send({ error: 'Output assignment not found', statusCode: 404 });
+        const updated: ProductionDoc = {
+          ...doc,
+          outputAssignments: (doc.outputAssignments ?? []).filter((o) => o.outputId !== req.params.outputId),
           updatedAt: new Date().toISOString(),
         };
         await getDb().insert(updated);

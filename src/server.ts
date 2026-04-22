@@ -4,6 +4,7 @@ import websocket from '@fastify/websocket';
 import { ZodError } from 'zod';
 import { config } from './config.js';
 import healthRoutes from './routes/health.js';
+import statusRoutes from './routes/status.js';
 import productionsRoutes from './routes/productions.js';
 import sourcesRoutes from './routes/sources.js';
 import templatesRoutes from './routes/templates.js';
@@ -14,6 +15,9 @@ import statsRoutes from './routes/stats.js';
 import iceServersRoutes from './routes/ice-servers.js';
 import whepProxyRoutes from './routes/whep-proxy.js';
 import whipRoutes from './routes/whip.js';
+import productionConfigsRoutes from './routes/production-configs.js';
+import graphicsRoutes from './routes/graphics.js';
+import outputsRoutes from './routes/outputs.js';
 import controllerWs from './ws/controller.js';
 
 export async function buildServer() {
@@ -21,6 +25,7 @@ export async function buildServer() {
     logger: {
       level: config.logLevel,
     },
+    disableRequestLogging: true,
   });
 
   await fastify.register(cors, {
@@ -53,6 +58,7 @@ export async function buildServer() {
   });
 
   await fastify.register(healthRoutes);
+  await fastify.register(statusRoutes);
   await fastify.register(productionsRoutes);
   await fastify.register(sourcesRoutes);
   await fastify.register(templatesRoutes);
@@ -63,6 +69,9 @@ export async function buildServer() {
   await fastify.register(iceServersRoutes);
   await fastify.register(whepProxyRoutes);
   await fastify.register(whipRoutes);
+  await fastify.register(productionConfigsRoutes);
+  await fastify.register(graphicsRoutes);
+  await fastify.register(outputsRoutes);
   await fastify.register(controllerWs);
 
   return fastify;

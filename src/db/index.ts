@@ -1,6 +1,6 @@
 import Nano from 'nano';
 import { config } from '../config.js';
-import type { ProductionDoc, SourceDoc, StromFlowTemplate } from './types.js';
+import type { ProductionDoc, SourceDoc, StromFlowTemplate, ProductionConfigDoc, GraphicDoc, OutputDoc } from './types.js';
 
 let db: Nano.DocumentScope<ProductionDoc>;
 
@@ -14,6 +14,18 @@ export function getSourcesDb(): Nano.DocumentScope<SourceDoc> {
 
 export function getTemplatesDb(): Nano.DocumentScope<StromFlowTemplate> {
   return db as unknown as Nano.DocumentScope<StromFlowTemplate>;
+}
+
+export function getConfigsDb(): Nano.DocumentScope<ProductionConfigDoc> {
+  return db as unknown as Nano.DocumentScope<ProductionConfigDoc>;
+}
+
+export function getGraphicsDb(): Nano.DocumentScope<GraphicDoc> {
+  return db as unknown as Nano.DocumentScope<GraphicDoc>;
+}
+
+export function getOutputsDb(): Nano.DocumentScope<OutputDoc> {
+  return db as unknown as Nano.DocumentScope<OutputDoc>;
 }
 
 export async function connectDb(): Promise<void> {

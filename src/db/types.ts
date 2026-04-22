@@ -31,7 +31,7 @@ export interface AudioElement {
 
 // --------------- Source types ---------------
 
-export type StreamType = 'srt' | 'efp' | 'whip' | 'test1' | 'test2';
+export type StreamType = 'srt' | 'efp' | 'whip' | 'test1' | 'test2' | 'html';
 
 export type SourceStatus = 'active' | 'inactive';
 
@@ -44,11 +44,68 @@ export interface SourceDoc {
   streamType: StreamType;
   status: SourceStatus;
   liveCamera?: boolean;
+  /** SRT receiver buffer latency in ms. Only applies to srt/efp stream types. Default 125. */
+  latency?: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// --------------- Graphic types ---------------
+
+export interface GraphicDoc {
+  _id: string;        // "gfx-{uuid}"
+  _rev?: string;
+  type: 'graphic';
+  name: string;
+  url: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// --------------- Output types ---------------
+
+export type OutputType = 'mpegtssrt' | 'efpsrt' | 'whep';
+
+export interface OutputDoc {
+  _id: string;           // "output-{uuid}"
+  _rev?: string;
+  type: 'output';
+  name: string;
+  outputType: OutputType;
+  url?: string;          // SRT URI for mpegtssrt/efpsrt; undefined for whep
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProductionOutputAssignment {
+  outputId: string;      // references OutputDoc._id
+}
+
+// --------------- Production config types ---------------
+
+export interface ProductionConfigDoc {
+  _id: string;         // "cfg-<uuid>"
+  _rev?: string;
+  type: 'production-config';
+  name: string;
+  templateId: string;
+  values: Record<string, string | number>;
   createdAt: string;
   updatedAt: string;
 }
 
 // --------------- Template types ---------------
+
+export interface TemplateProperty {
+  id: string;
+  label: string;
+  type: 'select' | 'text' | 'number';
+  default: string | number;
+  options?: Array<{ value: string; label: string }>;
+  min?: number;
+  max?: number;
+  unit?: string;
+}
 
 export interface FlowElement {
   id: string;
@@ -109,6 +166,8 @@ export interface StromFlowTemplate {
   /** Defines which blocks are parametric source inputs */
   inputs: TemplateInputSlot[];
   audioElements: AudioElement[];
+  /** Configurable properties shown when creating a production from this template */
+  properties?: TemplateProperty[];
   createdAt: string;
   updatedAt: string;
 }
@@ -120,7 +179,15 @@ export interface StromFlowTemplate {
  */
 export interface ProductionSourceAssignment {
   sourceId: string;   // references SourceDoc._id
-  mixerInput: string; // references TemplateInputSlot.id
+  mixerInput: string; // references TemplateInputSlot.id (e.g. 'video_in_0')
+}
+
+/**
+ * Maps a graphic from the graphics catalogue to a DSK pad on the vision mixer.
+ */
+export interface ProductionGraphicAssignment {
+  graphicId: string;  // references GraphicDoc._id
+  dskInput: string;   // DSK pad name (e.g. 'dsk_in_0', 'dsk_in_1')
 }
 
 export type PipelineStatus = 'stopped' | 'running';
@@ -153,6 +220,12 @@ export interface ProductionDoc {
   status: ProductionStatus;
   /** Source-to-mixer-input assignments for this production */
   sources: ProductionSourceAssignment[];
+  /** Output assignments for this production */
+  outputAssignments?: ProductionOutputAssignment[];
+  /** WHEP output URLs — set when flow reaches 'playing', cleared on deactivate */
+  whepOutputUrls?: Array<{ outputId: string; url: string }>;
+  /** Graphic-to-DSK-pad assignments for this production */
+  graphicAssignments?: ProductionGraphicAssignment[];
   /** ID of the StromFlowTemplate to use when activating */
   templateId?: string;
   /** ID of the running Strom flow (set on activate, cleared on deactivate) */
@@ -161,12 +234,18 @@ export interface ProductionDoc {
   whepEndpoint?: string;
   /** WHIP ingest endpoint URLs for each __whip__ source assignment — set on activate, cleared on deactivate */
   whipEndpoints?: Array<{ mixerInput: string; url: string }>;
+  /** SRT program output URI (listener) — set on activate, cleared on deactivate */
+  srtOutputUri?: string;
+  /** Template property values chosen at production creation, keyed by property id */
+  values?: Record<string, string | number>;
   pipeline: Pipeline;
   graphics: GraphicOverlay[];
   macros: Macro[];
   tally: Tally;
   overlayAlpha?: number;
   mixerBlockId?: string;
+  /** DSK layer visibility state, keyed by 0-based layer index */
+  dskLayers?: Record<number, boolean>;
   createdAt: string;
   updatedAt: string;
 }

@@ -1,9 +1,10 @@
 import type { FastifyPluginAsync } from 'fastify';
 import type { WebSocket } from '@fastify/websocket';
-import { getDb } from '../db/index.js';
+import { getDb, getSourcesDb } from '../db/index.js';
 import { updateProductionDoc } from '../routes/productions.js';
 import type { ProductionDoc } from '../db/types.js';
 import { getTally, setTally, subscribe, unsubscribe, broadcast } from '../services/tally.service.js';
+import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
 import { StromClient, type TransitionType as StromTransitionType } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
@@ -20,7 +21,8 @@ type InboundMessage =
   | { type: 'GRAPHIC_ON'; overlayId: string }
   | { type: 'GRAPHIC_OFF'; overlayId: string }
   | { type: 'DSK_TOGGLE'; layer: number; visible?: boolean }
-  | { type: 'MACRO_EXEC'; macroId: string };
+  | { type: 'MACRO_EXEC'; macroId: string }
+  | { type: 'AUDIO_SET'; elementId: string; property: 'volume' | 'mute'; value: unknown };
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -83,13 +85,60 @@ async function stromTransition(
 }
 
 // ---------------------------------------------------------------------------
+// Audio follow
+// ---------------------------------------------------------------------------
+
+/**
+ * Routes only the PGM source to the main mix bus by setting each channel's
+ * to_main_vol routing element to 1.0 (PGM) or 0.0 (everything else).
+ * This leaves the volume/mute element untouched so meters and faders continue
+ * to function normally on all sources.
+ */
+async function applyAudioFollow(
+  doc: ProductionDoc,
+  newPgmMixerInput: string | null,
+  stromFlowId: string,
+  audioBlockId: string,
+  strom: StromClient,
+): Promise<void> {
+  const sorted = [...doc.sources].sort((a, b) => a.mixerInput.localeCompare(b.mixerInput));
+  const sourcesDb = getSourcesDb();
+
+  let audioIdx = 0;
+  for (const assignment of sorted) {
+    let streamType: string | undefined;
+    try {
+      const src = await sourcesDb.get(assignment.sourceId);
+      streamType = src.streamType;
+    } catch {
+      continue; // virtual source — no audio channel
+    }
+    if (streamType === 'html' || streamType === 'whip') continue;
+
+    const chIdx = ++audioIdx;
+    const routeLevel = assignment.mixerInput === newPgmMixerInput ? 1.0 : 0.0;
+    const elemId = `${audioBlockId}:to_main_vol_${chIdx - 1}`;
+    try {
+      await strom.properties.updateElement(stromFlowId, elemId, {
+        property_name: 'volume',
+        value: routeLevel,
+      });
+      console.log(`[controller] audio follow ch${chIdx} ${elemId} → ${routeLevel}`);
+    } catch (err) {
+      console.warn(`[controller] audio follow ch${chIdx} ${elemId} error:`, err);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Message handler
 // ---------------------------------------------------------------------------
 
 async function handleMessage(
   productionId: string,
   ws: WebSocket,
-  raw: string
+  raw: string,
+  ctx: { audioBlockId?: string },
 ): Promise<void> {
   let msg: InboundMessage;
   try {
@@ -117,6 +166,9 @@ async function handleMessage(
       await db.insert(updated);
       broadcast(productionId, { type: 'TALLY', ...newTally });
       await stromTransition(doc, tally.pgm, msg.mixerInput, 'cut');
+      if (doc.stromFlowId && ctx.audioBlockId) {
+        void applyAudioFollow(doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient());
+      }
       break;
     }
     case 'TRANSITION': {
@@ -127,6 +179,9 @@ async function handleMessage(
       await db.insert(updated);
       broadcast(productionId, { type: 'TALLY', ...newTally, transitionType: msg.transitionType, durationMs: msg.durationMs });
       await stromTransition(doc, tally.pgm, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
+      if (doc.stromFlowId && ctx.audioBlockId) {
+        void applyAudioFollow(doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient());
+      }
       break;
     }
     case 'TAKE': {
@@ -137,6 +192,9 @@ async function handleMessage(
       await db.insert(updated);
       broadcast(productionId, { type: 'TALLY', ...newTally });
       await stromTransition(doc, tally.pgm, tally.pvw, 'cut');
+      if (doc.stromFlowId && ctx.audioBlockId) {
+        void applyAudioFollow(doc, tally.pvw, doc.stromFlowId, ctx.audioBlockId, await makeStromClient());
+      }
       break;
     }
     case 'SET_PVW': {
@@ -217,10 +275,14 @@ async function handleMessage(
       const stromToken = await getStromToken(config.stromToken).catch(() => undefined);
       const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
       const result = await strom.mixer.toggleDsk(doc.stromFlowId, doc.mixerBlockId, {
-        layer: msg.layer,
-        visible: msg.visible,
+        dsk: msg.layer + 1,
+        enabled: msg.visible ?? true,
       });
-      broadcast(productionId, { type: 'DSK_STATE', layer: result.layer, visible: result.visible });
+      const layer0 = result.dsk - 1;
+      await updateProductionDoc(productionId, {
+        dskLayers: { ...(doc.dskLayers ?? {}), [layer0]: result.enabled },
+      });
+      broadcast(productionId, { type: 'DSK_STATE', layer: layer0, visible: result.enabled });
       break;
     }
     case 'MACRO_EXEC': {
@@ -288,8 +350,8 @@ async function handleMessage(
               throw new Error('Pipeline not active or mixer block not resolved');
             }
             await strom.mixer.toggleDsk(currentDoc.stromFlowId, currentDoc.mixerBlockId, {
-              layer: action.layer ?? 0,
-              visible: action.visible,
+              dsk: (action.layer ?? 0) + 1,
+              enabled: action.visible ?? true,
             });
           }
         } catch (err) {
@@ -302,6 +364,42 @@ async function handleMessage(
         ws.send(JSON.stringify({ type: 'MACRO_ERROR', macroId: msg.macroId, failedActionIndex: failedAt, error: failError }));
       } else {
         broadcast(productionId, { type: 'MACRO_EXECUTED', macroId: msg.macroId });
+      }
+      break;
+    }
+    case 'AUDIO_SET': {
+      if (!doc.stromFlowId) break;
+      try {
+        const strom = await makeStromClient();
+        // Resolve audio block ID from cache; fetch flow only if not yet known
+        if (!ctx.audioBlockId) {
+          const { flow } = await strom.flows.get(doc.stromFlowId);
+          const audioBlock = (flow.blocks ?? []).find((b) => b.block_definition_id === 'builtin.mixer');
+          if (audioBlock) ctx.audioBlockId = audioBlock.id;
+        }
+        if (!ctx.audioBlockId) {
+          console.warn('[controller] AUDIO_SET: builtin.mixer block not found');
+          break;
+        }
+        let elementId: string;
+        let property: string;
+        if (msg.elementId === 'main') {
+          elementId = `${ctx.audioBlockId}:main_volume`;
+          property = msg.property === 'volume' ? 'volume' : 'mute';
+        } else {
+          const chMatch = /^ch(\d+)$/.exec(msg.elementId);
+          if (!chMatch) {
+            ws.send(JSON.stringify({ type: 'ERROR', error: 'Invalid audio channel id' }));
+            break;
+          }
+          const ch = parseInt(chMatch[1], 10);
+          elementId = `${ctx.audioBlockId}:volume_${ch - 1}`;
+          property = msg.property === 'volume' ? 'volume' : 'mute';
+        }
+        await strom.properties.updateElement(doc.stromFlowId, elementId, { property_name: property, value: msg.value });
+        broadcast(productionId, { type: 'AUDIO_STATE', elementId: msg.elementId, property: msg.property, value: msg.value });
+      } catch (err) {
+        console.warn('[controller] Strom audio update error:', err);
       }
       break;
     }
@@ -319,14 +417,19 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       const { id } = req.params;
       subscribe(id, socket);
 
+      // Per-connection context — mutable so the audio block ID can be populated
+      // at connect time and reused on every subsequent AUDIO_SET without a flow fetch.
+      const ctx: { audioBlockId?: string } = {};
+
       // Register message/close handlers immediately so no messages are dropped
       // while we perform the async connect-time sync below.
       socket.on('message', (raw: Buffer | string) => {
-        void handleMessage(id, socket, raw.toString());
+        void handleMessage(id, socket, raw.toString(), ctx);
       });
 
       socket.on('close', () => {
         unsubscribe(id, socket);
+        stopMeterRelay(id);
       });
 
       // Fetch production doc once for connect-time sync
@@ -358,6 +461,59 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
         }
       } else if (connectDoc?.overlayAlpha !== undefined) {
         socket.send(JSON.stringify({ type: 'OVL_STATE', alpha: connectDoc.overlayAlpha }));
+      }
+
+      // Send persisted DSK layer states so the controller reflects the live pipeline
+      if (connectDoc?.dskLayers) {
+        for (const [layer, visible] of Object.entries(connectDoc.dskLayers)) {
+          socket.send(JSON.stringify({ type: 'DSK_STATE', layer: Number(layer), visible }));
+        }
+      }
+
+      // Sync audio channel state and start meter relay using the audio mixer block
+      if (connectDoc?.stromFlowId) {
+        try {
+          const strom = await makeStromClient();
+          const { flow } = await strom.flows.get(connectDoc.stromFlowId);
+          const blocks = flow.blocks ?? [];
+          console.log(`[controller] flow blocks: ${blocks.map((b) => `${b.block_definition_id}(${b.id})`).join(', ')}`);
+          const mixerBlock = blocks.find((b) => b.block_definition_id === 'builtin.mixer');
+          console.log(`[controller] audio mixerBlock: ${mixerBlock ? `id=${mixerBlock.id}` : 'NOT FOUND'}`);
+          if (mixerBlock) {
+            ctx.audioBlockId = mixerBlock.id;
+            // Apply audio follow immediately so production starts with only PGM audible
+            void applyAudioFollow(connectDoc, connectDoc.tally?.pgm ?? null, connectDoc.stromFlowId, mixerBlock.id, strom);
+            const rawCh = mixerBlock.properties?.num_channels;
+            const numChannels = typeof rawCh === 'number' ? rawCh : typeof rawCh === 'string' ? parseInt(rawCh, 10) || 0 : 0;
+            // Read live element properties (block properties don't store fader/mute state)
+            for (let i = 1; i <= numChannels; i++) {
+              try {
+                const res = await strom.properties.getElement(connectDoc.stromFlowId, `${mixerBlock.id}:volume_${i - 1}`);
+                const volume = res.properties['volume'];
+                const mute = res.properties['mute'];
+                if (typeof volume === 'number') {
+                  socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'volume', value: volume }));
+                }
+                if (typeof mute === 'boolean') {
+                  socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'mute', value: mute }));
+                }
+              } catch { /* element not yet ready or unavailable */ }
+            }
+            // Read main fader level
+            try {
+              const res = await strom.properties.getElement(connectDoc.stromFlowId, `${mixerBlock.id}:main_volume`);
+              const volume = res.properties['volume'];
+              if (typeof volume === 'number') {
+                socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: 'main', property: 'volume', value: volume }));
+              }
+            } catch { /* main volume element not yet ready */ }
+            if (typeof mixerBlock.id === 'string') {
+              startMeterRelay(id, connectDoc.stromFlowId, mixerBlock.id);
+            }
+          }
+        } catch (err) {
+          console.warn('[controller] audio sync error:', err);
+        }
       }
     }
   );

@@ -2,6 +2,7 @@
  * Strom API client — generated from openapi.json v0.4.5
  * https://github.com/Eyevinn/strom
  */
+import { WebSocket as WsWebSocket } from 'ws'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -174,6 +175,7 @@ export interface UpdateFlowPropertiesRequest {
   ephemeral?: boolean
   description?: string
   clock_type?: string
+  properties?: Record<string, unknown>
 }
 
 // --- Flow operations ---
@@ -217,13 +219,14 @@ export interface SetBackgroundResponse {
 }
 
 export interface DskToggleRequest {
-  layer: number
-  visible?: boolean
+  dsk: number
+  enabled: boolean
 }
 
 export interface DskToggleResponse {
-  layer: number
-  visible: boolean
+  dsk: number
+  enabled: boolean
+  message: string
 }
 
 export interface FadeToBlackRequest {
@@ -257,12 +260,12 @@ export interface PadPropertiesResponse {
 }
 
 export interface UpdatePropertyRequest {
-  property: string
+  property_name: string
   value: unknown
 }
 
 export interface UpdatePadPropertyRequest {
-  property: string
+  property_name: string
   value: unknown
 }
 
@@ -456,7 +459,7 @@ export interface IceServersResponse {
 }
 
 export interface WhepStreamsResponse {
-  streams: Array<{ id: string; url: string }>
+  streams: Array<{ endpoint_id: string; mode: string; has_audio: boolean; has_video: boolean }>
 }
 
 // --- WebSocket events ---
@@ -467,6 +470,7 @@ export type FlowEvent =
   | { type: 'flow_deleted'; flow_id: string }
   | { type: 'flow_started'; flow_id: string }
   | { type: 'flow_stopped'; flow_id: string }
+  | { type: 'MeterData'; data: { flow_id: string; element_id: string; rms: number[]; peak: number[]; decay: number[] } }
   | { type: 'ping' }
 
 // ---------------------------------------------------------------------------
@@ -800,18 +804,29 @@ export class StromClient {
    * Opens a WebSocket connection to /api/ws and calls `onEvent` for each
    * flow event. Returns a cleanup function that closes the socket.
    */
-  connectWebSocket(onEvent: (event: FlowEvent) => void): () => void {
+  connectWebSocket(onEvent: (event: FlowEvent) => void, onClose?: () => void): () => void {
     const wsUrl = this.baseUrl.replace(/^http/, 'ws') + '/api/ws'
-    const ws = new WebSocket(wsUrl)
+    const headers: Record<string, string> = {}
+    if (this.token) headers['Authorization'] = `Bearer ${this.token}`
+    const ws = new WsWebSocket(wsUrl, { headers })
 
-    ws.onmessage = (msg) => {
+    ws.on('error', (err) => {
+      console.error('[strom-ws] Connection error:', err.message)
+    })
+
+    ws.on('close', (code, reason) => {
+      if (code !== 1000) console.warn(`[strom-ws] Connection closed unexpectedly: code=${code} reason=${reason.toString()}`)
+      onClose?.()
+    })
+
+    ws.on('message', (data) => {
       try {
-        const event = JSON.parse(msg.data as string) as FlowEvent
+        const event = JSON.parse(data.toString()) as FlowEvent
         onEvent(event)
       } catch {
         // ignore malformed frames
       }
-    }
+    })
 
     return () => ws.close()
   }

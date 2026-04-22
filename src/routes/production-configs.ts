@@ -1,0 +1,84 @@
+import type { FastifyPluginAsync } from 'fastify';
+import { randomUUID } from 'crypto';
+import { z } from 'zod';
+import { getConfigsDb } from '../db/index.js';
+import type { ProductionConfigDoc } from '../db/types.js';
+
+const ConfigInput = z.object({
+  name: z.string().min(1),
+  templateId: z.string().min(1),
+  values: z.record(z.union([z.string(), z.number()])),
+});
+
+const ConfigPatch = z.object({
+  name: z.string().min(1).optional(),
+  values: z.record(z.union([z.string(), z.number()])).optional(),
+});
+
+function toApi(doc: ProductionConfigDoc) {
+  const { _rev, type, ...rest } = doc;
+  void _rev; void type;
+  return rest;
+}
+
+const productionConfigsRoutes: FastifyPluginAsync = async (fastify) => {
+  // List configs, optionally filtered by templateId
+  fastify.get<{ Querystring: { templateId?: string } }>('/api/v1/production-configs', async (req, reply) => {
+    const db = getConfigsDb();
+    const baseSelector = { type: 'production-config' as const };
+    const result = await db.find({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      selector: req.query.templateId ? { ...baseSelector, templateId: req.query.templateId } as any : baseSelector as any,
+    });
+    return reply.send((result.docs as unknown as ProductionConfigDoc[]).map(toApi));
+  });
+
+  // Create a config
+  fastify.post('/api/v1/production-configs', async (req, reply) => {
+    const body = ConfigInput.parse(req.body);
+    const now = new Date().toISOString();
+    const doc: ProductionConfigDoc = {
+      _id: `cfg-${randomUUID()}`,
+      type: 'production-config',
+      name: body.name,
+      templateId: body.templateId,
+      values: body.values,
+      createdAt: now,
+      updatedAt: now,
+    };
+    await getConfigsDb().insert(doc as never);
+    return reply.status(201).send(toApi(doc));
+  });
+
+  // Update a config (name and/or values)
+  fastify.patch<{ Params: { id: string } }>('/api/v1/production-configs/:id', async (req, reply) => {
+    const body = ConfigPatch.parse(req.body);
+    try {
+      const existing = await getConfigsDb().get(req.params.id);
+      const doc = existing as unknown as ProductionConfigDoc;
+      const updated: ProductionConfigDoc = {
+        ...doc,
+        ...(body.name !== undefined && { name: body.name }),
+        ...(body.values !== undefined && { values: body.values }),
+        updatedAt: new Date().toISOString(),
+      };
+      const response = await getConfigsDb().insert(updated as never);
+      return reply.send({ ...toApi(updated), _rev: response.rev });
+    } catch {
+      return reply.status(404).send({ error: 'Config not found', statusCode: 404 });
+    }
+  });
+
+  // Delete a config
+  fastify.delete<{ Params: { id: string } }>('/api/v1/production-configs/:id', async (req, reply) => {
+    try {
+      const doc = await getConfigsDb().get(req.params.id);
+      await getConfigsDb().destroy(doc._id, doc._rev!);
+      return reply.status(204).send();
+    } catch {
+      return reply.status(404).send({ error: 'Config not found', statusCode: 404 });
+    }
+  });
+};
+
+export default productionConfigsRoutes;
