@@ -244,6 +244,7 @@ export interface ProductionDoc {
   tally: Tally;
   overlayAlpha?: number;
   mixerBlockId?: string;
+  audioMixerBlockId?: string;
   /** DSK layer visibility state, keyed by 0-based layer index */
   dskLayers?: Record<number, boolean>;
   createdAt: string;

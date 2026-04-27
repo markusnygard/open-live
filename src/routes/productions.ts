@@ -75,6 +75,7 @@ async function runActivationFlow(
 ): Promise<void> {
   let stromFlowId: string | undefined;
   let mixerBlockId: string | undefined;
+  let audioMixerBlockId: string | undefined;
   let whepOutputEntries: Array<{ outputId: string; endpointId: string }> | undefined;
 
   try {
@@ -103,19 +104,23 @@ async function runActivationFlow(
     if (signal.aborted) return;
     ({ flowId: stromFlowId, whepOutputEntries } = await activateStromFlow(doc, strom, config.stromUrl, outputDocs.length > 0 ? outputDocs : undefined));
 
-    // Resolve mixerBlockId from template (templates live in the templates DB, not the main DB)
+    // Resolve mixerBlockId + audioMixerBlockId from template (templates live in the templates DB, not the main DB)
     if (doc.templateId) {
       const tmpl = await getTemplatesDb().get(doc.templateId).catch(() => null);
       if (tmpl) {
-        const mixerBlock = (tmpl as unknown as { flow?: { blocks?: Array<Record<string, unknown>> } })
-          .flow?.blocks?.find((b) => (b['block_definition_id'] as string | undefined)?.includes('vision_mixer'));
+        const blocks = (tmpl as unknown as { flow?: { blocks?: Array<Record<string, unknown>> } }).flow?.blocks ?? [];
+        const mixerBlock = blocks.find((b) => (b['block_definition_id'] as string | undefined)?.includes('vision_mixer'));
         if (mixerBlock && typeof mixerBlock['id'] === 'string') {
           mixerBlockId = mixerBlock['id'];
+        }
+        const audioBlock = blocks.find((b) => (b['block_definition_id'] as string | undefined) === 'builtin.mixer');
+        if (audioBlock && typeof audioBlock['id'] === 'string') {
+          audioMixerBlockId = audioBlock['id'];
         }
       }
     }
 
-    // Step 2: Persist stromFlowId + mixerBlockId
+    // Step 2: Persist stromFlowId + mixerBlockId + audioMixerBlockId
     if (signal.aborted) {
       await deactivateStromFlow(stromFlowId, strom).catch(() => undefined);
       return;
@@ -123,6 +128,7 @@ async function runActivationFlow(
     await updateProductionDoc(productionId, {
       stromFlowId,
       ...(mixerBlockId !== undefined && { mixerBlockId }),
+      ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
     });
 
     // Step 3: Poll until flow reaches 'playing' or we time out
@@ -137,6 +143,14 @@ async function runActivationFlow(
       const { flow } = await strom.flows.get(stromFlowId);
 
       if (flow.running === true) {
+        // Resolve audioMixerBlockId from the running flow — this is the authoritative source.
+        // Strom may assign a server-generated ID that differs from the template's block ID,
+        // so always prefer the live flow value over the template-derived one.
+        const runningAudioBlock = (flow.blocks ?? []).find(
+          (b) => (b as unknown as { block_definition_id?: string }).block_definition_id === 'builtin.mixer',
+        ) as { id?: string } | undefined;
+        if (runningAudioBlock?.id) audioMixerBlockId = runningAudioBlock.id;
+
         // Step 4: Retrieve WHEP multiview endpoint
         let whepEndpoint: string | undefined;
         if (mixerBlockId) {
@@ -203,9 +217,10 @@ async function runActivationFlow(
           srtOutputUri: undefined,
           whepOutputUrls: whepOutputUrls && whepOutputUrls.length > 0 ? whepOutputUrls : undefined,
           tally: initialTally,
+          ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
         });
 
-        log.info({ productionId, stromFlowId, whepEndpoint, initialTally }, 'Production activated — flow playing');
+        log.info({ productionId, stromFlowId, whepEndpoint, initialTally, audioMixerBlockId }, 'Production activated — flow playing');
         return;
       }
 

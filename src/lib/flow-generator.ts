@@ -161,6 +161,21 @@ export async function activateStromFlow(
   ) as Record<string, unknown> | undefined;
   const audioMixerBlockId = typeof audioMixerBlock?.['id'] === 'string' ? audioMixerBlock['id'] : null;
 
+  // Re-wire the template's multiview WHEP output audio to the audio mixer main_out.
+  // The template's original audio connection (e.g. direct from vision mixer) bypasses
+  // AFV — replacing it with main_out ensures the multiview hears the AFV-controlled mix.
+  if (audioMixerBlockId) {
+    for (const block of flow.blocks) {
+      const b = block as Record<string, unknown>;
+      if (b['block_definition_id'] !== 'builtin.whep_output') continue;
+      const mvId = b['id'] as string;
+      flow.links = (flow.links as Array<Record<string, unknown>>).filter(
+        (l) => !((l['to'] as string | undefined) ?? '').startsWith(`${mvId}:audio`),
+      );
+      flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${mvId}:audio_in` });
+    }
+  }
+
   // Strip ALL inputs wired to video_in_N pads on the mixer (dynamic blocks AND
   // static template placeholders like videotestsrc). We rebuild all video inputs
   // from production.sources, so the template's static elements must be removed.
@@ -338,28 +353,43 @@ export async function activateStromFlow(
     }
   }
 
-  // Strip any cefsrc elements from the template that are wired to dsk_in_N pads.
-  // These are replaced by the production's graphicAssignments at activation time.
+  // Strip any cefsrc elements (and any intermediate videoformat blocks) from the template
+  // that are wired to dsk_in_N pads. These are replaced by graphicAssignments at activation.
   if (mixerBlockId) {
     const dskLinkPattern = new RegExp(`^${mixerBlockId}:dsk_in_\\d+$`);
-    const dskSourceElementIds = new Set<string>();
+    const stripIds = new Set<string>();
+
+    // First pass: collect IDs directly connected to dsk_in_N (may be videoformat blocks or cefsrc)
     for (const link of flow.links) {
       const l = link as Record<string, unknown>;
       const to = (l['to'] as string | undefined) ?? '';
       if (dskLinkPattern.test(to)) {
-        const fromParts = ((l['from'] as string | undefined) ?? '').split(':');
-        dskSourceElementIds.add(fromParts[0]);
+        stripIds.add(((l['from'] as string | undefined) ?? '').split(':')[0]);
       }
     }
-    if (dskSourceElementIds.size > 0) {
+
+    // Second pass: follow one more hop back to catch cefsrc feeding into a videoformat block
+    const firstPassIds = new Set(stripIds);
+    for (const link of flow.links) {
+      const l = link as Record<string, unknown>;
+      const toId = ((l['to'] as string | undefined) ?? '').split(':')[0];
+      if (firstPassIds.has(toId)) {
+        stripIds.add(((l['from'] as string | undefined) ?? '').split(':')[0]);
+      }
+    }
+
+    if (stripIds.size > 0) {
       flow.elements = flow.elements.filter(
-        (el) => !dskSourceElementIds.has((el as Record<string, unknown>)['id'] as string),
+        (el) => !stripIds.has((el as Record<string, unknown>)['id'] as string),
+      );
+      flow.blocks = flow.blocks.filter(
+        (b) => !stripIds.has((b as Record<string, unknown>)['id'] as string),
       );
       flow.links = flow.links.filter((link) => {
         const l = link as Record<string, unknown>;
-        const to = (l['to'] as string | undefined) ?? '';
         const fromId = ((l['from'] as string | undefined) ?? '').split(':')[0];
-        return !dskLinkPattern.test(to) && !dskSourceElementIds.has(fromId);
+        const toId = ((l['to'] as string | undefined) ?? '').split(':')[0];
+        return !stripIds.has(fromId) && !stripIds.has(toId);
       });
     }
   }
@@ -384,13 +414,26 @@ export async function activateStromFlow(
       }
 
       const elemId = `e-dsk-${dskIndex}-${endpointSuffix}`;
+      const fmtId = `b-dsk-fmt-${dskIndex}-${endpointSuffix}`;
       flow.elements.push({
         id: elemId,
         element_type: 'cefsrc',
         properties: { url: graphic.url },
         position: [50, 600 + dskIndex * 150],
       });
-      flow.links.push({ from: `${elemId}:src`, to: `${mixerBlockId}:${assignment.dskInput}` });
+      const fmtProps: Record<string, unknown> = { resolution: pgmResolution };
+      if (pgmFramerate !== undefined) fmtProps['framerate'] = pgmFramerate;
+      flow.blocks.push({
+        id: fmtId,
+        block_definition_id: 'builtin.videoformat',
+        name: `Format DSK${dskIndex}`,
+        properties: fmtProps,
+        position: { x: 300, y: 600 + dskIndex * 150 },
+      });
+      flow.links.push(
+        { from: `${elemId}:src`, to: `${fmtId}:video_in` },
+        { from: `${fmtId}:video_out`, to: `${mixerBlockId}:${assignment.dskInput}` },
+      );
     }
 
     // Set num_dsk_inputs on the vision mixer so DSK pads are available
