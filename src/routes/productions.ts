@@ -102,23 +102,13 @@ async function runActivationFlow(
 
     // Step 1: Start the Strom flow
     if (signal.aborted) return;
-    ({ flowId: stromFlowId, whepOutputEntries } = await activateStromFlow(doc, strom, config.stromUrl, outputDocs.length > 0 ? outputDocs : undefined));
-
-    // Resolve mixerBlockId + audioMixerBlockId from template (templates live in the templates DB, not the main DB)
-    if (doc.templateId) {
-      const tmpl = await getTemplatesDb().get(doc.templateId).catch(() => null);
-      if (tmpl) {
-        const blocks = (tmpl as unknown as { flow?: { blocks?: Array<Record<string, unknown>> } }).flow?.blocks ?? [];
-        const mixerBlock = blocks.find((b) => (b['block_definition_id'] as string | undefined)?.includes('vision_mixer'));
-        if (mixerBlock && typeof mixerBlock['id'] === 'string') {
-          mixerBlockId = mixerBlock['id'];
-        }
-        const audioBlock = blocks.find((b) => (b['block_definition_id'] as string | undefined) === 'builtin.mixer');
-        if (audioBlock && typeof audioBlock['id'] === 'string') {
-          audioMixerBlockId = audioBlock['id'];
-        }
-      }
-    }
+    const activation = await activateStromFlow(doc, strom, config.stromUrl, outputDocs.length > 0 ? outputDocs : undefined);
+    stromFlowId = activation.flowId;
+    mixerBlockId = activation.mixerBlockId ?? undefined;
+    audioMixerBlockId = activation.audioMixerBlockId ?? undefined;
+    whepOutputEntries = activation.whepOutputEntries;
+    // mixerBlockId/audioMixerBlockId come directly from the flow generator — they are the
+    // randomised IDs actually used in the live Strom flow, not the static template IDs.
 
     // Step 2: Persist stromFlowId + mixerBlockId + audioMixerBlockId
     if (signal.aborted) {
@@ -272,6 +262,7 @@ const ProductionPatch = z.object({
   name: z.string().min(1).optional(),
   templateId: z.string().nullable().optional(),
   values: z.record(z.union([z.string(), z.number()])).optional(),
+  airTime: z.string().datetime().nullable().optional(),
 });
 
 const SourceAssignmentInput = z.object({
@@ -341,6 +332,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         ...(body.name !== undefined && { name: body.name }),
         ...(body.templateId !== undefined && { templateId: body.templateId ?? undefined }),
         ...(body.values !== undefined && { values: body.values }),
+        ...(body.airTime !== undefined && { airTime: body.airTime ?? undefined }),
         updatedAt: new Date().toISOString(),
       };
       const response = await getDb().insert(updated);

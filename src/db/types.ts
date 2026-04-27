@@ -238,6 +238,8 @@ export interface ProductionDoc {
   srtOutputUri?: string;
   /** Template property values chosen at production creation, keyed by property id */
   values?: Record<string, string | number>;
+  /** Scheduled on-air start time — ISO 8601 UTC string (e.g. "2026-05-01T18:30:00.000Z") */
+  airTime?: string;
   pipeline: Pipeline;
   graphics: GraphicOverlay[];
   macros: Macro[];

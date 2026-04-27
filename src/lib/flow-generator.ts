@@ -12,6 +12,8 @@ import { StromClient } from './strom.js';
  */
 export interface ActivationResult {
   flowId: string;
+  mixerBlockId: string | null;
+  audioMixerBlockId: string | null;
   whepOutputEntries?: Array<{ outputId: string; endpointId: string }>;
 }
 
@@ -73,6 +75,34 @@ export async function activateStromFlow(
   // names and SRT output ports are unique — multiple productions can run
   // simultaneously without conflicting on shared resources.
   const endpointSuffix = production._id.replace(/^prod-/, '').slice(0, 8);
+
+  // Remap all template block/element IDs to fresh random values so that two
+  // productions running concurrently don't share element names in Strom's
+  // global GStreamer pipeline context, which requires unique element names.
+  {
+    const idMap = new Map<string, string>();
+    for (const b of flow.blocks) {
+      const old = (b as Record<string, unknown>)['id'] as string | undefined;
+      if (old) { const n = randomUUID().replace(/-/g, ''); idMap.set(old, n); (b as Record<string, unknown>)['id'] = n; }
+    }
+    for (const e of flow.elements) {
+      const old = (e as Record<string, unknown>)['id'] as string | undefined;
+      if (old) { const n = randomUUID().replace(/-/g, ''); idMap.set(old, n); (e as Record<string, unknown>)['id'] = n; }
+    }
+    // Patch links: "blockId:pad" → "newId:pad"
+    for (const link of flow.links) {
+      const l = link as Record<string, unknown>;
+      for (const side of ['from', 'to'] as const) {
+        const val = l[side] as string | undefined;
+        if (!val) continue;
+        const colonIdx = val.indexOf(':');
+        const blockId = colonIdx >= 0 ? val.slice(0, colonIdx) : val;
+        const pad = colonIdx >= 0 ? val.slice(colonIdx) : '';
+        const mapped = idMap.get(blockId);
+        if (mapped) l[side] = mapped + pad;
+      }
+    }
+  }
 
   // Resolve pgm_resolution: production.values takes precedence over the template
   // mixer block's default — avoids in-mixer upscaling on static inputs (test
@@ -520,7 +550,7 @@ export async function activateStromFlow(
     throw err;
   }
 
-  return { flowId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined };
+  return { flowId, mixerBlockId, audioMixerBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined };
 }
 
 /**
