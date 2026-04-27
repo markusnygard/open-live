@@ -44,8 +44,8 @@ function toStromTransition(type: string): StromTransitionType {
 }
 
 async function makeStromClient(): Promise<StromClient> {
-  const token = await getStromToken(config.stromToken).catch(() => undefined);
-  return new StromClient({ baseUrl: config.stromUrl, token });
+  const token = await getStromToken(config.stromToken).catch(() => undefined)
+  return new StromClient({ baseUrl: config.stromUrl, token })
 }
 
 async function stromTransition(
@@ -89,12 +89,12 @@ async function stromTransition(
 // ---------------------------------------------------------------------------
 
 /**
- * Routes only the PGM source to the main mix bus by setting each channel's
- * to_main_vol routing element to 1.0 (PGM) or 0.0 (everything else).
- * This leaves the volume/mute element untouched so meters and faders continue
- * to function normally on all sources.
+ * Routes only the PGM source to the main mix by toggling each channel's
+ * to_main_vol_N routing element (bool). Non-PGM channels are unrouted from
+ * the main bus without touching the channel fader or mute.
  */
 async function applyAudioFollow(
+  productionId: string,
   doc: ProductionDoc,
   newPgmMixerInput: string | null,
   stromFlowId: string,
@@ -113,19 +113,22 @@ async function applyAudioFollow(
     } catch {
       continue; // virtual source — no audio channel
     }
-    if (streamType === 'html' || streamType === 'whip') continue;
+    if (streamType === 'html' || streamType === 'whip' || streamType === 'test1' || streamType === 'test2') continue;
 
     const chIdx = ++audioIdx;
-    const routeLevel = assignment.mixerInput === newPgmMixerInput ? 1.0 : 0.0;
+    const routed = newPgmMixerInput === null || assignment.mixerInput === newPgmMixerInput;
     const elemId = `${audioBlockId}:to_main_vol_${chIdx - 1}`;
+    console.log(`[controller] audio follow ch${chIdx} elemId=${elemId} routed=${routed}`);
     try {
+      // Use mute (boolean) rather than volume (float) — Strom's PATCH drops the
+      // connection when it receives JSON integers for float properties (1/0 vs 1.0/0.0).
       await strom.properties.updateElement(stromFlowId, elemId, {
-        property_name: 'volume',
-        value: routeLevel,
+        property_name: 'mute',
+        value: !routed,
       });
-      console.log(`[controller] audio follow ch${chIdx} ${elemId} → ${routeLevel}`);
+      console.log(`[controller] audio follow ch${chIdx} → ${routed ? 'routed' : 'unrouted'}`);
     } catch (err) {
-      console.warn(`[controller] audio follow ch${chIdx} ${elemId} error:`, err);
+      console.warn(`[controller] audio follow ch${chIdx} error:`, String(err));
     }
   }
 }
@@ -167,7 +170,7 @@ async function handleMessage(
       broadcast(productionId, { type: 'TALLY', ...newTally });
       await stromTransition(doc, tally.pgm, msg.mixerInput, 'cut');
       if (doc.stromFlowId && ctx.audioBlockId) {
-        void applyAudioFollow(doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient());
+        void applyAudioFollow(productionId, doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient());
       }
       break;
     }
@@ -180,7 +183,7 @@ async function handleMessage(
       broadcast(productionId, { type: 'TALLY', ...newTally, transitionType: msg.transitionType, durationMs: msg.durationMs });
       await stromTransition(doc, tally.pgm, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
       if (doc.stromFlowId && ctx.audioBlockId) {
-        void applyAudioFollow(doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient());
+        void applyAudioFollow(productionId, doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient());
       }
       break;
     }
@@ -193,7 +196,7 @@ async function handleMessage(
       broadcast(productionId, { type: 'TALLY', ...newTally });
       await stromTransition(doc, tally.pgm, tally.pvw, 'cut');
       if (doc.stromFlowId && ctx.audioBlockId) {
-        void applyAudioFollow(doc, tally.pvw, doc.stromFlowId, ctx.audioBlockId, await makeStromClient());
+        void applyAudioFollow(productionId, doc, tally.pvw, doc.stromFlowId, ctx.audioBlockId, await makeStromClient());
       }
       break;
     }
@@ -476,19 +479,20 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           const strom = await makeStromClient();
           const { flow } = await strom.flows.get(connectDoc.stromFlowId);
           const blocks = flow.blocks ?? [];
-          console.log(`[controller] flow blocks: ${blocks.map((b) => `${b.block_definition_id}(${b.id})`).join(', ')}`);
-          const mixerBlock = blocks.find((b) => b.block_definition_id === 'builtin.mixer');
-          console.log(`[controller] audio mixerBlock: ${mixerBlock ? `id=${mixerBlock.id}` : 'NOT FOUND'}`);
-          if (mixerBlock) {
-            ctx.audioBlockId = mixerBlock.id;
+          // Prefer the persisted audioMixerBlockId; fall back to scanning live flow blocks
+          const audioBlockId = connectDoc.audioMixerBlockId ?? blocks.find((b) => b.block_definition_id === 'builtin.mixer')?.id;
+          const mixerBlock = audioBlockId ? blocks.find((b) => b.id === audioBlockId) : undefined;
+          console.log(`[controller] audio mixerBlock: ${audioBlockId ?? 'NOT FOUND'}`);
+          if (audioBlockId) {
+            ctx.audioBlockId = audioBlockId;
             // Apply audio follow immediately so production starts with only PGM audible
-            void applyAudioFollow(connectDoc, connectDoc.tally?.pgm ?? null, connectDoc.stromFlowId, mixerBlock.id, strom);
-            const rawCh = mixerBlock.properties?.num_channels;
+            void applyAudioFollow(id, connectDoc, connectDoc.tally?.pgm ?? null, connectDoc.stromFlowId, audioBlockId, strom);
+            const rawCh = mixerBlock?.properties?.num_channels;
             const numChannels = typeof rawCh === 'number' ? rawCh : typeof rawCh === 'string' ? parseInt(rawCh, 10) || 0 : 0;
             // Read live element properties (block properties don't store fader/mute state)
             for (let i = 1; i <= numChannels; i++) {
               try {
-                const res = await strom.properties.getElement(connectDoc.stromFlowId, `${mixerBlock.id}:volume_${i - 1}`);
+                const res = await strom.properties.getElement(connectDoc.stromFlowId, `${audioBlockId}:volume_${i - 1}`);
                 const volume = res.properties['volume'];
                 const mute = res.properties['mute'];
                 if (typeof volume === 'number') {
@@ -501,15 +505,13 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             }
             // Read main fader level
             try {
-              const res = await strom.properties.getElement(connectDoc.stromFlowId, `${mixerBlock.id}:main_volume`);
+              const res = await strom.properties.getElement(connectDoc.stromFlowId, `${audioBlockId}:main_volume`);
               const volume = res.properties['volume'];
               if (typeof volume === 'number') {
                 socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: 'main', property: 'volume', value: volume }));
               }
             } catch { /* main volume element not yet ready */ }
-            if (typeof mixerBlock.id === 'string') {
-              startMeterRelay(id, connectDoc.stromFlowId, mixerBlock.id);
-            }
+            startMeterRelay(id, connectDoc.stromFlowId, audioBlockId);
           }
         } catch (err) {
           console.warn('[controller] audio sync error:', err);

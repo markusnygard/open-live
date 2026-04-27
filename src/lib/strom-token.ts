@@ -1,10 +1,10 @@
 /**
- * OSC Service Access Token (SAT) manager for Strom.
+ * Strom auth helper — getStromToken
  *
- * PATs cannot be used directly against OSC-hosted services — they must be
- * exchanged for a short-lived SAT via the OSC token service. This module
- * handles that exchange and caches the SAT, refreshing it 5 minutes before
- * it expires so callers always get a valid token.
+ * - STROM_AUTH_MODE=direct: returns the API key as-is (self-hosted Strom)
+ * - STROM_AUTH_MODE=osc (default): exchanges the PAT for a short-lived SAT
+ *   via the OSC token service (required for OSC-hosted Strom instances).
+ *   Caches the SAT and refreshes it 5 min before expiry.
  */
 
 const TOKEN_EXCHANGE_URL = 'https://token.svc.prod.osaas.io/servicetoken'
@@ -43,7 +43,6 @@ export async function getStromToken(pat: string | undefined): Promise<string | u
     return cache.token
   }
 
-  // (no debug log — exchange is a normal background operation)
   const res = await fetch(TOKEN_EXCHANGE_URL, {
     method: 'POST',
     headers: {

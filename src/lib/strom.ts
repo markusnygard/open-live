@@ -489,7 +489,7 @@ export class StromClientError extends Error {
 
 export interface StromClientOptions {
   baseUrl: string
-  /** Optional Bearer token or session cookie — if omitted, assumes no-auth mode */
+  /** Optional Bearer token — API key or SAT for OSC-hosted instances */
   token?: string
 }
 
@@ -509,16 +509,27 @@ export class StromClient {
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const url = `${this.baseUrl}${path}`
+    // Retry once on UND_ERR_SOCKET: undici doesn't auto-retry unsafe methods (PATCH/POST)
+    // when a pooled connection was closed by the server. The stale connection is evicted on
+    // the first failure, so the retry always opens a fresh TCP connection.
     let res: Response
-    try {
-      res = await fetch(`${this.baseUrl}${path}`, {
-        method,
-        headers: this.headers(),
-        body: body !== undefined ? JSON.stringify(body) : undefined,
-      })
-    } catch (err) {
-      throw new StromClientError(0, `Strom unreachable: ${(err as Error).message}`)
+    for (let attempt = 0; attempt <= 1; attempt++) {
+      try {
+        res = await fetch(url, {
+          method,
+          headers: this.headers(),
+          body: body !== undefined ? JSON.stringify(body) : undefined,
+        })
+        break
+      } catch (err) {
+        const e = err as Error & { cause?: Error & { code?: string } }
+        if (attempt === 0 && e.cause?.code === 'UND_ERR_SOCKET') continue
+        const cause = e.cause ? ` [cause: ${e.cause.message ?? String(e.cause)}${e.cause.code ? ` code=${e.cause.code}` : ''}]` : ''
+        throw new StromClientError(0, `Strom unreachable: ${e.message}${cause} — ${method} ${url}`)
+      }
     }
+    res = res!
 
     if (res.status === 204) return undefined as T
 
@@ -542,8 +553,8 @@ export class StromClient {
   private get = <T>(path: string) => this.request<T>('GET', path)
   private post = <T>(path: string, body?: unknown) => this.request<T>('POST', path, body)
   private put = <T>(path: string, body: unknown) => this.request<T>('PUT', path, body)
-  private patch = <T>(path: string, body: unknown) => this.request<T>('PATCH', path, body)
   private del = <T>(path: string) => this.request<T>('DELETE', path)
+  private patch = <T>(path: string, body: unknown) => this.request<T>('PATCH', path, body)
 
   // -------------------------------------------------------------------------
   // Auth
