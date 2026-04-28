@@ -85,6 +85,14 @@ async function stromTransition(
 }
 
 // ---------------------------------------------------------------------------
+// Audio volume debounce
+// ---------------------------------------------------------------------------
+
+// Debounce rapid volume nudges so back-to-back AUDIO_SET volume messages don't
+// flood Strom's HTTP connection pool. Mute changes skip the debounce.
+const pendingVolume = new Map<string, NodeJS.Timeout>()
+
+// ---------------------------------------------------------------------------
 // Audio follow
 // ---------------------------------------------------------------------------
 
@@ -118,7 +126,6 @@ async function applyAudioFollow(
     const chIdx = ++audioIdx;
     const routed = newPgmMixerInput === null || assignment.mixerInput === newPgmMixerInput;
     const elemId = `${audioBlockId}:to_main_vol_${chIdx - 1}`;
-    console.log(`[controller] audio follow ch${chIdx} elemId=${elemId} routed=${routed}`);
     try {
       // Use mute (boolean) rather than volume (float) — Strom's PATCH drops the
       // connection when it receives JSON integers for float properties (1/0 vs 1.0/0.0).
@@ -126,7 +133,6 @@ async function applyAudioFollow(
         property_name: 'mute',
         value: !routed,
       });
-      console.log(`[controller] audio follow ch${chIdx} → ${routed ? 'routed' : 'unrouted'}`);
     } catch (err) {
       console.warn(`[controller] audio follow ch${chIdx} error:`, String(err));
     }
@@ -399,8 +405,32 @@ async function handleMessage(
           elementId = `${ctx.audioBlockId}:volume_${ch - 1}`;
           property = msg.property === 'volume' ? 'volume' : 'mute';
         }
-        await strom.properties.updateElement(doc.stromFlowId, elementId, { property_name: property, value: msg.value });
-        broadcast(productionId, { type: 'AUDIO_STATE', elementId: msg.elementId, property: msg.property, value: msg.value });
+        if (msg.property === 'volume') {
+          // Debounce: coalesce rapid nudges into one Strom PATCH.
+          // Broadcast immediately for UI responsiveness; only the final value is sent to Strom.
+          broadcast(productionId, { type: 'AUDIO_STATE', elementId: msg.elementId, property: msg.property, value: msg.value });
+          const debounceKey = `${productionId}:${elementId}`;
+          const prev = pendingVolume.get(debounceKey);
+          if (prev) clearTimeout(prev);
+          const flowId = doc.stromFlowId;
+          const capturedElementId = elementId;
+          const capturedProperty = property;
+          const capturedValue = msg.value;
+          const capturedLogicalId = msg.elementId;
+          pendingVolume.set(debounceKey, setTimeout(async () => {
+            pendingVolume.delete(debounceKey);
+            try {
+              const s = await makeStromClient();
+              await s.properties.updateElement(flowId, capturedElementId, { property_name: capturedProperty, value: capturedValue });
+            } catch (err) {
+              console.warn('[controller] Strom audio update error:', err);
+              broadcast(productionId, { type: 'AUDIO_STATE', elementId: capturedLogicalId, property: 'volume', value: capturedValue });
+            }
+          }, 150));
+        } else {
+          await strom.properties.updateElement(doc.stromFlowId, elementId, { property_name: property, value: msg.value });
+          broadcast(productionId, { type: 'AUDIO_STATE', elementId: msg.elementId, property: msg.property, value: msg.value });
+        }
       } catch (err) {
         console.warn('[controller] Strom audio update error:', err);
       }
@@ -482,7 +512,6 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           // Prefer the persisted audioMixerBlockId; fall back to scanning live flow blocks
           const audioBlockId = connectDoc.audioMixerBlockId ?? blocks.find((b) => b.block_definition_id === 'builtin.mixer')?.id;
           const mixerBlock = audioBlockId ? blocks.find((b) => b.id === audioBlockId) : undefined;
-          console.log(`[controller] audio mixerBlock: ${audioBlockId ?? 'NOT FOUND'}`);
           if (audioBlockId) {
             ctx.audioBlockId = audioBlockId;
             // Apply audio follow immediately so production starts with only PGM audible

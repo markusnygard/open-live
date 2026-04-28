@@ -524,7 +524,12 @@ export class StromClient {
         break
       } catch (err) {
         const e = err as Error & { cause?: Error & { code?: string } }
-        if (attempt === 0 && e.cause?.code === 'UND_ERR_SOCKET') continue
+        if (attempt === 0 && e.cause?.code === 'UND_ERR_SOCKET') {
+          // Strom closed the connection (often while processing a low-volume audio
+          // adjustment). Wait briefly for it to recover, then retry on a fresh socket.
+          await new Promise<void>((r) => setTimeout(r, 300))
+          continue
+        }
         const cause = e.cause ? ` [cause: ${e.cause.message ?? String(e.cause)}${e.cause.code ? ` code=${e.cause.code}` : ''}]` : ''
         throw new StromClientError(0, `Strom unreachable: ${e.message}${cause} — ${method} ${url}`)
       }
@@ -825,8 +830,7 @@ export class StromClient {
       console.error('[strom-ws] Connection error:', err.message)
     })
 
-    ws.on('close', (code, reason) => {
-      if (code !== 1000) console.warn(`[strom-ws] Connection closed unexpectedly: code=${code} reason=${reason.toString()}`)
+    ws.on('close', (_code, _reason) => {
       onClose?.()
     })
 

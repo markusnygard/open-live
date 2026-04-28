@@ -19,12 +19,9 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
   }
 
   const meterPrefix = `${mixerBlockId}:meter:`;
-  console.log(`[meter-relay] Starting for production=${productionId} flowId=${flowId} mixerBlockId=${mixerBlockId}`);
-
   let stopped = false;
   let wsCleanup: (() => void) | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  let meterCount = 0;
 
   function connect() {
     if (stopped) return;
@@ -32,20 +29,12 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
     void getStromToken(config.stromToken).then((token) => {
       if (stopped) return;
 
-      // Build the WS URL for logging (mask token)
-      const wsBase = config.stromUrl.replace(/^http/, 'ws');
-      console.log(`[meter-relay] Connecting WS to ${wsBase}/api/ws (auth=${token ? 'yes' : 'none'})`);
-
       const strom = new StromClient({ baseUrl: config.stromUrl, token });
 
       const closeCleanup = strom.connectWebSocket(
         (event) => {
           if (event.type !== 'MeterData') return;
-          meterCount++;
           const { flow_id, element_id, rms, peak } = event.data;
-          if (meterCount <= 3) {
-            console.log(`[meter-relay] MeterData #${meterCount}: flow_id=${flow_id} element_id=${element_id}`);
-          }
           if (flow_id !== flowId) return;
           if (!element_id.startsWith(meterPrefix)) return;
           const suffix = element_id.slice(meterPrefix.length);
@@ -58,9 +47,7 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
           broadcast(productionId, { type: 'METER_DATA', elementId: `ch${chNum}`, peak, rms });
         },
         () => {
-          // onClose — schedule reconnect unless intentionally stopped
           if (!stopped) {
-            console.log(`[meter-relay] WS closed for production=${productionId}, reconnecting in ${RECONNECT_DELAY_MS}ms`);
             reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
           }
         },
