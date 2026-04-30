@@ -209,7 +209,7 @@ export async function activateStromFlow(
   // Strip ALL inputs wired to video_in_N pads on the mixer (dynamic blocks AND
   // static template placeholders like videotestsrc). We rebuild all video inputs
   // from production.sources, so the template's static elements must be removed.
-  const DYNAMIC_INPUT_BLOCK_DEFS = new Set(['builtin.mpegtssrt_input', 'builtin.whip_input']);
+  const DYNAMIC_INPUT_BLOCK_DEFS = new Set(['builtin.mpegtssrt_input', 'builtin.efpsrt_input', 'builtin.whip_input']);
   const strippedVideoInputIds = new Set<string>();
 
   // Collect dynamic block IDs (mpegtssrt_input, whip_input)
@@ -387,11 +387,11 @@ export async function activateStromFlow(
         }
       }
     } else {
-      // srt or efp — both use the MPEG-TS/SRT input block
+      // srt → builtin.mpegtssrt_input, efp → builtin.efpsrt_input
       const audioChannel = audioChannelIndex++;
       flow.blocks.push({
         id: inputId,
-        block_definition_id: 'builtin.mpegtssrt_input',
+        block_definition_id: source.streamType === 'efp' ? 'builtin.efpsrt_input' : 'builtin.mpegtssrt_input',
         name: `${source.streamType === 'efp' ? 'EFP' : 'SRT'} Input (V${padIndex})`,
         properties: {
           srt_uri: source.address || 'srt://127.0.0.1:5005?mode=caller',
