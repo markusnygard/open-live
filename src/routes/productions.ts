@@ -382,10 +382,38 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         });
       }
 
-      // Transition to 'activating' immediately and respond
+      // Guard: reject if any non-WHEP output is already active in another production
+      if (doc.outputAssignments && doc.outputAssignments.length > 0) {
+        const otherActiveProds = await getDb().find({
+          selector: { type: 'production', status: { $in: ['active', 'activating'] } },
+          fields: ['_id', 'name', 'outputAssignments'],
+          limit: 200,
+        });
+        const activeOutputIds = new Set(
+          otherActiveProds.docs.flatMap((p) =>
+            ((p as unknown as ProductionDoc).outputAssignments ?? []).map((a) => a.outputId),
+          ),
+        );
+        for (const assignment of doc.outputAssignments) {
+          if (!activeOutputIds.has(assignment.outputId)) continue;
+          let outputDoc: OutputDoc | undefined;
+          try { outputDoc = await getOutputsDb().get(assignment.outputId); } catch { continue; }
+          if (outputDoc.outputType === 'whep') continue;
+          const conflictProd = otherActiveProds.docs.find((p) =>
+            ((p as unknown as ProductionDoc).outputAssignments ?? []).some((a) => a.outputId === assignment.outputId),
+          ) as unknown as ProductionDoc | undefined;
+          return reply.status(409).send({
+            error: `Output "${outputDoc.name}" is already active in production "${conflictProd?.name ?? 'another production'}"`,
+            statusCode: 409,
+          });
+        }
+      }
+
+      // Transition to 'activating' immediately and respond; clear any deletion warnings
       const activatingDoc: ProductionDoc = {
         ...doc,
         status: 'activating',
+        deletionWarnings: undefined,
         updatedAt: new Date().toISOString(),
       };
       const insertResponse = await getDb().insert(activatingDoc);

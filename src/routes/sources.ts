@@ -3,11 +3,12 @@ import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getSourcesDb, getDb } from '../db/index.js';
 import type { SourceDoc, ProductionDoc } from '../db/types.js';
+import { updateProductionDoc } from './productions.js';
 
 const SourceInput = z.object({
   name: z.string().min(1),
   address: z.string(),
-  streamType: z.enum(['srt', 'whip', 'html']),
+  streamType: z.enum(['srt', 'efp', 'whip', 'html']),
   status: z.enum(['active', 'inactive']).default('inactive'),
   liveCamera: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
@@ -16,7 +17,7 @@ const SourceInput = z.object({
 const SourcePatch = z.object({
   name: z.string().min(1).optional(),
   address: z.string().optional(),
-  streamType: z.enum(['srt', 'whip', 'html']).optional(),
+  streamType: z.enum(['srt', 'efp', 'whip', 'html']).optional(),
   status: z.enum(['active', 'inactive']).optional(),
   liveCamera: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
@@ -83,6 +84,7 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
     try {
       const doc = await getSourcesDb().get(req.params.id);
 
+      // Block deletion if source is used by an active/activating production
       const activeProductions = await getDb().find({
         selector: { type: 'production', status: { $in: ['active', 'activating'] }, 'sources': { $elemMatch: { sourceId: req.params.id } } },
         fields: ['_id', 'name'],
@@ -91,6 +93,22 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       if (activeProductions.docs.length > 0) {
         const prod = activeProductions.docs[0] as unknown as Pick<ProductionDoc, '_id' | 'name'>;
         return reply.status(409).send({ error: `Source is in use by active production "${prod.name}"` });
+      }
+
+      // Remove references from inactive productions and record a warning
+      const inactiveProductions = await getDb().find({
+        selector: { type: 'production', status: 'inactive', 'sources': { $elemMatch: { sourceId: req.params.id } } },
+        fields: ['_id', 'name', 'sources', 'deletionWarnings'],
+        limit: 100,
+      });
+      for (const p of inactiveProductions.docs) {
+        const prod = p as unknown as ProductionDoc;
+        const warnings = prod.deletionWarnings ?? [];
+        warnings.push({ type: 'source', name: doc.name });
+        await updateProductionDoc(prod._id, {
+          sources: prod.sources.filter((s) => s.sourceId !== req.params.id),
+          deletionWarnings: warnings,
+        });
       }
 
       await getSourcesDb().destroy(doc._id, doc._rev!);

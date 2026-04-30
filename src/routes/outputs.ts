@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getOutputsDb, getDb } from '../db/index.js';
 import type { OutputDoc, ProductionDoc } from '../db/types.js';
+import { updateProductionDoc } from './productions.js';
 
 const OutputInput = z.object({
   name: z.string().min(1),
@@ -68,15 +69,32 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
     try {
       const doc = await getOutputsDb().get(req.params.id);
 
-      const activeProds = await getDb().find({
-        selector: { type: 'production', status: { $in: ['active', 'activating'] } },
-        fields: ['_id', 'name', 'outputAssignments'],
+      // Block deletion if output is used by an active/activating production
+      const allProds = await getDb().find({
+        selector: { type: 'production' },
+        fields: ['_id', 'name', 'status', 'outputAssignments', 'deletionWarnings'],
+        limit: 200,
       });
-      const inUse = activeProds.docs.some((p) =>
-        (p as unknown as ProductionDoc).outputAssignments?.some((a) => a.outputId === req.params.id),
-      );
-      if (inUse) {
+      const activeInUse = allProds.docs.some((p) => {
+        const prod = p as unknown as ProductionDoc;
+        return (prod.status === 'active' || prod.status === 'activating') &&
+          prod.outputAssignments?.some((a) => a.outputId === req.params.id);
+      });
+      if (activeInUse) {
         return reply.status(409).send({ error: 'Output is used in an active production', statusCode: 409 });
+      }
+
+      // Remove references from inactive productions and record a warning
+      for (const p of allProds.docs) {
+        const prod = p as unknown as ProductionDoc;
+        if (prod.status !== 'inactive') continue;
+        if (!prod.outputAssignments?.some((a) => a.outputId === req.params.id)) continue;
+        const warnings = prod.deletionWarnings ?? [];
+        warnings.push({ type: 'output', name: doc.name });
+        await updateProductionDoc(prod._id, {
+          outputAssignments: (prod.outputAssignments ?? []).filter((a) => a.outputId !== req.params.id),
+          deletionWarnings: warnings,
+        });
       }
 
       await getOutputsDb().destroy(doc._id, doc._rev!);

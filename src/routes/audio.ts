@@ -53,10 +53,10 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
         if (numChannels === 0) return reply.send([]);
 
         // Build audio-channel-index → source name map.
-        // Audio channels are assigned only to SRT/EFP sources (not test, WHIP, or HTML
-        // sources), in mixerInput order — matching the flow-generator audioChannelIndex
-        // logic exactly. Virtual source IDs (Whip, __test1__, __test2__) are not in the
-        // sources DB and are silently skipped.
+        // Audio channels are assigned to SRT/EFP/WHIP sources (not test or HTML),
+        // in mixerInput order — matching the flow-generator audioChannelIndex logic exactly.
+        // Virtual source IDs (__test1__, __test2__) are not in the sources DB and are
+        // silently skipped via the catch block.
         const audioChannelNameMap = new Map<number, string>();
         const audioChannelMixerInputMap = new Map<number, string>();
         try {
@@ -64,15 +64,21 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
           const sortedAssignments = [...(doc.sources ?? [])].sort((a, b) =>
             a.mixerInput.localeCompare(b.mixerInput),
           );
+          const VIRTUAL_SOURCES: Record<string, { streamType: string; name: string }> = {
+            'Whip': { streamType: 'whip', name: 'WHIP Input' },
+            '__test1__': { streamType: 'test1', name: 'Test - Pinwheel' },
+            '__test2__': { streamType: 'test2', name: 'Test - Colors' },
+          };
           let audioIdx = 0;
           for (const assignment of sortedAssignments) {
             try {
-              const src = await sourcesDb.get(assignment.sourceId);
-              if (src.streamType === 'html' || src.streamType === 'whip') continue;
+              const src = VIRTUAL_SOURCES[assignment.sourceId] ?? await sourcesDb.get(assignment.sourceId);
+              if (src.streamType === 'html') continue;
+              if (src.streamType === 'test1' || src.streamType === 'test2') continue;
               audioChannelNameMap.set(audioIdx, src.name);
               audioChannelMixerInputMap.set(audioIdx, assignment.mixerInput);
               audioIdx++;
-            } catch { /* virtual or missing source — no audio channel */ }
+            } catch { /* missing source — no audio channel */ }
           }
         } catch { /* sources DB unavailable */ }
 

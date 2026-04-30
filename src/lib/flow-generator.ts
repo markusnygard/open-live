@@ -260,10 +260,9 @@ export async function activateStromFlow(
   // Also set input_{N}_label for each assigned source so Strom renders the name
   // in the multiview overlay (verified: property format from strom/backend/src/blocks/builtin/vision_mixer/properties.rs).
   if (mixerBlock && mixerBlockId) {
-    const ALLOWED_INPUT_COUNTS = [2, 4, 6, 8, 10];
-    const numInputs = ALLOWED_INPUT_COUNTS.find((n) => n >= sortedAssignments.length) ?? 10;
+    const numInputs = Math.max(2, sortedAssignments.length);
     const props = (mixerBlock['properties'] ?? {}) as Record<string, unknown>;
-    props['num_inputs'] = String(numInputs);
+    props['num_inputs'] = numInputs;
 
     for (const assignment of sortedAssignments) {
       const padMatch = /video_in_(\d+)$/.exec(assignment.mixerInput);
@@ -286,7 +285,7 @@ export async function activateStromFlow(
     const ALLOWED_CHANNEL_COUNTS = [2, 4, 8, 12, 16, 24, 32];
     const srtEfpCount = sortedAssignments.filter((a) => {
       const src = sourceMap.get(a.sourceId) ?? (VIRTUAL_SOURCES[a.sourceId] as SourceDoc | undefined);
-      return src && src.streamType !== 'test1' && src.streamType !== 'test2' && src.streamType !== 'whip' && src.streamType !== 'html';
+      return src && src.streamType !== 'test1' && src.streamType !== 'test2' && src.streamType !== 'html';
     }).length;
     const numChannels = ALLOWED_CHANNEL_COUNTS.find((n) => n >= srtEfpCount) ?? 32;
     const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
@@ -294,15 +293,34 @@ export async function activateStromFlow(
     audioMixerBlock['properties'] = props;
   }
 
-  // Use the highest latency across all SRT/EFP sources so timestamps align at the mixer.
-  // Mismatched latencies cause QoS frame-drop events on the encoder.
+  // Compute the highest latency across all SRT/EFP sources. Each source keeps its
+  // own configured latency; the max is used only to set min_upstream_latency on the
+  // mixers so the aggregators never starve waiting for the slowest source.
   const srtLatencies = sortedAssignments
     .map((a) => sourceMap.get(a.sourceId) ?? (VIRTUAL_SOURCES[a.sourceId] as SourceDoc | undefined))
     .filter((s): s is SourceDoc => !!s && s.streamType !== 'test1' && s.streamType !== 'test2' && s.streamType !== 'whip' && s.streamType !== 'html')
     .map((s) => s.latency ?? 125);
-  const sharedLatency = srtLatencies.length > 0 ? Math.max(...srtLatencies) : 125;
+  const maxSourceLatency = srtLatencies.length > 0 ? Math.max(...srtLatencies) : 125;
+
+  if (mixerBlock) {
+    const props = (mixerBlock['properties'] ?? {}) as Record<string, unknown>;
+    props['latency'] = 100;
+    props['min_upstream_latency'] = maxSourceLatency;
+    mixerBlock['properties'] = props;
+  }
+  if (audioMixerBlock) {
+    const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
+    props['latency'] = 100;
+    props['min_upstream_latency'] = maxSourceLatency;
+    audioMixerBlock['properties'] = props;
+  }
 
   let audioChannelIndex = 0;
+  const ROW_H = 150;      // vertical spacing between rows
+  const ROW_START = 50;   // y of first input row
+  const COL_ELEM = -500;  // col 1: cefsrc / videotestsrc elements
+  const COL_INPUT = -250; // col 2: input blocks (mpegtssrt_input, whip_input, videoformat)
+  const COL_OUTPUT = 850; // col 5: output blocks
 
   for (const assignment of sortedAssignments) {
     const padMatch = /video_in_(\d+)$/.exec(assignment.mixerInput);
@@ -312,7 +330,7 @@ export async function activateStromFlow(
     const source = sourceMap.get(assignment.sourceId) ?? (VIRTUAL_SOURCES[assignment.sourceId] as SourceDoc | undefined);
     if (!source) continue;
 
-    const yPos = 100 + padIndex * 150;
+    const yPos = ROW_START + padIndex * ROW_H;
     const inputId = `b-input-${padIndex}-${endpointSuffix}`;
 
     const TEST_PATTERNS: Record<string, string> = { test1: 'Pinwheel', test2: 'Colors' }
@@ -323,14 +341,14 @@ export async function activateStromFlow(
         id: elemId,
         element_type: 'videotestsrc',
         properties: { pattern: TEST_PATTERNS[source.streamType] },
-        position: [50, yPos],
+        position: [COL_ELEM, yPos],
       });
       flow.blocks.push({
         id: fmtId,
         block_definition_id: 'builtin.videoformat',
         name: `Format V${padIndex}`,
         properties: { resolution: '1920x1080' },
-        position: { x: 300, y: yPos },
+        position: { x: COL_INPUT, y: yPos },
       });
       flow.links.push(
         { from: `${elemId}:src`, to: `${fmtId}:video_in` },
@@ -342,22 +360,32 @@ export async function activateStromFlow(
         id: elemId,
         element_type: 'cefsrc',
         properties: { url: source.address },
-        position: [50, yPos],
+        position: [COL_ELEM, yPos],
       });
       // Connect directly to the mixer — same pattern as DSK overlays.
       // Skipping builtin.videoformat avoids autovideoconvert trying to use GL,
       // which conflicts with cefsrc's X11/Xvfb rendering context on GPU hosts.
       flow.links.push({ from: `${elemId}:src`, to: `${mixerBlockId}:${assignment.mixerInput}` });
     } else if (source.streamType === 'whip') {
+      const audioChannel = audioChannelIndex++;
       const endpointId = `whip-${padIndex}-${endpointSuffix}`;
       flow.blocks.push({
         id: inputId,
         block_definition_id: 'builtin.whip_input',
         name: `WHIP Input (V${padIndex})`,
         properties: { endpoint_id: endpointId },
-        position: { x: 300, y: yPos },
+        position: { x: COL_INPUT, y: yPos },
       });
       flow.links.push({ from: `${inputId}:video_out`, to: `${mixerBlockId}:${assignment.mixerInput}` });
+      flow.links.push({ from: `${inputId}:audio_out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      if (audioMixerBlock && audioMixerBlockId) {
+        flow.links.push({ from: `${inputId}:audio_out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
+        if (source.name) {
+          const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
+          props[`ch${audioChannel + 1}_label`] = source.name;
+          audioMixerBlock['properties'] = props;
+        }
+      }
     } else {
       // srt or efp — both use the MPEG-TS/SRT input block
       const audioChannel = audioChannelIndex++;
@@ -367,9 +395,9 @@ export async function activateStromFlow(
         name: `${source.streamType === 'efp' ? 'EFP' : 'SRT'} Input (V${padIndex})`,
         properties: {
           srt_uri: source.address || 'srt://127.0.0.1:5005?mode=caller',
-          latency: sharedLatency,
+          latency: source.latency ?? 125,
         },
-        position: { x: 300, y: yPos },
+        position: { x: COL_INPUT, y: yPos },
       });
       flow.links.push({ from: `${inputId}:video_out`, to: `${mixerBlockId}:${assignment.mixerInput}` });
       // Wire audio:
@@ -377,8 +405,13 @@ export async function activateStromFlow(
       //    correlates audio with the correct video source (a3 for video_in_3, etc.).
       //  - Audio mixer: sequential 1-indexed inputs (it doesn't know about video pads).
       flow.links.push({ from: `${inputId}:audio_out_0`, to: `${mixerBlockId}:audio_in_${padIndex}` });
-      if (audioMixerBlockId) {
+      if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${inputId}:audio_out_0`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
+        if (source.name) {
+          const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
+          props[`ch${audioChannel + 1}_label`] = source.name;
+          audioMixerBlock['properties'] = props;
+        }
       }
     }
   }
@@ -445,11 +478,12 @@ export async function activateStromFlow(
 
       const elemId = `e-dsk-${dskIndex}-${endpointSuffix}`;
       const fmtId = `b-dsk-fmt-${dskIndex}-${endpointSuffix}`;
+      const dskY = ROW_START + (sortedAssignments.length + dskIndex) * ROW_H;
       flow.elements.push({
         id: elemId,
         element_type: 'cefsrc',
         properties: { url: graphic.url },
-        position: [50, 600 + dskIndex * 150],
+        position: [COL_ELEM, dskY],
       });
       const fmtProps: Record<string, unknown> = { resolution: pgmResolution };
       if (pgmFramerate !== undefined) fmtProps['framerate'] = pgmFramerate;
@@ -458,7 +492,7 @@ export async function activateStromFlow(
         block_definition_id: 'builtin.videoformat',
         name: `Format DSK${dskIndex}`,
         properties: fmtProps,
-        position: { x: 300, y: 600 + dskIndex * 150 },
+        position: { x: COL_INPUT, y: dskY },
       });
       flow.links.push(
         { from: `${elemId}:src`, to: `${fmtId}:video_in` },
@@ -476,6 +510,7 @@ export async function activateStromFlow(
 
   // Inject output blocks for each assigned OutputDoc
   const whepOutputEntries: Array<{ outputId: string; endpointId: string }> = [];
+  let outputBlockIndex = 0;
   if (outputDocs && outputDocs.length > 0) {
     for (const outputDoc of outputDocs) {
       // Sanitize the output doc ID for use in block/endpoint IDs: strip non-alphanumeric chars,
@@ -490,12 +525,13 @@ export async function activateStromFlow(
           block_definition_id: 'builtin.whep_output',
           name: outputDoc.name,
           properties: { endpoint_id: endpointId, mode: 'audio_video' },
-          position: { x: 1600, y: 800 + whepOutputEntries.length * 150 },
+          position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
         if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
         // Wire audio from the audio mixer main_out — required for audio_video mode
         if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in` });
         whepOutputEntries.push({ outputId: outputDoc._id, endpointId });
+        outputBlockIndex++;
       } else {
         // mpegtssrt or efpsrt — both use the MPEG-TS/SRT output block.
         // Skip if no URL — an empty srt_uri fails at GStreamer READY state.
@@ -505,8 +541,9 @@ export async function activateStromFlow(
           block_definition_id: 'builtin.mpegtssrt_output',
           name: outputDoc.name,
           properties: { srt_uri: outputDoc.url },
-          position: { x: 1600, y: 300 + flow.blocks.length * 80 },
+          position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
+        outputBlockIndex++;
         if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
         // Wire audio from the audio mixer main_out
         if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in_0` });

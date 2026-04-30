@@ -249,6 +249,8 @@ export interface ProductionDoc {
   audioMixerBlockId?: string;
   /** DSK layer visibility state, keyed by 0-based layer index */
   dskLayers?: Record<number, boolean>;
+  /** Warnings accumulated when a referenced source/graphic/output was deleted while production was inactive */
+  deletionWarnings?: Array<{ type: 'source' | 'graphic' | 'output'; name: string }>;
   createdAt: string;
   updatedAt: string;
 }

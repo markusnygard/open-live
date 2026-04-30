@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getGraphicsDb, getDb } from '../db/index.js';
 import type { GraphicDoc, ProductionDoc } from '../db/types.js';
+import { updateProductionDoc } from './productions.js';
 
 // Accept both http/https URLs and data: URIs (inline HTML overlays)
 const urlOrDataUri = z.string().min(1).refine(
@@ -73,18 +74,32 @@ const graphicsRoutes: FastifyPluginAsync = async (fastify) => {
       const doc = await getGraphicsDb().get(req.params.id);
 
       // Block deletion if the graphic is assigned to an active or activating production
-      const activeProductions = await getDb().find({
-        selector: { type: 'production', status: { $in: ['active', 'activating'] } },
-        fields: ['_id', 'name', 'graphicAssignments'],
-        limit: 100,
+      const allProductions = await getDb().find({
+        selector: { type: 'production' },
+        fields: ['_id', 'name', 'status', 'graphicAssignments', 'deletionWarnings'],
+        limit: 200,
       });
-      const inUse = activeProductions.docs.find((p) => {
-        const assignments = (p as unknown as ProductionDoc).graphicAssignments ?? [];
-        return assignments.some((a) => a.graphicId === req.params.id);
+      const activeInUse = allProductions.docs.find((p) => {
+        const prod = p as unknown as ProductionDoc;
+        return (prod.status === 'active' || prod.status === 'activating') &&
+          (prod.graphicAssignments ?? []).some((a) => a.graphicId === req.params.id);
       });
-      if (inUse) {
-        const prod = inUse as unknown as Pick<ProductionDoc, '_id' | 'name'>;
+      if (activeInUse) {
+        const prod = activeInUse as unknown as Pick<ProductionDoc, '_id' | 'name'>;
         return reply.status(409).send({ error: `Graphic is in use by active production "${prod.name}"` });
+      }
+
+      // Remove references from inactive productions and record a warning
+      for (const p of allProductions.docs) {
+        const prod = p as unknown as ProductionDoc;
+        if (prod.status !== 'inactive') continue;
+        if (!(prod.graphicAssignments ?? []).some((a) => a.graphicId === req.params.id)) continue;
+        const warnings = prod.deletionWarnings ?? [];
+        warnings.push({ type: 'graphic', name: doc.name });
+        await updateProductionDoc(prod._id, {
+          graphicAssignments: (prod.graphicAssignments ?? []).filter((a) => a.graphicId !== req.params.id),
+          deletionWarnings: warnings,
+        });
       }
 
       await getGraphicsDb().destroy(doc._id, doc._rev!);
