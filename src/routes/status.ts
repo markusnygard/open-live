@@ -5,6 +5,10 @@ import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
 
 const statusRoutes: FastifyPluginAsync = async (fastify) => {
+  fastify.get('/api/v1/ping', async (_req, reply) => {
+    return reply.send({ ok: true });
+  });
+
   fastify.get('/api/v1/status', async (_req, reply) => {
     const [db, strom] = await Promise.all([
       isDbReady(),
