@@ -15,6 +15,7 @@ export interface ActivationResult {
   mixerBlockId: string | null;
   audioMixerBlockId: string | null;
   whepOutputEntries?: Array<{ outputId: string; endpointId: string }>;
+  pgmWhepEndpointId?: string;
 }
 
 function findPgmFeedPad(flow: StromFlowTemplate['flow']): string | null {
@@ -145,13 +146,28 @@ export async function activateStromFlow(
       }
     }
 
-    // Uniquify the multiview WHEP endpoint_id per production so concurrent
-    // productions don't collide on the same WHEP stream name.
+    // Uniquify WHEP endpoint_ids per production so concurrent productions don't
+    // collide on the same WHEP stream name.
     if (b['block_definition_id'] === 'builtin.whep_output') {
       if (typeof props['endpoint_id'] === 'string') {
         props['endpoint_id'] = `${props['endpoint_id']}-${endpointSuffix}`;
       }
       b['properties'] = props;
+    }
+  }
+
+  // Extract the PGM WHEP endpoint_id (now uniquified to 'pgm-{suffix}') so the
+  // activation route can construct the full WHEP URL for the production doc.
+  let pgmWhepEndpointId: string | undefined;
+  for (const block of flow.blocks) {
+    const b = block as Record<string, unknown>;
+    if (
+      b['block_definition_id'] === 'builtin.whep_output' &&
+      (b['name'] as string | undefined) === 'PGM Output'
+    ) {
+      const props = (b['properties'] ?? {}) as Record<string, unknown>;
+      if (typeof props['endpoint_id'] === 'string') pgmWhepEndpointId = props['endpoint_id'];
+      break;
     }
   }
 
@@ -587,7 +603,7 @@ export async function activateStromFlow(
     throw err;
   }
 
-  return { flowId, mixerBlockId, audioMixerBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined };
+  return { flowId, mixerBlockId, audioMixerBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined, pgmWhepEndpointId };
 }
 
 /**

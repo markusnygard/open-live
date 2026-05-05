@@ -77,6 +77,7 @@ async function runActivationFlow(
   let mixerBlockId: string | undefined;
   let audioMixerBlockId: string | undefined;
   let whepOutputEntries: Array<{ outputId: string; endpointId: string }> | undefined;
+  let pgmWhepEndpointId: string | undefined;
 
   try {
     // Load the current production doc
@@ -107,6 +108,7 @@ async function runActivationFlow(
     mixerBlockId = activation.mixerBlockId ?? undefined;
     audioMixerBlockId = activation.audioMixerBlockId ?? undefined;
     whepOutputEntries = activation.whepOutputEntries;
+    pgmWhepEndpointId = activation.pgmWhepEndpointId;
     // mixerBlockId/audioMixerBlockId come directly from the flow generator — they are the
     // randomised IDs actually used in the live Strom flow, not the static template IDs.
 
@@ -203,6 +205,7 @@ async function runActivationFlow(
         await updateProductionDoc(productionId, {
           status: 'active',
           whepEndpoint,
+          pgmWhepEndpoint: pgmWhepEndpointId ? `${config.stromUrl}/whep/${pgmWhepEndpointId}` : undefined,
           whipEndpoints: whipEndpoints.length > 0 ? whipEndpoints : undefined,
           srtOutputUri: undefined,
           whepOutputUrls: whepOutputUrls && whepOutputUrls.length > 0 ? whepOutputUrls : undefined,
@@ -241,6 +244,7 @@ async function runActivationFlow(
       stromFlowId: undefined,
       mixerBlockId: undefined,
       whepEndpoint: undefined,
+      pgmWhepEndpoint: undefined,
       whipEndpoints: undefined,
     }).catch((resetErr) => {
       log.error({ resetErr, productionId }, 'Failed to reset production to inactive after activation failure');
@@ -475,6 +479,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         stromFlowId: undefined,
         mixerBlockId: undefined,
         whepEndpoint: undefined,
+        pgmWhepEndpoint: undefined,
         whipEndpoints: undefined,
         srtOutputUri: undefined,
         whepOutputUrls: undefined,

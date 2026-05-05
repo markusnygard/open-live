@@ -262,6 +262,9 @@ export interface PadPropertiesResponse {
 export interface UpdatePropertyRequest {
   property_name: string
   value: unknown
+  /** Optional ramp duration in ms. Honoured for volume and mute transitions.
+   *  Values > 50 ms use a 12-point dB-linear curve for even-sounding fades. */
+  ramp_ms?: number
 }
 
 export interface UpdatePadPropertyRequest {
@@ -519,15 +522,21 @@ export class StromClient {
         res = await fetch(url, {
           method,
           headers: this.headers(),
-          body: body !== undefined ? JSON.stringify(body) : undefined,
+          body: body !== undefined
+            // JSON.stringify serialises 10.0 as "10" (integer) — Python's json.loads
+            // then parses it as int, which Strom rejects for float fields like volume.
+            // Force a decimal point on any bare-integer "value" field so the backend
+            // always receives a JSON number with a fractional part.
+            ? JSON.stringify(body).replace(/"value":(-?\d+)([,}])/g, '"value":$1.0$2')
+            : undefined,
         })
         break
       } catch (err) {
         const e = err as Error & { cause?: Error & { code?: string } }
         if (attempt === 0 && e.cause?.code === 'UND_ERR_SOCKET') {
-          // Strom closed the connection (often while processing a low-volume audio
-          // adjustment). Wait briefly for it to recover, then retry on a fresh socket.
-          await new Promise<void>((r) => setTimeout(r, 300))
+          // Strom closed the pooled connection. undici evicts the stale socket on the
+          // first failure, so the immediate retry opens a fresh TCP connection — no
+          // sleep needed (sleeping gave Strom time to close the fresh socket too).
           continue
         }
         const cause = e.cause ? ` [cause: ${e.cause.message ?? String(e.cause)}${e.cause.code ? ` code=${e.cause.code}` : ''}]` : ''

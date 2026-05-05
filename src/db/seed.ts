@@ -47,6 +47,13 @@ const DEFAULT_TEMPLATE: Omit<StromFlowTemplate, '_id' | '_rev'> = {
         position: { x: 850.0, y: 600.0 },
       },
       {
+        id: 'b9f3c2e1a4d5b6c7e8f9a0b1c2d3e4f5',
+        block_definition_id: 'builtin.whep_output',
+        name: 'PGM Output',
+        properties: { endpoint_id: 'pgm', low_latency: true, mode: 'audio_video' },
+        position: { x: 850.0, y: 300.0 },
+      },
+      {
         id: 'b035ceff6c25d4bc2bb7a1d36eb0c4308',
         block_definition_id: 'builtin.videoenc',
         name: 'Enc MV',
@@ -93,6 +100,7 @@ const DEFAULT_TEMPLATE: Omit<StromFlowTemplate, '_id' | '_rev'> = {
       // PGM/MV video routing
       { from: 'bba5be208b1904f9aae46c38c6c4d23a2:pgm_out',       to: 'b370f5d3ce9774e869f262aa5714f7a74:video_in' },
       { from: 'b370f5d3ce9774e869f262aa5714f7a74:encoded_out',    to: 'b0454efed640a402cafb4727e6a259514:video_in' },
+      { from: 'b370f5d3ce9774e869f262aa5714f7a74:encoded_out',    to: 'b9f3c2e1a4d5b6c7e8f9a0b1c2d3e4f5:video_in' },
       { from: 'bba5be208b1904f9aae46c38c6c4d23a2:multiview_out',  to: 'b035ceff6c25d4bc2bb7a1d36eb0c4308:video_in' },
       { from: 'b035ceff6c25d4bc2bb7a1d36eb0c4308:encoded_out',    to: 'bdaf7aa1547ee4a11b8b2b147264b2694:video_in' },
       // Static video inputs: test sources (V2, V3)

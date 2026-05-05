@@ -48,8 +48,9 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
         );
         if (!mixerBlock) return reply.send([]);
 
-        const rawCh = mixerBlock.properties?.num_channels;
-        const numChannels = typeof rawCh === 'number' ? rawCh : typeof rawCh === 'string' ? parseInt(rawCh, 10) || 0 : 0;
+        const numChannels = typeof mixerBlock.properties?.num_channels === 'number'
+          ? mixerBlock.properties.num_channels as number
+          : 0;
         if (numChannels === 0) return reply.send([]);
 
         // Build audio-channel-index → source name map.

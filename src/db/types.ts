@@ -232,6 +232,8 @@ export interface ProductionDoc {
   stromFlowId?: string;
   /** WHEP multiview endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
   whepEndpoint?: string;
+  /** WHEP PGM output endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
+  pgmWhepEndpoint?: string;
   /** WHIP ingest endpoint URLs for each __whip__ source assignment — set on activate, cleared on deactivate */
   whipEndpoints?: Array<{ mixerInput: string; url: string }>;
   /** SRT program output URI (listener) — set on activate, cleared on deactivate */
