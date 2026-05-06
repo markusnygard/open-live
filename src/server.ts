@@ -29,9 +29,12 @@ export async function buildServer() {
   });
 
   await fastify.register(cors, {
-    origin: config.corsOrigin === '*' ? true : config.corsOrigin.split(','),
+    origin: config.corsOrigin === '*'
+      ? async (origin: string | undefined) => origin ?? '*'
+      : config.corsOrigin.split(','),
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true,
     maxAge: 86400,
     strictPreflight: false,
   });
