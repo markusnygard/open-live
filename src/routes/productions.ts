@@ -426,7 +426,6 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       const abortController = new AbortController();
       activationAbortControllers.set(doc._id, abortController);
 
-      // Derive public base URL for WHIP endpoint construction
       const proto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim()
         ?? req.protocol
         ?? 'https'
@@ -478,11 +477,15 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         status: 'inactive',
         stromFlowId: undefined,
         mixerBlockId: undefined,
+        audioMixerBlockId: undefined,
         whepEndpoint: undefined,
         pgmWhepEndpoint: undefined,
         whipEndpoints: undefined,
         srtOutputUri: undefined,
         whepOutputUrls: undefined,
+        overlayAlpha: undefined,
+        dskLayers: undefined,
+        tally: { pgm: null, pvw: null },
         updatedAt: new Date().toISOString(),
       };
       const response = await getDb().insert(updated);

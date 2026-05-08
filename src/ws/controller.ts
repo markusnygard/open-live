@@ -10,9 +10,9 @@ import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
 
 type InboundMessage =
-  | { type: 'CUT'; mixerInput: string }
-  | { type: 'TRANSITION'; mixerInput: string; transitionType: string; durationMs?: number }
-  | { type: 'TAKE' }
+  | { type: 'CUT'; mixerInput: string; afvRampMs?: number }
+  | { type: 'TRANSITION'; mixerInput: string; transitionType: string; durationMs?: number; afvRampMs?: number }
+  | { type: 'TAKE'; afvRampMs?: number }
   | { type: 'SET_PVW'; mixerInput: string }
   | { type: 'FTB'; active?: boolean; durationMs?: number }
   | { type: 'SET_OVL'; alpha: number }
@@ -38,9 +38,10 @@ function padToIndex(mixerInput: string): number | null {
   return match ? parseInt(match[1], 10) : null;
 }
 
+const VALID_STROM_TRANSITIONS = new Set<StromTransitionType>(['cut', 'fade', 'slide_left', 'slide_right', 'slide_up', 'slide_down']);
+
 function toStromTransition(type: string): StromTransitionType {
-  if (type === 'mix' || type === 'dip') return 'fade';
-  if (type === 'push') return 'slide_left';
+  if (VALID_STROM_TRANSITIONS.has(type as StromTransitionType)) return type as StromTransitionType;
   return 'cut';
 }
 
@@ -132,7 +133,8 @@ function clearAudioState(productionId: string): void {
 
 /**
  * Returns the 0-based audio channel index for a given mixerInput, or null if
- * the source has no audio channel (html/whip/test sources are skipped).
+ * the source has no audio channel (html/test sources are skipped).
+ * WHIP sources (including the virtual "Whip" source) carry audio and are included.
  */
 async function resolveAudioChannelIndex(doc: ProductionDoc, mixerInput: string): Promise<number | null> {
   const sorted = [...doc.sources].sort((a, b) => a.mixerInput.localeCompare(b.mixerInput));
@@ -143,8 +145,15 @@ async function resolveAudioChannelIndex(doc: ProductionDoc, mixerInput: string):
     try {
       const src = await sourcesDb.get(assignment.sourceId);
       streamType = src.streamType;
-    } catch { continue; }
-    if (streamType === 'html' || streamType === 'whip' || streamType === 'test1' || streamType === 'test2') continue;
+    } catch {
+      // "Whip" is a virtual WHIP source that carries audio — treat it as 'whip'
+      if (assignment.sourceId === 'Whip') {
+        streamType = 'whip';
+      } else {
+        continue; // other virtual sources (test1, test2, html) have no audio
+      }
+    }
+    if (streamType === 'html' || streamType === 'test1' || streamType === 'test2') continue;
     if (assignment.mixerInput === mixerInput) return audioIdx;
     audioIdx++;
   }
@@ -169,6 +178,7 @@ async function applyAudioFollow(
   stromFlowId: string,
   audioBlockId: string,
   strom: StromClient,
+  rampMs = 200,
 ): Promise<void> {
   // Default to empty set — an uninitialised registry never routes all channels.
   const afvChannels = afvChannelsByProduction.get(productionId) ?? new Set<string>();
@@ -182,9 +192,14 @@ async function applyAudioFollow(
       const src = await sourcesDb.get(assignment.sourceId);
       streamType = src.streamType;
     } catch {
-      continue; // virtual source — no audio channel
+      // "Whip" is a virtual WHIP source that carries audio — treat it as 'whip'
+      if (assignment.sourceId === 'Whip') {
+        streamType = 'whip';
+      } else {
+        continue; // other virtual sources (test1, test2, html) have no audio
+      }
     }
-    if (streamType === 'html' || streamType === 'whip' || streamType === 'test1' || streamType === 'test2') continue;
+    if (streamType === 'html' || streamType === 'test1' || streamType === 'test2') continue;
 
     const chIdx = ++audioIdx;
     // Only update routing for channels the operator has opted into AFV.
@@ -197,7 +212,7 @@ async function applyAudioFollow(
       await strom.properties.updateElement(stromFlowId, elemId, {
         property_name: 'mute',
         value: !routed,
-        ramp_ms: 200,
+        ramp_ms: rampMs,
       });
     } catch (err) {
       console.warn(`[controller] audio follow ch${chIdx} error:`, String(err));
@@ -242,7 +257,7 @@ async function handleMessage(
       broadcast(productionId, { type: 'TALLY', ...newTally });
       await stromTransition(doc, tally.pgm, msg.mixerInput, 'cut');
       if (doc.stromFlowId && ctx.audioBlockId) {
-        void applyAudioFollow(productionId, doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient());
+        void applyAudioFollow(productionId, doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampMs);
       }
       break;
     }
@@ -255,7 +270,7 @@ async function handleMessage(
       broadcast(productionId, { type: 'TALLY', ...newTally, transitionType: msg.transitionType, durationMs: msg.durationMs });
       await stromTransition(doc, tally.pgm, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
       if (doc.stromFlowId && ctx.audioBlockId) {
-        void applyAudioFollow(productionId, doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient());
+        void applyAudioFollow(productionId, doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampMs);
       }
       break;
     }
@@ -268,7 +283,7 @@ async function handleMessage(
       broadcast(productionId, { type: 'TALLY', ...newTally });
       await stromTransition(doc, tally.pgm, tally.pvw, 'cut');
       if (doc.stromFlowId && ctx.audioBlockId) {
-        void applyAudioFollow(productionId, doc, tally.pvw, doc.stromFlowId, ctx.audioBlockId, await makeStromClient());
+        void applyAudioFollow(productionId, doc, tally.pvw, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampMs);
       }
       break;
     }

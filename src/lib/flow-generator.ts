@@ -293,8 +293,8 @@ export async function activateStromFlow(
     mixerBlock['properties'] = props;
   }
 
-  // Set num_channels on the audio mixer = number of dynamic SRT/EFP sources
-  // (test/whip sources don't carry audio in this template).
+  // Set num_channels on the audio mixer = number of SRT/EFP/WHIP sources
+  // (test1/test2/html sources don't carry audio in this template).
   // num_channels is a Strom enum: valid values are 2, 4, 8, 12, 16, 24, 32.
   // Round up to the nearest valid value; never set it below 2.
   if (audioMixerBlock) {
