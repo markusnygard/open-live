@@ -23,7 +23,13 @@ type InboundMessage =
   | { type: 'DSK_TOGGLE'; layer: number; visible?: boolean }
   | { type: 'MACRO_EXEC'; macroId: string }
   | { type: 'AUDIO_SET'; elementId: string; property: 'volume' | 'mute'; value: unknown; ramp_ms?: number }
-  | { type: 'AFV_SET'; mixerInput: string; enabled: boolean };
+  | { type: 'AFV_SET'; mixerInput: string; enabled: boolean }
+  | { type: 'PFL_SET'; elementId: string; enabled: boolean; volume?: number }
+  | { type: 'AUX_SEND_SET'; elementId: string; auxBus: number; level: number; enabled: boolean }
+  | { type: 'AUX_MASTER_SET'; auxBus: number; volume: number; muted: boolean }
+  | { type: 'GRP_SEND_SET'; elementId: string; grpBus: number; level: number; enabled: boolean }
+  | { type: 'GRP_MASTER_SET'; grpBus: number; volume: number; muted: boolean }
+  | { type: 'SOURCE_OFFSET_SET'; mixerInput: string; offsetMs: number };
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -124,11 +130,19 @@ const mutedElementsByProduction = new Map<string, Set<string>>()
  */
 const activeFlowIdByProduction = new Map<string, string>()
 
+/**
+ * Per-production runtime offset registry.
+ * Maps productionId → (mixerInput → offsetMs).
+ * Populated by SOURCE_OFFSET_SET messages; sent to new clients on connect.
+ */
+const sourceOffsetsByProduction = new Map<string, Map<string, number>>()
+
 /** Wipe all per-production audio state. Called when the pipeline changes. */
 function clearAudioState(productionId: string): void {
   afvChannelsByProduction.delete(productionId)
   mutedElementsByProduction.delete(productionId)
   activeFlowIdByProduction.delete(productionId)
+  sourceOffsetsByProduction.delete(productionId)
 }
 
 /**
@@ -580,6 +594,189 @@ async function handleMessage(
       broadcast(productionId, { type: 'AFV_STATE', mixerInput: msg.mixerInput, enabled: msg.enabled });
       break;
     }
+    case 'PFL_SET': {
+      // Set pfl_volume_N:volume on the audio mixer to route this channel to the PFL bus.
+      // elementId is the API channel ID, e.g. 'ch1' (1-indexed) → pfl_volume_0 (0-indexed).
+      // pfl_out is allow-not-linked so this is safe even when no WHEP client is connected.
+      const chMatch = /^ch(\d+)$/.exec(msg.elementId);
+      if (chMatch && doc.stromFlowId && ctx.audioBlockId) {
+        const chIdx = parseInt(chMatch[1], 10) - 1; // 0-based
+        const pflElementId = `${ctx.audioBlockId}:pfl_volume_${chIdx}`;
+        const strom = await makeStromClient();
+        // When disabling: always 0. When enabling: use provided volume (fader level)
+        // or default to 1.0 (unity) so PFL matches perceived channel level.
+        const pflValue = msg.enabled ? (msg.volume ?? 1.0) : 0.0;
+        await strom.properties.updateElement(doc.stromFlowId, pflElementId, {
+          property_name: 'volume',
+          value: pflValue,
+        }).catch((err) => console.warn('[controller] PFL_SET error:', err));
+      }
+      // Broadcast so all operator clients stay in sync
+      broadcast(productionId, { type: 'PFL_STATE', elementId: msg.elementId, enabled: msg.enabled });
+      break;
+    }
+    case 'AUX_SEND_SET': {
+      // Set aux_send_{chIdx}_{auxIdx}:volume on the audio mixer for the given AUX bus.
+      // elementId is the API channel ID, e.g. 'ch1' (1-indexed) → chIdx=0.
+      // auxBus is 1-indexed on the wire (AUX 1 → auxIdx=0).
+      // Strom receives enabled ? level : 0.  The fader position (level) is always
+      // broadcast so all clients preserve the saved level across ON/OFF.
+      const chMatch = /^ch(\d+)$/.exec(msg.elementId);
+      if (chMatch && doc.stromFlowId && ctx.audioBlockId) {
+        const chIdx = parseInt(chMatch[1], 10) - 1;     // 0-based
+        const auxIdx = msg.auxBus - 1;                   // 0-based
+        const auxElementId = `${ctx.audioBlockId}:aux_send_${chIdx}_${auxIdx}`;
+        const stromValue = msg.enabled ? msg.level : 0;
+        const flowId = doc.stromFlowId;
+        const debounceKey = `${productionId}:aux:${auxElementId}`;
+        const prev = pendingVolume.get(debounceKey);
+        if (prev) clearTimeout(prev);
+        pendingVolume.set(debounceKey, setTimeout(async () => {
+          pendingVolume.delete(debounceKey);
+          try {
+            const s = await makeStromClient();
+            await s.properties.updateElement(flowId, auxElementId, {
+              property_name: 'volume',
+              value: stromValue,
+            });
+          } catch (err) {
+            console.warn('[controller] AUX_SEND_SET error:', err);
+          }
+        }, 150));
+      }
+      // Broadcast level + enabled so all clients can restore fader position and ON/OFF state
+      broadcast(productionId, { type: 'AUX_SEND_STATE', elementId: msg.elementId, auxBus: msg.auxBus, level: msg.level, enabled: msg.enabled });
+      break;
+    }
+    case 'AUX_MASTER_SET': {
+      // Set aux{N}_volume:volume on the audio mixer (the AUX bus master fader).
+      // auxBus is 1-indexed; Strom element is 0-indexed: aux1 → aux0_volume.
+      // When muted, Strom receives 0; the fader level is always broadcast so all
+      // clients preserve the saved level even while the master is silenced.
+      if (doc.stromFlowId && ctx.audioBlockId) {
+        const auxElementId = `${ctx.audioBlockId}:aux${msg.auxBus - 1}_volume`;
+        const stromValue = msg.muted ? 0 : msg.volume;
+        const flowId = doc.stromFlowId;
+        const debounceKey = `${productionId}:aux-master:${auxElementId}`;
+        const prev = pendingVolume.get(debounceKey);
+        if (prev) clearTimeout(prev);
+        pendingVolume.set(debounceKey, setTimeout(async () => {
+          pendingVolume.delete(debounceKey);
+          try {
+            const s = await makeStromClient();
+            await s.properties.updateElement(flowId, auxElementId, {
+              property_name: 'volume',
+              value: stromValue,
+            });
+          } catch (err) {
+            console.warn('[controller] AUX_MASTER_SET error:', err);
+          }
+        }, 150));
+      }
+      broadcast(productionId, { type: 'AUX_MASTER_STATE', auxBus: msg.auxBus, volume: msg.volume, muted: msg.muted });
+      break;
+    }
+    case 'GRP_SEND_SET': {
+      // Set to_grp{grpIdx}_vol_{chIdx}:volume on the audio mixer.
+      // elementId is API channel ID e.g. 'ch1' (1-indexed) → chIdx=0.
+      // grpBus is 1-indexed (GRP 1 → grpIdx=0).
+      // Strom receives enabled ? level : 0. Fader position always broadcast for multi-client sync.
+      const chMatch = /^ch(\d+)$/.exec(msg.elementId);
+      if (chMatch && doc.stromFlowId && ctx.audioBlockId) {
+        const chIdx = parseInt(chMatch[1], 10) - 1;
+        const grpIdx = msg.grpBus - 1;
+        const grpElementId = `${ctx.audioBlockId}:to_grp${grpIdx}_vol_${chIdx}`;
+        const stromValue = msg.enabled ? msg.level : 0;
+        const flowId = doc.stromFlowId;
+        const debounceKey = `${productionId}:grp:${grpElementId}`;
+        const prev = pendingVolume.get(debounceKey);
+        if (prev) clearTimeout(prev);
+        pendingVolume.set(debounceKey, setTimeout(async () => {
+          pendingVolume.delete(debounceKey);
+          try {
+            const s = await makeStromClient();
+            await s.properties.updateElement(flowId, grpElementId, {
+              property_name: 'volume',
+              value: stromValue,
+            });
+          } catch (err) {
+            console.warn('[controller] GRP_SEND_SET error:', err);
+          }
+        }, 150));
+      }
+      broadcast(productionId, { type: 'GRP_SEND_STATE', elementId: msg.elementId, grpBus: msg.grpBus, level: msg.level, enabled: msg.enabled });
+      break;
+    }
+    case 'GRP_MASTER_SET': {
+      // Set group{N}_volume:volume on the audio mixer (group bus master fader).
+      // grpBus is 1-indexed; Strom element is 0-indexed: grp1 → group0_volume.
+      // Groups auto-feed into main — the group master fader controls contribution to PGM output.
+      // When muted, Strom receives 0; fader level always broadcast for multi-client sync.
+      if (doc.stromFlowId && ctx.audioBlockId) {
+        const grpElementId = `${ctx.audioBlockId}:group${msg.grpBus - 1}_volume`;
+        const stromValue = msg.muted ? 0 : msg.volume;
+        const flowId = doc.stromFlowId;
+        const debounceKey = `${productionId}:grp-master:${grpElementId}`;
+        const prev = pendingVolume.get(debounceKey);
+        if (prev) clearTimeout(prev);
+        pendingVolume.set(debounceKey, setTimeout(async () => {
+          pendingVolume.delete(debounceKey);
+          try {
+            const s = await makeStromClient();
+            await s.properties.updateElement(flowId, grpElementId, {
+              property_name: 'volume',
+              value: stromValue,
+            });
+          } catch (err) {
+            console.warn('[controller] GRP_MASTER_SET error:', err);
+          }
+        }, 150));
+      }
+      broadcast(productionId, { type: 'GRP_MASTER_STATE', grpBus: msg.grpBus, volume: msg.volume, muted: msg.muted });
+      break;
+    }
+    case 'SOURCE_OFFSET_SET': {
+      // Apply a time offset (ms) to the builtin.time_offset block for this mixer input.
+      // The offset is applied live to the running Strom flow and stored in the runtime
+      // registry so newly-connected clients receive the current value on connect.
+      const { mixerInput, offsetMs } = msg;
+      if (!Number.isFinite(offsetMs)) break;
+
+      // Update runtime registry
+      const offsets = sourceOffsetsByProduction.get(productionId) ?? new Map<string, number>();
+      offsets.set(mixerInput, offsetMs);
+      sourceOffsetsByProduction.set(productionId, offsets);
+
+      // Apply to Strom if the flow is running and we know the block ID.
+      // offset_ms is a synthetic property on builtin.time_offset blocks — Strom stores it
+      // via pad.set_offset() on the identity element's src pad (not a GStreamer element property).
+      if (!doc.stromFlowId) {
+        console.warn('[controller] SOURCE_OFFSET_SET: production not active, offset stored in registry only');
+      } else if (!doc.sourceOffsetBlockIds?.[mixerInput]) {
+        console.warn(`[controller] SOURCE_OFFSET_SET: no offset block for ${mixerInput} — re-activate production to pick up time_offset blocks`);
+      } else {
+        const offsetBlockId = doc.sourceOffsetBlockIds[mixerInput];
+        const flowId = doc.stromFlowId;
+        const debounceKey = `${productionId}:offset:${mixerInput}`;
+        const prev = pendingVolume.get(debounceKey);
+        if (prev) clearTimeout(prev);
+        pendingVolume.set(debounceKey, setTimeout(async () => {
+          pendingVolume.delete(debounceKey);
+          try {
+            const s = await makeStromClient();
+            await s.properties.updateElement(flowId, `${offsetBlockId}:offset_identity`, {
+              property_name: 'offset_ms',
+              value: offsetMs,
+            });
+          } catch (err) {
+            console.warn(`[controller] SOURCE_OFFSET_SET error (${mixerInput}):`, String(err));
+          }
+        }, 150));
+      }
+
+      broadcast(productionId, { type: 'SOURCE_OFFSET_STATE', mixerInput, offsetMs });
+      break;
+    }
     default: {
       ws.send(JSON.stringify({ type: 'ERROR', error: 'Unknown message type' }));
     }
@@ -754,6 +951,14 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             const currentAfvSet = afvChannelsByProduction.get(id) ?? new Set<string>();
             for (const mixerInput of currentAfvSet) {
               socket.send(JSON.stringify({ type: 'AFV_STATE', mixerInput, enabled: true }));
+            }
+            // Send current source offset state so newly-connected clients inherit
+            // any offsets set by other operators without needing a round-trip.
+            const currentOffsets = sourceOffsetsByProduction.get(id);
+            if (currentOffsets) {
+              for (const [mixerInput, offsetMs] of currentOffsets) {
+                socket.send(JSON.stringify({ type: 'SOURCE_OFFSET_STATE', mixerInput, offsetMs }));
+              }
             }
             startMeterRelay(id, connectDoc.stromFlowId, audioBlockId);
           }

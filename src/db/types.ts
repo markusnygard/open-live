@@ -249,6 +249,8 @@ export interface ProductionDoc {
   overlayAlpha?: number;
   mixerBlockId?: string;
   audioMixerBlockId?: string;
+  /** Maps mixerInput (e.g. 'video_in_1') → time_offset block ID — set on activate, cleared on deactivate */
+  sourceOffsetBlockIds?: Record<string, string>;
   /** DSK layer visibility state, keyed by 0-based layer index */
   dskLayers?: Record<number, boolean>;
   /** Warnings accumulated when a referenced source/graphic/output was deleted while production was inactive */

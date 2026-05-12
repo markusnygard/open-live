@@ -42,6 +42,22 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
             broadcast(productionId, { type: 'METER_DATA', elementId: 'main', peak, rms });
             return;
           }
+          // AUX bus master meters: Strom emits "meter:aux1", "meter:aux2" (1-indexed)
+          if (suffix.startsWith('aux')) {
+            const auxNum = parseInt(suffix.slice(3), 10);
+            if (Number.isFinite(auxNum)) {
+              broadcast(productionId, { type: 'METER_DATA', elementId: `aux${auxNum}`, peak, rms });
+              return;
+            }
+          }
+          // GROUP bus master meters: Strom emits "meter:group1", "meter:group2" (1-indexed)
+          if (suffix.startsWith('group')) {
+            const grpNum = parseInt(suffix.slice(5), 10);
+            if (Number.isFinite(grpNum)) {
+              broadcast(productionId, { type: 'METER_DATA', elementId: `grp${grpNum}`, peak, rms });
+              return;
+            }
+          }
           const chNum = parseInt(suffix, 10);
           if (!Number.isFinite(chNum)) return;
           broadcast(productionId, { type: 'METER_DATA', elementId: `ch${chNum}`, peak, rms });

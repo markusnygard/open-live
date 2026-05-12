@@ -71,7 +71,7 @@ const DEFAULT_TEMPLATE: Omit<StromFlowTemplate, '_id' | '_rev'> = {
         id: 'b08c7a35f181a4f6a90f5e2c517df284a',
         block_definition_id: 'builtin.mixer',
         name: 'Audio Mixer',
-        properties: { num_aux_buses: 0, num_channels: 2, num_groups: 0 },
+        properties: { num_aux_buses: 2, num_channels: 2, num_groups: 2 },
         position: { x: 250.0, y: 650.0 },
       },
       {

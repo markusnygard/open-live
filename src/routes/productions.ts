@@ -121,6 +121,7 @@ async function runActivationFlow(
       stromFlowId,
       ...(mixerBlockId !== undefined && { mixerBlockId }),
       ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
+      ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
     });
 
     // Step 3: Poll until flow reaches 'playing' or we time out
@@ -142,6 +143,30 @@ async function runActivationFlow(
           (b) => (b as unknown as { block_definition_id?: string }).block_definition_id === 'builtin.mixer',
         ) as { id?: string } | undefined;
         if (runningAudioBlock?.id) audioMixerBlockId = runningAudioBlock.id;
+
+        // Re-resolve sourceOffsetBlockIds from the running flow — Strom may assign server-generated
+        // IDs that differ from the template block IDs we stored at activation time.
+        // Strategy: find all builtin.time_offset blocks and match their names to mixerInputs.
+        // The flow generator names them "Offset V{padIndex}" where padIndex maps to video_in_{N},
+        // so this is reliable without needing flow.links (which may be absent in the GET response).
+        const runningOffsetBlocks = (flow.blocks ?? []).filter(
+          (b) => b.block_definition_id === 'builtin.time_offset',
+        );
+        if (runningOffsetBlocks.length > 0) {
+          const resolvedOffsetBlockIds: Record<string, string> = {};
+          for (const offsetBlock of runningOffsetBlocks) {
+            if (!offsetBlock.id) continue;
+            // Name is "Offset V{N}" → mixerInput "video_in_{N}"
+            const nameMatch = /^Offset V(\d+)$/.exec(offsetBlock.name ?? '');
+            if (!nameMatch) continue;
+            const mixerInput = `video_in_${nameMatch[1]}`;
+            resolvedOffsetBlockIds[mixerInput] = offsetBlock.id;
+          }
+          if (Object.keys(resolvedOffsetBlockIds).length > 0) {
+            activation.sourceOffsetBlockIds = resolvedOffsetBlockIds;
+            log.info({ productionId, resolvedOffsetBlockIds }, 'Re-resolved sourceOffsetBlockIds from running flow');
+          }
+        }
 
         // Step 4: Retrieve WHEP multiview endpoint
         let whepEndpoint: string | undefined;
@@ -211,6 +236,7 @@ async function runActivationFlow(
           whepOutputUrls: whepOutputUrls && whepOutputUrls.length > 0 ? whepOutputUrls : undefined,
           tally: initialTally,
           ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
+          ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
         });
 
         log.info({ productionId, stromFlowId, whepEndpoint, initialTally, audioMixerBlockId }, 'Production activated — flow playing');
@@ -478,6 +504,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         stromFlowId: undefined,
         mixerBlockId: undefined,
         audioMixerBlockId: undefined,
+        sourceOffsetBlockIds: undefined,
         whepEndpoint: undefined,
         pgmWhepEndpoint: undefined,
         whipEndpoints: undefined,

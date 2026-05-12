@@ -16,6 +16,8 @@ export interface ActivationResult {
   audioMixerBlockId: string | null;
   whepOutputEntries?: Array<{ outputId: string; endpointId: string }>;
   pgmWhepEndpointId?: string;
+  /** Maps mixerInput (e.g. 'video_in_1') → time_offset block ID — so the WS layer can apply live offset changes */
+  sourceOffsetBlockIds: Record<string, string>;
 }
 
 function findPgmFeedPad(flow: StromFlowTemplate['flow']): string | null {
@@ -207,18 +209,19 @@ export async function activateStromFlow(
   ) as Record<string, unknown> | undefined;
   const audioMixerBlockId = typeof audioMixerBlock?.['id'] === 'string' ? audioMixerBlock['id'] : null;
 
-  // Re-wire the template's multiview WHEP output audio to the audio mixer main_out.
-  // The template's original audio connection (e.g. direct from vision mixer) bypasses
-  // AFV — replacing it with main_out ensures the multiview hears the AFV-controlled mix.
+  // Re-wire all WHEP outputs to the audio mixer main_out (AFV-controlled program mix).
+  // AUX 1 / AUX 2 are independent monitor buses routed to their own aux_out pads —
+  // they are not exposed via WHEP (Strom's whepserversink only supports a single
+  // audio track). When Strom adds multi-track WHEP, route aux buses as separate tracks.
   if (audioMixerBlockId) {
     for (const block of flow.blocks) {
       const b = block as Record<string, unknown>;
       if (b['block_definition_id'] !== 'builtin.whep_output') continue;
-      const mvId = b['id'] as string;
+      const whepId = b['id'] as string;
       flow.links = (flow.links as Array<Record<string, unknown>>).filter(
-        (l) => !((l['to'] as string | undefined) ?? '').startsWith(`${mvId}:audio`),
+        (l) => !((l['to'] as string | undefined) ?? '').startsWith(`${whepId}:audio`),
       );
-      flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${mvId}:audio_in` });
+      flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${whepId}:audio_in` });
     }
   }
 
@@ -332,11 +335,15 @@ export async function activateStromFlow(
   }
 
   let audioChannelIndex = 0;
-  const ROW_H = 150;      // vertical spacing between rows
-  const ROW_START = 50;   // y of first input row
-  const COL_ELEM = -500;  // col 1: cefsrc / videotestsrc elements
-  const COL_INPUT = -250; // col 2: input blocks (mpegtssrt_input, whip_input, videoformat)
-  const COL_OUTPUT = 850; // col 5: output blocks
+  const ROW_H = 150;        // vertical spacing between rows
+  const ROW_START = 50;     // y of first input row
+  const COL_ELEM = -500;    // col 1: cefsrc / videotestsrc elements
+  const COL_INPUT = -250;   // col 2: input blocks (mpegtssrt_input, whip_input, videoformat)
+  const COL_OFFSET = 0;     // col 3: time_offset blocks (between source and mixer)
+  const COL_OUTPUT = 850;   // col 5: output blocks
+
+  // Maps mixerInput → time_offset block ID — returned so the WS layer can apply live changes.
+  const sourceOffsetBlockIds: Record<string, string> = {};
 
   for (const assignment of sortedAssignments) {
     const padMatch = /video_in_(\d+)$/.exec(assignment.mixerInput);
@@ -348,6 +355,20 @@ export async function activateStromFlow(
 
     const yPos = ROW_START + padIndex * ROW_H;
     const inputId = `b-input-${padIndex}-${endpointSuffix}`;
+
+    // Insert a time_offset block between this source and the vision mixer.
+    // Starts at 0 ms; operators adjust it live via SOURCE_OFFSET_SET WS messages.
+    const offsetId = `b-offset-${padIndex}-${endpointSuffix}`;
+    flow.blocks.push({
+      id: offsetId,
+      block_definition_id: 'builtin.time_offset',
+      name: `Offset V${padIndex}`,
+      properties: { offset_ms: 0.0 },
+      position: { x: COL_OFFSET, y: yPos },
+    });
+    sourceOffsetBlockIds[assignment.mixerInput] = offsetId;
+    // Final link: offset → mixer (applies to all source types below)
+    flow.links.push({ from: `${offsetId}:out`, to: `${mixerBlockId}:${assignment.mixerInput}` });
 
     const TEST_PATTERNS: Record<string, string> = { test1: 'Pinwheel', test2: 'Colors' }
     if (source.streamType === 'test1' || source.streamType === 'test2') {
@@ -368,7 +389,7 @@ export async function activateStromFlow(
       });
       flow.links.push(
         { from: `${elemId}:src`, to: `${fmtId}:video_in` },
-        { from: `${fmtId}:video_out`, to: `${mixerBlockId}:${assignment.mixerInput}` },
+        { from: `${fmtId}:video_out`, to: `${offsetId}:in` },
       );
     } else if (source.streamType === 'html') {
       const elemId = `e-html-${padIndex}-${endpointSuffix}`;
@@ -378,10 +399,10 @@ export async function activateStromFlow(
         properties: { url: source.address },
         position: [COL_ELEM, yPos],
       });
-      // Connect directly to the mixer — same pattern as DSK overlays.
+      // Connect directly to offset block — same pattern as before but via offset.
       // Skipping builtin.videoformat avoids autovideoconvert trying to use GL,
       // which conflicts with cefsrc's X11/Xvfb rendering context on GPU hosts.
-      flow.links.push({ from: `${elemId}:src`, to: `${mixerBlockId}:${assignment.mixerInput}` });
+      flow.links.push({ from: `${elemId}:src`, to: `${offsetId}:in` });
     } else if (source.streamType === 'whip') {
       const audioChannel = audioChannelIndex++;
       const endpointId = `whip-${padIndex}-${endpointSuffix}`;
@@ -392,7 +413,7 @@ export async function activateStromFlow(
         properties: { endpoint_id: endpointId },
         position: { x: COL_INPUT, y: yPos },
       });
-      flow.links.push({ from: `${inputId}:video_out`, to: `${mixerBlockId}:${assignment.mixerInput}` });
+      flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
       flow.links.push({ from: `${inputId}:audio_out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${inputId}:audio_out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
@@ -415,7 +436,7 @@ export async function activateStromFlow(
         },
         position: { x: COL_INPUT, y: yPos },
       });
-      flow.links.push({ from: `${inputId}:video_out`, to: `${mixerBlockId}:${assignment.mixerInput}` });
+      flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
       // Wire audio:
       //  - Vision mixer: audio_in_N must match the video pad index N so the mixer
       //    correlates audio with the correct video source (a3 for video_in_3, etc.).
@@ -603,7 +624,7 @@ export async function activateStromFlow(
     throw err;
   }
 
-  return { flowId, mixerBlockId, audioMixerBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined, pgmWhepEndpointId };
+  return { flowId, mixerBlockId, audioMixerBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined, pgmWhepEndpointId, sourceOffsetBlockIds };
 }
 
 /**
