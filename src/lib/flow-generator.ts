@@ -124,9 +124,22 @@ export async function activateStromFlow(
   })();
 
   const pgmBitrate = typeof production.values?.bitrate === 'number' ? production.values.bitrate : undefined;
+  const multiviewBitrate = typeof production.values?.multiview_bitrate === 'number' ? production.values.multiview_bitrate : undefined;
   const pgmFramerate = typeof production.values?.pgm_framerate === 'string' ? production.values.pgm_framerate : undefined;
   const multiviewResolution = typeof production.values?.multiview_resolution === 'string' ? production.values.multiview_resolution : undefined;
   const multiviewFramerate = typeof production.values?.multiview_framerate === 'string' ? production.values.multiview_framerate : undefined;
+  const numAuxBuses = (() => {
+    const v = production.values?.num_aux_buses;
+    if (typeof v === 'number') return v;
+    if (typeof v === 'string') { const n = parseInt(v, 10); return isNaN(n) ? undefined : n; }
+    return undefined;
+  })();
+  const numGroups = (() => {
+    const v = production.values?.num_groups;
+    if (typeof v === 'number') return v;
+    if (typeof v === 'string') { const n = parseInt(v, 10); return isNaN(n) ? undefined : n; }
+    return undefined;
+  })();
 
   for (const block of flow.blocks) {
     const b = block as Record<string, unknown>;
@@ -145,11 +158,22 @@ export async function activateStromFlow(
       b['properties'] = props;
     }
 
-    if (b['block_definition_id'] === 'builtin.videoenc' && pgmBitrate !== undefined) {
-      if ((b['name'] as string | undefined) === 'Enc PGM') {
+    if (b['block_definition_id'] === 'builtin.videoenc') {
+      const name = b['name'] as string | undefined;
+      if (name === 'Enc PGM' && pgmBitrate !== undefined) {
         props['bitrate'] = pgmBitrate;
         b['properties'] = props;
       }
+      if (name === 'Enc MV' && multiviewBitrate !== undefined) {
+        props['bitrate'] = multiviewBitrate;
+        b['properties'] = props;
+      }
+    }
+
+    if (b['block_definition_id'] === 'builtin.mixer') {
+      if (numAuxBuses !== undefined) props['num_aux_buses'] = numAuxBuses;
+      if (numGroups !== undefined) props['num_groups'] = numGroups;
+      b['properties'] = props;
     }
 
     // Uniquify WHEP endpoint_ids per production so concurrent productions don't
@@ -226,26 +250,18 @@ export async function activateStromFlow(
   const mainAudioSource = audioMixerBlockId ? `${audioMixerBlockId}:main_out` : null;
 
   // Wire all template WHEP outputs:
-  //   audio_in   (track 0) ← main programme mix via loudness block
-  //   audio_in_1 (track 1) ← monitor_out (headphone/PFL bus) when audio mixer present
-  // num_audio_tracks is bumped to 2 so Strom creates the second audio input pad.
-  const monitorAudioSource = audioMixerBlockId ? `${audioMixerBlockId}:monitor_out` : null;
+  //   audio_in (track 0) ← main programme mix
+  // TODO: add monitor_out (PFL/AFL bus) to audio_in_1 once Strom multi-track WHEP API is confirmed.
   for (const block of flow.blocks) {
     const b = block as Record<string, unknown>;
     if (b['block_definition_id'] !== 'builtin.whep_output') continue;
     const whepId = b['id'] as string;
-    const props = ((b['properties'] ?? {}) as Record<string, unknown>);
     // Remove any existing audio links to this block — we rebuild them below.
     flow.links = (flow.links as Array<Record<string, unknown>>).filter(
       (l) => !((l['to'] as string | undefined) ?? '').startsWith(`${whepId}:audio`),
     );
     if (mainAudioSource) {
-      props['num_audio_tracks'] = monitorAudioSource ? 2 : 1;
-      b['properties'] = props;
       flow.links.push({ from: mainAudioSource, to: `${whepId}:audio_in` });
-      if (monitorAudioSource) {
-        flow.links.push({ from: monitorAudioSource, to: `${whepId}:audio_in_1` });
-      }
     }
   }
 
@@ -587,13 +603,11 @@ export async function activateStromFlow(
           name: outputDoc.name,
           properties: {
             endpoint_id: endpointId,
-            num_audio_tracks: monitorAudioSource ? 2 : 1,
           },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
         if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
         if (mainAudioSource) flow.links.push({ from: mainAudioSource, to: `${blockId}:audio_in` });
-        if (monitorAudioSource) flow.links.push({ from: monitorAudioSource, to: `${blockId}:audio_in_1` });
         whepOutputEntries.push({ outputId: outputDoc._id, endpointId });
         outputBlockIndex++;
       } else {
