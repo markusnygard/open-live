@@ -8,6 +8,7 @@ import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
 import { StromClient, type TransitionType as StromTransitionType } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
+import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
 
 type InboundMessage =
   | { type: 'CUT'; mixerInput: string; afvRampMs?: number }
@@ -25,6 +26,7 @@ type InboundMessage =
   | { type: 'AUDIO_SET'; elementId: string; property: 'volume' | 'mute'; value: unknown; ramp_ms?: number }
   | { type: 'AFV_SET'; mixerInput: string; enabled: boolean }
   | { type: 'PFL_SET'; elementId: string; enabled: boolean; volume?: number }
+  | { type: 'AFL_SET'; elementId: string; enabled: boolean }
   | { type: 'AUX_SEND_SET'; elementId: string; auxBus: number; level: number; enabled: boolean }
   | { type: 'AUX_MASTER_SET'; auxBus: number; volume: number; muted: boolean }
   | { type: 'GRP_SEND_SET'; elementId: string; grpBus: number; level: number; enabled: boolean }
@@ -45,6 +47,7 @@ function padToIndex(mixerInput: string): number | null {
 }
 
 const VALID_STROM_TRANSITIONS = new Set<StromTransitionType>(['cut', 'fade', 'slide_left', 'slide_right', 'slide_up', 'slide_down']);
+
 
 function toStromTransition(type: string): StromTransitionType {
   if (VALID_STROM_TRANSITIONS.has(type as StromTransitionType)) return type as StromTransitionType;
@@ -80,7 +83,7 @@ async function stromTransition(
   const fromIndex = fromMixerInput ? (padToIndex(fromMixerInput) ?? toIndex) : toIndex;
   try {
     const strom = await makeStromClient();
-    await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { input: toIndex });
+    await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { input: toIndex } });
     await strom.mixer.transition(doc.stromFlowId, doc.mixerBlockId, {
       from_input: fromIndex,
       to_input: toIndex,
@@ -137,12 +140,14 @@ const activeFlowIdByProduction = new Map<string, string>()
  */
 const sourceOffsetsByProduction = new Map<string, Map<string, number>>()
 
+
 /** Wipe all per-production audio state. Called when the pipeline changes. */
 function clearAudioState(productionId: string): void {
   afvChannelsByProduction.delete(productionId)
   mutedElementsByProduction.delete(productionId)
   activeFlowIdByProduction.delete(productionId)
   sourceOffsetsByProduction.delete(productionId)
+  numAudioChannelsByProduction.delete(productionId)
 }
 
 /**
@@ -200,6 +205,7 @@ async function applyAudioFollow(
   const sourcesDb = getSourcesDb();
 
   let audioIdx = 0;
+  const properties: Record<string, unknown> = {};
   for (const assignment of sorted) {
     let streamType: string | undefined;
     try {
@@ -221,16 +227,11 @@ async function applyAudioFollow(
     if (!afvChannels.has(assignment.mixerInput)) continue;
 
     const routed = newPgmMixerInput === null || assignment.mixerInput === newPgmMixerInput;
-    const elemId = `${audioBlockId}:to_main_vol_${chIdx - 1}`;
-    try {
-      await strom.properties.updateElement(stromFlowId, elemId, {
-        property_name: 'mute',
-        value: !routed,
-        ramp_ms: rampMs,
-      });
-    } catch (err) {
-      console.warn(`[controller] audio follow ch${chIdx} error:`, String(err));
-    }
+    properties[`ch${chIdx}_to_main`] = routed;
+  }
+  if (Object.keys(properties).length > 0) {
+    await strom.flows.updateBlockProperties(stromFlowId, audioBlockId, { properties, ramp_ms: rampMs })
+      .catch((err) => console.warn('[controller] audio follow error:', String(err)));
   }
 }
 
@@ -313,7 +314,7 @@ async function handleMessage(
         if (inputIndex !== null) {
           try {
             const strom = await makeStromClient();
-            await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { input: inputIndex });
+            await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { input: inputIndex } });
           } catch (err) {
             console.warn('[controller] Strom selectPreview error:', err);
           }
@@ -485,48 +486,31 @@ async function handleMessage(
           console.warn('[controller] AUDIO_SET: builtin.mixer block not found');
           break;
         }
-        let stromElementId: string;
-        let property: string;
-        if (msg.elementId === 'main') {
-          stromElementId = `${ctx.audioBlockId}:main_volume`;
-          property = msg.property === 'volume' ? 'volume' : 'mute';
-        } else {
-          const chMatch = /^ch(\d+)$/.exec(msg.elementId);
-          if (!chMatch) {
-            ws.send(JSON.stringify({ type: 'ERROR', error: 'Invalid audio channel id' }));
-            break;
-          }
-          const ch = parseInt(chMatch[1], 10);
-          if (msg.property === 'volume') {
-            stromElementId = `${ctx.audioBlockId}:volume_${ch - 1}`;
-            property = 'volume';
-          } else {
-            // Mute targets the routing layer (to_main_vol_N) so that the channel
-            // signal stays active and VU meters remain visible even when OFF.
-            // volume_N:mute is always kept false; only routing is toggled.
-            stromElementId = `${ctx.audioBlockId}:to_main_vol_${ch - 1}`;
-            property = 'mute';
-          }
-        }
         if (msg.property === 'volume') {
           // Debounce: coalesce rapid nudges into one Strom PATCH.
           // Broadcast immediately for UI responsiveness; only the final value is sent to Strom.
           broadcast(productionId, { type: 'AUDIO_STATE', elementId: msg.elementId, property: msg.property, value: msg.value });
-          const debounceKey = `${productionId}:${stromElementId}`;
+          // Extract ch number before closure (only valid when elementId !== 'main')
+          const chMatch = msg.elementId !== 'main' ? /^ch(\d+)$/.exec(msg.elementId) : null;
+          if (msg.elementId !== 'main' && !chMatch) {
+            ws.send(JSON.stringify({ type: 'ERROR', error: 'Invalid audio channel id' }));
+            break;
+          }
+          const ch = chMatch ? parseInt(chMatch[1], 10) : null;
+          const debounceKey = `${productionId}:vol:${msg.elementId}`;
           const prev = pendingVolume.get(debounceKey);
           if (prev) clearTimeout(prev);
           const flowId = doc.stromFlowId;
-          const capturedStromId = stromElementId;
-          const capturedProperty = property;
+          const capturedAudioBlockId = ctx.audioBlockId;
           const capturedValue = msg.value;
           const capturedLogicalId = msg.elementId;
           pendingVolume.set(debounceKey, setTimeout(async () => {
             pendingVolume.delete(debounceKey);
             try {
               const s = await makeStromClient();
-              await s.properties.updateElement(flowId, capturedStromId, {
-                property_name: capturedProperty,
-                value: capturedValue,
+              const propName = capturedLogicalId === 'main' ? 'main_fader' : `ch${ch}_fader`;
+              await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
+                properties: { [propName]: capturedValue },
               });
             } catch (err) {
               console.warn('[controller] Strom audio update error:', err);
@@ -542,9 +526,21 @@ async function handleMessage(
               else mutedSet.delete(msg.elementId);
             }
           }
-          await strom.properties.updateElement(doc.stromFlowId, stromElementId, {
-            property_name: property,
-            value: msg.value,
+          let props: Record<string, unknown>;
+          if (msg.elementId === 'main') {
+            props = { main_mute: msg.value };
+          } else {
+            const chMatch = /^ch(\d+)$/.exec(msg.elementId);
+            if (!chMatch) {
+              ws.send(JSON.stringify({ type: 'ERROR', error: 'Invalid audio channel id' }));
+              break;
+            }
+            const ch = parseInt(chMatch[1], 10);
+            // to_main = !mute (true=ON routing, false=OFF routing)
+            props = { [`ch${ch}_to_main`]: !msg.value };
+          }
+          await strom.flows.updateBlockProperties(doc.stromFlowId, ctx.audioBlockId, {
+            properties: props,
             ...(msg.ramp_ms !== undefined && { ramp_ms: msg.ramp_ms }),
           });
           broadcast(productionId, { type: 'AUDIO_STATE', elementId: msg.elementId, property: msg.property, value: msg.value });
@@ -578,9 +574,8 @@ async function handleMessage(
             mutedElementsByProduction.get(productionId)?.delete(elementId);
             broadcast(productionId, { type: 'AUDIO_STATE', elementId, property: 'mute', value: false });
             const strom = await makeStromClient();
-            await strom.properties.updateElement(doc.stromFlowId, `${ctx.audioBlockId}:to_main_vol_${chIdx}`, {
-              property_name: 'mute',
-              value: !isOnPgm,
+            await strom.flows.updateBlockProperties(doc.stromFlowId, `${ctx.audioBlockId}`, {
+              properties: { [`ch${chIdx + 1}_to_main`]: isOnPgm },
             }).catch((err) => console.warn('[controller] AFV_SET routing error:', err));
           }
         }
@@ -595,24 +590,63 @@ async function handleMessage(
       break;
     }
     case 'PFL_SET': {
-      // Set pfl_volume_N:volume on the audio mixer to route this channel to the PFL bus.
-      // elementId is the API channel ID, e.g. 'ch1' (1-indexed) → pfl_volume_0 (0-indexed).
-      // pfl_out is allow-not-linked so this is safe even when no WHEP client is connected.
+      if (!activePflByProduction.has(productionId)) activePflByProduction.set(productionId, new Set());
+      const activeSet = activePflByProduction.get(productionId)!;
+      if (msg.enabled) activeSet.add(msg.elementId); else activeSet.delete(msg.elementId);
+
+      // Mutually exclusive per strip — enabling PFL cancels AFL on the same channel
+      if (msg.enabled) activeAflByProduction.get(productionId)?.delete(msg.elementId);
+
       const chMatch = /^ch(\d+)$/.exec(msg.elementId);
       if (chMatch && doc.stromFlowId && ctx.audioBlockId) {
-        const chIdx = parseInt(chMatch[1], 10) - 1; // 0-based
-        const pflElementId = `${ctx.audioBlockId}:pfl_volume_${chIdx}`;
         const strom = await makeStromClient();
-        // When disabling: always 0. When enabling: use provided volume (fader level)
-        // or default to 1.0 (unity) so PFL matches perceived channel level.
-        const pflValue = msg.enabled ? (msg.volume ?? 1.0) : 0.0;
-        await strom.properties.updateElement(doc.stromFlowId, pflElementId, {
-          property_name: 'volume',
-          value: pflValue,
-        }).catch((err) => console.warn('[controller] PFL_SET error:', err));
+        const anySolo = anySoloActive(productionId);
+        const props: Record<string, unknown> = { [`ch${chMatch[1]}_pfl`]: msg.enabled };
+        if (msg.enabled) props[`ch${chMatch[1]}_afl`] = false;
+        await strom.flows.updateBlockProperties(doc.stromFlowId, ctx.audioBlockId, {
+          properties: props,
+          ramp_ms: 50,
+        }).catch((err: unknown) => console.warn('[controller] PFL_SET block props error:', err));
+        await Promise.all([
+          strom.properties.updateElement(doc.stromFlowId, `${ctx.audioBlockId}:solo_to_mon`,
+            { property_name: 'volume', value: anySolo ? 1.0 : 0.0, ramp_ms: 50 }),
+          strom.properties.updateElement(doc.stromFlowId, `${ctx.audioBlockId}:main_to_mon`,
+            { property_name: 'volume', value: anySolo ? 0.0 : 1.0, ramp_ms: 50 }),
+        ]).catch((err: unknown) => console.warn('[controller] PFL_SET gate error:', err));
       }
-      // Broadcast so all operator clients stay in sync
+
       broadcast(productionId, { type: 'PFL_STATE', elementId: msg.elementId, enabled: msg.enabled });
+      if (msg.enabled) broadcast(productionId, { type: 'AFL_STATE', elementId: msg.elementId, enabled: false });
+      break;
+    }
+    case 'AFL_SET': {
+      if (!activeAflByProduction.has(productionId)) activeAflByProduction.set(productionId, new Set());
+      const activeAflSet = activeAflByProduction.get(productionId)!;
+      if (msg.enabled) activeAflSet.add(msg.elementId); else activeAflSet.delete(msg.elementId);
+
+      // Mutually exclusive per strip — enabling AFL cancels PFL on the same channel
+      if (msg.enabled) activePflByProduction.get(productionId)?.delete(msg.elementId);
+
+      const aflChMatch = /^ch(\d+)$/.exec(msg.elementId);
+      if (aflChMatch && doc.stromFlowId && ctx.audioBlockId) {
+        const strom = await makeStromClient();
+        const anySolo = anySoloActive(productionId);
+        const aflProps: Record<string, unknown> = { [`ch${aflChMatch[1]}_afl`]: msg.enabled };
+        if (msg.enabled) aflProps[`ch${aflChMatch[1]}_pfl`] = false;
+        await strom.flows.updateBlockProperties(doc.stromFlowId, ctx.audioBlockId, {
+          properties: aflProps,
+          ramp_ms: 50,
+        }).catch((err: unknown) => console.warn('[controller] AFL_SET block props error:', err));
+        await Promise.all([
+          strom.properties.updateElement(doc.stromFlowId, `${ctx.audioBlockId}:solo_to_mon`,
+            { property_name: 'volume', value: anySolo ? 1.0 : 0.0, ramp_ms: 50 }),
+          strom.properties.updateElement(doc.stromFlowId, `${ctx.audioBlockId}:main_to_mon`,
+            { property_name: 'volume', value: anySolo ? 0.0 : 1.0, ramp_ms: 50 }),
+        ]).catch((err: unknown) => console.warn('[controller] AFL_SET gate error:', err));
+      }
+
+      broadcast(productionId, { type: 'AFL_STATE', elementId: msg.elementId, enabled: msg.enabled });
+      if (msg.enabled) broadcast(productionId, { type: 'PFL_STATE', elementId: msg.elementId, enabled: false });
       break;
     }
     case 'AUX_SEND_SET': {
@@ -624,20 +658,19 @@ async function handleMessage(
       const chMatch = /^ch(\d+)$/.exec(msg.elementId);
       if (chMatch && doc.stromFlowId && ctx.audioBlockId) {
         const chIdx = parseInt(chMatch[1], 10) - 1;     // 0-based
-        const auxIdx = msg.auxBus - 1;                   // 0-based
-        const auxElementId = `${ctx.audioBlockId}:aux_send_${chIdx}_${auxIdx}`;
+        const chNum = chIdx + 1;
         const stromValue = msg.enabled ? msg.level : 0;
         const flowId = doc.stromFlowId;
-        const debounceKey = `${productionId}:aux:${auxElementId}`;
+        const capturedAudioBlockId = ctx.audioBlockId;
+        const debounceKey = `${productionId}:aux:ch${chNum}_aux${msg.auxBus}`;
         const prev = pendingVolume.get(debounceKey);
         if (prev) clearTimeout(prev);
         pendingVolume.set(debounceKey, setTimeout(async () => {
           pendingVolume.delete(debounceKey);
           try {
             const s = await makeStromClient();
-            await s.properties.updateElement(flowId, auxElementId, {
-              property_name: 'volume',
-              value: stromValue,
+            await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
+              properties: { [`ch${chNum}_aux${msg.auxBus}_level`]: stromValue },
             });
           } catch (err) {
             console.warn('[controller] AUX_SEND_SET error:', err);
@@ -654,19 +687,20 @@ async function handleMessage(
       // When muted, Strom receives 0; the fader level is always broadcast so all
       // clients preserve the saved level even while the master is silenced.
       if (doc.stromFlowId && ctx.audioBlockId) {
-        const auxElementId = `${ctx.audioBlockId}:aux${msg.auxBus - 1}_volume`;
-        const stromValue = msg.muted ? 0 : msg.volume;
         const flowId = doc.stromFlowId;
-        const debounceKey = `${productionId}:aux-master:${auxElementId}`;
+        const capturedAudioBlockId = ctx.audioBlockId;
+        const debounceKey = `${productionId}:aux-master:${msg.auxBus}`;
         const prev = pendingVolume.get(debounceKey);
         if (prev) clearTimeout(prev);
         pendingVolume.set(debounceKey, setTimeout(async () => {
           pendingVolume.delete(debounceKey);
           try {
             const s = await makeStromClient();
-            await s.properties.updateElement(flowId, auxElementId, {
-              property_name: 'volume',
-              value: stromValue,
+            await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
+              properties: {
+                [`aux${msg.auxBus}_fader`]: msg.volume,
+                [`aux${msg.auxBus}_mute`]: msg.muted,
+              },
             });
           } catch (err) {
             console.warn('[controller] AUX_MASTER_SET error:', err);
@@ -684,20 +718,17 @@ async function handleMessage(
       const chMatch = /^ch(\d+)$/.exec(msg.elementId);
       if (chMatch && doc.stromFlowId && ctx.audioBlockId) {
         const chIdx = parseInt(chMatch[1], 10) - 1;
-        const grpIdx = msg.grpBus - 1;
-        const grpElementId = `${ctx.audioBlockId}:to_grp${grpIdx}_vol_${chIdx}`;
-        const stromValue = msg.enabled ? msg.level : 0;
         const flowId = doc.stromFlowId;
-        const debounceKey = `${productionId}:grp:${grpElementId}`;
+        const capturedAudioBlockId = ctx.audioBlockId;
+        const debounceKey = `${productionId}:grp:ch${chIdx + 1}_grp${msg.grpBus}`;
         const prev = pendingVolume.get(debounceKey);
         if (prev) clearTimeout(prev);
         pendingVolume.set(debounceKey, setTimeout(async () => {
           pendingVolume.delete(debounceKey);
           try {
             const s = await makeStromClient();
-            await s.properties.updateElement(flowId, grpElementId, {
-              property_name: 'volume',
-              value: stromValue,
+            await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
+              properties: { [`ch${chIdx + 1}_to_grp${msg.grpBus}`]: msg.enabled },
             });
           } catch (err) {
             console.warn('[controller] GRP_SEND_SET error:', err);
@@ -713,19 +744,20 @@ async function handleMessage(
       // Groups auto-feed into main — the group master fader controls contribution to PGM output.
       // When muted, Strom receives 0; fader level always broadcast for multi-client sync.
       if (doc.stromFlowId && ctx.audioBlockId) {
-        const grpElementId = `${ctx.audioBlockId}:group${msg.grpBus - 1}_volume`;
-        const stromValue = msg.muted ? 0 : msg.volume;
         const flowId = doc.stromFlowId;
-        const debounceKey = `${productionId}:grp-master:${grpElementId}`;
+        const capturedAudioBlockId = ctx.audioBlockId;
+        const debounceKey = `${productionId}:grp-master:${msg.grpBus}`;
         const prev = pendingVolume.get(debounceKey);
         if (prev) clearTimeout(prev);
         pendingVolume.set(debounceKey, setTimeout(async () => {
           pendingVolume.delete(debounceKey);
           try {
             const s = await makeStromClient();
-            await s.properties.updateElement(flowId, grpElementId, {
-              property_name: 'volume',
-              value: stromValue,
+            await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
+              properties: {
+                [`group${msg.grpBus}_fader`]: msg.volume,
+                [`group${msg.grpBus}_mute`]: msg.muted,
+              },
             });
           } catch (err) {
             console.warn('[controller] GRP_MASTER_SET error:', err);
@@ -841,8 +873,8 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       if (connectDoc?.stromFlowId && connectDoc?.mixerBlockId) {
         try {
           const strom = await makeStromClient();
-          const ovl = await strom.mixer.getOverlayAlpha(connectDoc.stromFlowId, connectDoc.mixerBlockId);
-          socket.send(JSON.stringify({ type: 'OVL_STATE', alpha: ovl.alpha }));
+          const state = await strom.mixer.getState(connectDoc.stromFlowId, connectDoc.mixerBlockId);
+          socket.send(JSON.stringify({ type: 'OVL_STATE', alpha: state.overlay_alpha }));
         } catch {
           if (connectDoc.overlayAlpha !== undefined) {
             socket.send(JSON.stringify({ type: 'OVL_STATE', alpha: connectDoc.overlayAlpha }));
@@ -870,87 +902,93 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           const mixerBlock = audioBlockId ? blocks.find((b) => b.id === audioBlockId) : undefined;
           if (audioBlockId) {
             ctx.audioBlockId = audioBlockId;
-            const numChannels = typeof mixerBlock?.properties?.num_channels === 'number'
-              ? mixerBlock.properties.num_channels as number
+            const rawNumCh = mixerBlock?.properties?.num_channels;
+            const numChannels = typeof rawNumCh === 'number' ? rawNumCh
+              : typeof rawNumCh === 'string' ? parseInt(rawNumCh, 10)
               : 0;
+            numAudioChannelsByProduction.set(id, numChannels);
             // Only initialise registries on first connect for this production.
             // Subsequent connects (refresh, second operator) inherit existing state.
             const isFirstConnect = !afvChannelsByProduction.has(id);
             if (isFirstConnect) {
               afvChannelsByProduction.set(id, new Set());
               mutedElementsByProduction.set(id, new Set());
-              // Clear volume_N:mute for all channels so signal is always active —
-              // pre-fader metering stays visible even when a strip is OFF.
-              // Clear to_main_vol_N routing so every channel reaches main at start.
-              await Promise.allSettled([
-                ...Array.from({ length: numChannels }, (_, i) =>
-                  strom.properties.updateElement(connectDoc.stromFlowId!, `${audioBlockId}:volume_${i}`, {
-                    property_name: 'mute', value: false,
-                  })
-                ),
-                ...Array.from({ length: numChannels }, (_, i) =>
-                  strom.properties.updateElement(connectDoc.stromFlowId!, `${audioBlockId}:to_main_vol_${i}`, {
-                    property_name: 'mute', value: false,
-                  })
-                ),
-              ]);
+              // All channels: signal always active, all open to main at start.
+              const initProps: Record<string, unknown> = {};
+              for (let i = 1; i <= numChannels; i++) {
+                initProps[`ch${i}_mute`]    = false;
+                initProps[`ch${i}_to_main`] = true;
+              }
+              await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
+                .catch((err) => console.warn('[controller] init channel props error:', err));
             } else {
               // Returning/additional client — re-apply Strom state from registries in
               // case Strom restarted and lost its in-memory routing state.
               const afvSet   = afvChannelsByProduction.get(id) ?? new Set<string>();
               const mutedSet = mutedElementsByProduction.get(id) ?? new Set<string>();
-              // Ensure volume_N:mute is always false (signal always active)
-              await Promise.allSettled(
-                Array.from({ length: numChannels }, (_, i) =>
-                  strom.properties.updateElement(connectDoc.stromFlowId!, `${audioBlockId}:volume_${i}`, {
-                    property_name: 'mute', value: false,
-                  })
-                )
-              );
-              // Re-apply manual mutes (to_main_vol_N for muted non-AFV channels)
-              for (const elId of mutedSet) {
-                const chMatch = /^ch(\d+)$/.exec(elId);
-                if (chMatch) {
-                  const ch = parseInt(chMatch[1], 10);
-                  await strom.properties.updateElement(connectDoc.stromFlowId!, `${audioBlockId}:to_main_vol_${ch - 1}`, {
-                    property_name: 'mute', value: true,
-                  }).catch(() => {});
-                }
+              // Re-apply signal mute (always false) and routing from registry in one batch.
+              const channelProps: Record<string, unknown> = {};
+              for (let i = 1; i <= numChannels; i++) {
+                channelProps[`ch${i}_mute`]    = false;
+                channelProps[`ch${i}_to_main`] = !mutedSet.has(`ch${i}`);
               }
+              await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: channelProps })
+                .catch((err) => console.warn('[controller] re-apply channel props error:', err));
               // Re-apply AFV routing for channels that opted in
               if (afvSet.size > 0) {
                 const tally = getTally(id);
                 void applyAudioFollow(id, connectDoc, tally.pgm, connectDoc.stromFlowId!, audioBlockId, strom);
               }
+              // Re-apply PFL/AFL state after a restart.
+              const currentPflSet = activePflByProduction.get(id);
+              const currentAflSet = activeAflByProduction.get(id);
+              const soloProps: Record<string, unknown> = {};
+              for (const elId of (currentPflSet ?? [])) {
+                const m = /^ch(\d+)$/.exec(elId);
+                if (m) soloProps[`ch${m[1]}_pfl`] = true;
+              }
+              for (const elId of (currentAflSet ?? [])) {
+                const m = /^ch(\d+)$/.exec(elId);
+                if (m) soloProps[`ch${m[1]}_afl`] = true;
+              }
+              if (Object.keys(soloProps).length > 0) {
+                await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: soloProps, ramp_ms: 50 })
+                  .catch((err: unknown) => console.warn('[controller] solo re-apply error:', err));
+                const anySolo = anySoloActive(id);
+                await Promise.all([
+                  strom.properties.updateElement(connectDoc.stromFlowId!, `${audioBlockId}:solo_to_mon`, { property_name: 'volume', value: anySolo ? 1.0 : 0.0, ramp_ms: 50 }),
+                  strom.properties.updateElement(connectDoc.stromFlowId!, `${audioBlockId}:main_to_mon`, { property_name: 'volume', value: anySolo ? 0.0 : 1.0, ramp_ms: 50 }),
+                ]).catch((err: unknown) => console.warn('[controller] solo gate re-apply error:', err));
+              }
             }
-            // Read live fader levels from Strom; mute state comes from our registry
-            // (volume_N:mute is always false — we use to_main_vol_N for muting)
+            // Read live fader levels via block-properties; mute state from registry.
             const mutedSet = mutedElementsByProduction.get(id) ?? new Set<string>();
+            const blockProps = await strom.flows.getBlockProperties(connectDoc.stromFlowId, audioBlockId).catch(() => null);
             for (let i = 1; i <= numChannels; i++) {
-              try {
-                const res = await strom.properties.getElement(connectDoc.stromFlowId, `${audioBlockId}:volume_${i - 1}`);
-                const volume = res.properties['volume'];
-                if (typeof volume === 'number') {
-                  socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'volume', value: volume }));
-                }
-              } catch { /* element not yet ready or unavailable */ }
-              // Send mute state from registry — accurate regardless of Strom state
+              const volume = blockProps?.properties[`ch${i}_fader`];
+              if (typeof volume === 'number') {
+                socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'volume', value: volume }));
+              }
               const isMuted = mutedSet.has(`ch${i}`);
               socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'mute', value: isMuted }));
             }
             // Read main fader level
-            try {
-              const res = await strom.properties.getElement(connectDoc.stromFlowId, `${audioBlockId}:main_volume`);
-              const volume = res.properties['volume'];
-              if (typeof volume === 'number') {
-                socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: 'main', property: 'volume', value: volume }));
-              }
-            } catch { /* main volume element not yet ready */ }
+            const mainVolume = blockProps?.properties['main_fader'];
+            if (typeof mainVolume === 'number') {
+              socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: 'main', property: 'volume', value: mainVolume }));
+            }
             // Send current AFV state to this connecting client so it can restore
             // its store without the operator having to re-enable AFV per strip.
             const currentAfvSet = afvChannelsByProduction.get(id) ?? new Set<string>();
             for (const mixerInput of currentAfvSet) {
               socket.send(JSON.stringify({ type: 'AFV_STATE', mixerInput, enabled: true }));
+            }
+            // Send current PFL/AFL state so newly-connected clients show correct button state.
+            for (const elId of (activePflByProduction.get(id) ?? [])) {
+              socket.send(JSON.stringify({ type: 'PFL_STATE', elementId: elId, enabled: true }));
+            }
+            for (const elId of (activeAflByProduction.get(id) ?? [])) {
+              socket.send(JSON.stringify({ type: 'AFL_STATE', elementId: elId, enabled: true }));
             }
             // Send current source offset state so newly-connected clients inherit
             // any offsets set by other operators without needing a round-trip.
@@ -960,7 +998,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
                 socket.send(JSON.stringify({ type: 'SOURCE_OFFSET_STATE', mixerInput, offsetMs }));
               }
             }
-            startMeterRelay(id, connectDoc.stromFlowId, audioBlockId);
+            startMeterRelay(id, connectDoc.stromFlowId, audioBlockId, connectDoc.loudnessMainBlockId);
           }
         } catch (err) {
           console.warn('[controller] audio sync error:', err);

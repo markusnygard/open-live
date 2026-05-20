@@ -14,8 +14,12 @@ export interface ActivationResult {
   flowId: string;
   mixerBlockId: string | null;
   audioMixerBlockId: string | null;
+  /** ID of the builtin.loudness block inserted after the audio mixer main_out — used by meter relay */
+  loudnessMainBlockId: string | null;
   whepOutputEntries?: Array<{ outputId: string; endpointId: string }>;
   pgmWhepEndpointId?: string;
+  /** WHEP endpoint ID for the mixer's monitor_out (headphone/PFL) bus — undefined if no audio mixer */
+  monitorWhepEndpointId?: string;
   /** Maps mixerInput (e.g. 'video_in_1') → time_offset block ID — so the WS layer can apply live offset changes */
   sourceOffsetBlockIds: Record<string, string>;
 }
@@ -209,19 +213,39 @@ export async function activateStromFlow(
   ) as Record<string, unknown> | undefined;
   const audioMixerBlockId = typeof audioMixerBlock?.['id'] === 'string' ? audioMixerBlock['id'] : null;
 
-  // Re-wire all WHEP outputs to the audio mixer main_out (AFV-controlled program mix).
-  // AUX 1 / AUX 2 are independent monitor buses routed to their own aux_out pads —
-  // they are not exposed via WHEP (Strom's whepserversink only supports a single
-  // audio track). When Strom adds multi-track WHEP, route aux buses as separate tracks.
+  // Inject a builtin.loudness block as a parallel tap on the audio mixer main_out.
+  // The loudness block is NOT in series — main audio flows directly to all consumers.
+  // loudness:audio_out drains into a raw fakesink element so Strom doesn't stall.
+  // The block is pushed to flow.blocks after the output loop so its y position
+  // lands below the output/encoder blocks in the same Strom GUI column.
+  let loudnessMainBlockId: string | null = null;
   if (audioMixerBlockId) {
-    for (const block of flow.blocks) {
-      const b = block as Record<string, unknown>;
-      if (b['block_definition_id'] !== 'builtin.whep_output') continue;
-      const whepId = b['id'] as string;
-      flow.links = (flow.links as Array<Record<string, unknown>>).filter(
-        (l) => !((l['to'] as string | undefined) ?? '').startsWith(`${whepId}:audio`),
-      );
-      flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${whepId}:audio_in` });
+    loudnessMainBlockId = `b-loudness-main-${endpointSuffix}`;
+  }
+  // Main audio goes directly from the mixer — loudness is a side tap, not in the chain.
+  const mainAudioSource = audioMixerBlockId ? `${audioMixerBlockId}:main_out` : null;
+
+  // Wire all template WHEP outputs:
+  //   audio_in   (track 0) ← main programme mix via loudness block
+  //   audio_in_1 (track 1) ← monitor_out (headphone/PFL bus) when audio mixer present
+  // num_audio_tracks is bumped to 2 so Strom creates the second audio input pad.
+  const monitorAudioSource = audioMixerBlockId ? `${audioMixerBlockId}:monitor_out` : null;
+  for (const block of flow.blocks) {
+    const b = block as Record<string, unknown>;
+    if (b['block_definition_id'] !== 'builtin.whep_output') continue;
+    const whepId = b['id'] as string;
+    const props = ((b['properties'] ?? {}) as Record<string, unknown>);
+    // Remove any existing audio links to this block — we rebuild them below.
+    flow.links = (flow.links as Array<Record<string, unknown>>).filter(
+      (l) => !((l['to'] as string | undefined) ?? '').startsWith(`${whepId}:audio`),
+    );
+    if (mainAudioSource) {
+      props['num_audio_tracks'] = monitorAudioSource ? 2 : 1;
+      b['properties'] = props;
+      flow.links.push({ from: mainAudioSource, to: `${whepId}:audio_in` });
+      if (monitorAudioSource) {
+        flow.links.push({ from: monitorAudioSource, to: `${whepId}:audio_in_1` });
+      }
     }
   }
 
@@ -561,12 +585,15 @@ export async function activateStromFlow(
           id: blockId,
           block_definition_id: 'builtin.whep_output',
           name: outputDoc.name,
-          properties: { endpoint_id: endpointId, mode: 'audio_video' },
+          properties: {
+            endpoint_id: endpointId,
+            num_audio_tracks: monitorAudioSource ? 2 : 1,
+          },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
         if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
-        // Wire audio from the audio mixer main_out — required for audio_video mode
-        if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in` });
+        if (mainAudioSource) flow.links.push({ from: mainAudioSource, to: `${blockId}:audio_in` });
+        if (monitorAudioSource) flow.links.push({ from: monitorAudioSource, to: `${blockId}:audio_in_1` });
         whepOutputEntries.push({ outputId: outputDoc._id, endpointId });
         outputBlockIndex++;
       } else {
@@ -577,15 +604,50 @@ export async function activateStromFlow(
           id: blockId,
           block_definition_id: 'builtin.mpegtssrt_output',
           name: outputDoc.name,
-          properties: { srt_uri: outputDoc.url },
+          properties: {
+            srt_uri: outputDoc.url,
+            // Single audio track — MPEG-TS muxer stalls when monitor_out has no data (idle monitor bus),
+            // causing pipeline-wide back-pressure. Multi-track SRT requires Strom to guarantee continuous
+            // audio on monitor_out even when the monitor bus is silent.
+          },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
         outputBlockIndex++;
         if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
-        // Wire audio from the audio mixer main_out
-        if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in_0` });
+        if (mainAudioSource) flow.links.push({ from: mainAudioSource, to: `${blockId}:audio_in_0` });
       }
     }
+  }
+
+  // Loudness block — parallel tap, NOT in series. Placed below the video encoders.
+  // mixer:main_out → loudness:audio_in → loudness:audio_out → fakesink (drain).
+  if (loudnessMainBlockId && audioMixerBlockId) {
+    const encBlocks = flow.blocks.filter(
+      (b) => (b as Record<string, unknown>)['block_definition_id'] === 'builtin.videoenc',
+    ) as Record<string, unknown>[];
+    const encX = encBlocks.length > 0
+      ? (encBlocks[0]!['position'] as { x: number; y: number }).x
+      : COL_OUTPUT;
+    const maxEncY = encBlocks.reduce((max, b) => {
+      const y = (b['position'] as { x: number; y: number }).y;
+      return y > max ? y : max;
+    }, ROW_START);
+    flow.blocks.push({
+      id: loudnessMainBlockId,
+      block_definition_id: 'builtin.loudness',
+      name: 'Main Loudness',
+      properties: { interval: '100' },
+      position: { x: encX, y: maxEncY + ROW_H },
+    });
+    const fakesinkId = `e-loudness-sink-${endpointSuffix}`;
+    flow.elements.push({
+      id: fakesinkId,
+      element_type: 'fakesink',
+      properties: { sync: false },
+      position: [encX, maxEncY + ROW_H * 2],
+    } as unknown as typeof flow.elements[number]);
+    flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${loudnessMainBlockId}:audio_in` });
+    flow.links.push({ from: `${loudnessMainBlockId}:audio_out`, to: `${fakesinkId}:sink` });
   }
 
   // POST /api/flows takes the full Flow struct. The server requires 'id' in the
@@ -624,7 +686,7 @@ export async function activateStromFlow(
     throw err;
   }
 
-  return { flowId, mixerBlockId, audioMixerBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined, pgmWhepEndpointId, sourceOffsetBlockIds };
+  return { flowId, mixerBlockId, audioMixerBlockId, loudnessMainBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined, pgmWhepEndpointId, sourceOffsetBlockIds };
 }
 
 /**

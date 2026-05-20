@@ -11,7 +11,7 @@ interface RelayEntry {
 const relays = new Map<string, RelayEntry>();
 const RECONNECT_DELAY_MS = 5000;
 
-export function startMeterRelay(productionId: string, flowId: string, mixerBlockId: string): void {
+export function startMeterRelay(productionId: string, flowId: string, mixerBlockId: string, loudnessBlockId?: string | null): void {
   const existing = relays.get(productionId);
   if (existing) {
     existing.refCount++;
@@ -33,6 +33,12 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
 
       const closeCleanup = strom.connectWebSocket(
         (event) => {
+          if (event.type === 'LoudnessData' && loudnessBlockId) {
+            const { flow_id, element_id, momentary, shortterm, integrated, loudness_range, true_peak } = event.data;
+            if (flow_id !== flowId || element_id !== loudnessBlockId) return;
+            broadcast(productionId, { type: 'LOUDNESS_DATA', elementId: 'main', momentary, shortterm, integrated, loudness_range, true_peak });
+            return;
+          }
           if (event.type !== 'MeterData') return;
           const { flow_id, element_id, rms, peak } = event.data;
           if (flow_id !== flowId) return;

@@ -7,6 +7,7 @@ import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
 import { setTally } from '../services/tally.service.js';
+import { clearProductionPflState } from '../services/pfl-state.js';
 import { config } from '../config.js';
 
 // ---------------------------------------------------------------------------
@@ -76,6 +77,7 @@ async function runActivationFlow(
   let stromFlowId: string | undefined;
   let mixerBlockId: string | undefined;
   let audioMixerBlockId: string | undefined;
+  let loudnessMainBlockId: string | undefined;
   let whepOutputEntries: Array<{ outputId: string; endpointId: string }> | undefined;
   let pgmWhepEndpointId: string | undefined;
 
@@ -107,6 +109,7 @@ async function runActivationFlow(
     stromFlowId = activation.flowId;
     mixerBlockId = activation.mixerBlockId ?? undefined;
     audioMixerBlockId = activation.audioMixerBlockId ?? undefined;
+    loudnessMainBlockId = activation.loudnessMainBlockId ?? undefined;
     whepOutputEntries = activation.whepOutputEntries;
     pgmWhepEndpointId = activation.pgmWhepEndpointId;
     // mixerBlockId/audioMixerBlockId come directly from the flow generator — they are the
@@ -121,6 +124,7 @@ async function runActivationFlow(
       stromFlowId,
       ...(mixerBlockId !== undefined && { mixerBlockId }),
       ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
+      ...(loudnessMainBlockId !== undefined && { loudnessMainBlockId }),
       ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
     });
 
@@ -141,8 +145,9 @@ async function runActivationFlow(
         // so always prefer the live flow value over the template-derived one.
         const runningAudioBlock = (flow.blocks ?? []).find(
           (b) => (b as unknown as { block_definition_id?: string }).block_definition_id === 'builtin.mixer',
-        ) as { id?: string } | undefined;
+        ) as { id?: string; properties?: Record<string, unknown> } | undefined;
         if (runningAudioBlock?.id) audioMixerBlockId = runningAudioBlock.id;
+
 
         // Re-resolve sourceOffsetBlockIds from the running flow — Strom may assign server-generated
         // IDs that differ from the template block IDs we stored at activation time.
@@ -236,6 +241,7 @@ async function runActivationFlow(
           whepOutputUrls: whepOutputUrls && whepOutputUrls.length > 0 ? whepOutputUrls : undefined,
           tally: initialTally,
           ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
+          ...(loudnessMainBlockId !== undefined && { loudnessMainBlockId }),
           ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
         });
 
@@ -492,6 +498,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         activationAbortControllers.delete(doc._id);
       }
 
+      clearProductionPflState(doc._id);
       if (doc.stromFlowId) {
         const stromToken = await getStromToken(config.stromToken).catch((err) => { req.log.error({ err }, "SAT exchange failed — proceeding without auth"); return undefined; });
         const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
@@ -504,6 +511,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         stromFlowId: undefined,
         mixerBlockId: undefined,
         audioMixerBlockId: undefined,
+        loudnessMainBlockId: undefined,
         sourceOffsetBlockIds: undefined,
         whepEndpoint: undefined,
         pgmWhepEndpoint: undefined,

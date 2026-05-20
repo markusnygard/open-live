@@ -194,11 +194,24 @@ export interface TransitionResponse {
 }
 
 export interface SelectPreviewRequest {
-  input: number
+  source: { input: number } | { pip: number }
 }
 
 export interface SelectPreviewResponse {
-  input: number
+  preview_input: number | null
+  program_input: number | null
+  preview_pip: number | null
+  program_pip: number | null
+}
+
+export interface VisionMixerStateResponse {
+  program_input: number | null
+  preview_input: number | null
+  program_pip: number | null
+  preview_pip: number | null
+  ftb_active: boolean
+  dsk_enabled: boolean[]
+  overlay_alpha: number
 }
 
 export interface AnimateInputRequest {
@@ -244,6 +257,19 @@ export interface OverlayAlphaRequest {
 
 export interface OverlayAlphaResponse {
   alpha: number
+}
+
+// --- Block properties ---
+
+export interface UpdateBlockPropertiesRequest {
+  properties: Record<string, unknown>
+  ramp_ms?: number
+}
+
+export interface BlockPropertiesResponse {
+  block_id: string
+  properties: Record<string, unknown>
+  rejected: Record<string, string>
 }
 
 // --- Element/pad properties ---
@@ -474,6 +500,7 @@ export type FlowEvent =
   | { type: 'flow_started'; flow_id: string }
   | { type: 'flow_stopped'; flow_id: string }
   | { type: 'MeterData'; data: { flow_id: string; element_id: string; rms: number[]; peak: number[]; decay: number[] } }
+  | { type: 'LoudnessData'; data: { flow_id: string; element_id: string; momentary: number; shortterm: number | null; integrated: number | null; loudness_range: number | null; true_peak: number[] } }
   | { type: 'ping' }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +665,10 @@ export class StromClient {
       const q = index !== undefined ? `?index=${index}` : ''
       return `${this.baseUrl}/api/flows/${id}/blocks/${blockId}/thumbnail${q}`
     },
+    getBlockProperties: (flowId: string, blockId: string) =>
+      this.get<BlockPropertiesResponse>(`/api/flows/${flowId}/blocks/${blockId}/properties`),
+    updateBlockProperties: (flowId: string, blockId: string, body: UpdateBlockPropertiesRequest) =>
+      this.patch<BlockPropertiesResponse>(`/api/flows/${flowId}/blocks/${blockId}/properties`, body),
   }
 
   // -------------------------------------------------------------------------
@@ -649,10 +680,7 @@ export class StromClient {
       this.post<TransitionResponse>(`/api/flows/${flowId}/blocks/${blockId}/transition`, body),
 
     selectPreview: (flowId: string, blockId: string, body: SelectPreviewRequest) =>
-      this.post<SelectPreviewResponse>(`/api/flows/${flowId}/blocks/${blockId}/preview`, body),
-
-    setBackground: (flowId: string, blockId: string, body: SetBackgroundRequest) =>
-      this.post<SetBackgroundResponse>(`/api/flows/${flowId}/blocks/${blockId}/background`, body),
+      this.put<SelectPreviewResponse>(`/api/flows/${flowId}/blocks/${blockId}/preview`, body),
 
     toggleDsk: (flowId: string, blockId: string, body: DskToggleRequest) =>
       this.post<DskToggleResponse>(`/api/flows/${flowId}/blocks/${blockId}/dsk`, body),
@@ -663,11 +691,11 @@ export class StromClient {
     animateInput: (flowId: string, blockId: string, body: AnimateInputRequest) =>
       this.post<void>(`/api/flows/${flowId}/blocks/${blockId}/animate`, body),
 
-    getOverlayAlpha: (flowId: string, blockId: string) =>
-      this.get<OverlayAlphaResponse>(`/api/flows/${flowId}/blocks/${blockId}/overlay-alpha`),
-
     setOverlayAlpha: (flowId: string, blockId: string, body: OverlayAlphaRequest) =>
-      this.post<OverlayAlphaResponse>(`/api/flows/${flowId}/blocks/${blockId}/overlay-alpha`, body),
+      this.put<OverlayAlphaResponse>(`/api/flows/${flowId}/blocks/${blockId}/overlay-alpha`, body),
+
+    getState: (flowId: string, blockId: string) =>
+      this.get<VisionMixerStateResponse>(`/api/flows/${flowId}/blocks/${blockId}/state`),
 
     multiviewEndpoint: (flowId: string, blockId: string) =>
       this.get<MultiviewEndpointResponse>(`/api/flows/${flowId}/blocks/${blockId}/multiview-endpoint`),

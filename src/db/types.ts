@@ -249,6 +249,8 @@ export interface ProductionDoc {
   overlayAlpha?: number;
   mixerBlockId?: string;
   audioMixerBlockId?: string;
+  /** ID of the builtin.loudness block on the main audio bus — set on activate, cleared on deactivate */
+  loudnessMainBlockId?: string;
   /** Maps mixerInput (e.g. 'video_in_1') → time_offset block ID — set on activate, cleared on deactivate */
   sourceOffsetBlockIds?: Record<string, string>;
   /** DSK layer visibility state, keyed by 0-based layer index */
