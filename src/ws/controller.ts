@@ -27,11 +27,13 @@ type InboundMessage =
   | { type: 'AFV_SET'; mixerInput: string; enabled: boolean }
   | { type: 'PFL_SET'; elementId: string; enabled: boolean; volume?: number }
   | { type: 'AFL_SET'; elementId: string; enabled: boolean }
-  | { type: 'AUX_SEND_SET'; elementId: string; auxBus: number; level: number; enabled: boolean }
+  | { type: 'AUX_SEND_SET'; elementId: string; auxBus: number; level: number; enabled: boolean; pre?: boolean }
   | { type: 'AUX_MASTER_SET'; auxBus: number; volume: number; muted: boolean }
   | { type: 'GRP_SEND_SET'; elementId: string; grpBus: number; level: number; enabled: boolean }
   | { type: 'GRP_MASTER_SET'; grpBus: number; volume: number; muted: boolean }
-  | { type: 'SOURCE_OFFSET_SET'; mixerInput: string; offsetMs: number };
+  | { type: 'MONITOR_SET'; volume: number; muted: boolean }
+  | { type: 'SOURCE_OFFSET_SET'; mixerInput: string; offsetMs: number }
+  | { type: 'LOUDNESS_RESET' };
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -134,11 +136,50 @@ const mutedElementsByProduction = new Map<string, Set<string>>()
 const activeFlowIdByProduction = new Map<string, string>()
 
 /**
+ * Per-production channel fader level cache.
+ * Maps productionId → (elementId → level). elementId is 'ch1', 'ch2', ..., 'main'.
+ * Updated immediately on every AUDIO_SET volume message so reconnecting clients
+ * receive the last-known fader position even if Strom's block properties don't
+ * persist dynamically-set ch${N}_fader values.
+ */
+const channelLevelsByProduction = new Map<string, Map<string, number>>()
+
+/**
  * Per-production runtime offset registry.
  * Maps productionId → (mixerInput → offsetMs).
  * Populated by SOURCE_OFFSET_SET messages; sent to new clients on connect.
  */
 const sourceOffsetsByProduction = new Map<string, Map<string, number>>()
+
+/**
+ * Per-production AUX send state cache.
+ * Maps productionId → (`ch{N}_aux{M}` → { level, enabled, pre }).
+ * Updated on every AUX_SEND_SET so reconnecting clients restore the full per-channel
+ * send state (fader position, ON/OFF, and pre/post toggle).
+ */
+const auxSendByProduction = new Map<string, Map<string, { level: number; enabled: boolean; pre: boolean }>>()
+
+/**
+ * Per-production AUX master state cache.
+ * Maps productionId → (auxBus(1-indexed) → { volume, muted }).
+ * Supplements the Strom block-property fallback so restores work even when Strom
+ * is unreachable and the value is authoritative for the current operator session.
+ */
+const auxMasterByProduction = new Map<string, Map<number, { volume: number; muted: boolean }>>()
+
+/**
+ * Per-production GRP send (assignment) state cache.
+ * Maps productionId → (`ch{N}_grp{M}` → { level, enabled }).
+ * Populated by GRP_SEND_SET messages so the G1/G2 button state survives reconnects.
+ */
+const grpSendByProduction = new Map<string, Map<string, { level: number; enabled: boolean }>>()
+
+/**
+ * Per-production GRP master state cache.
+ * Maps productionId → (grpBus(1-indexed) → { volume, muted }).
+ */
+const grpMasterByProduction = new Map<string, Map<number, { volume: number; muted: boolean }>>()
+const monitorByProduction   = new Map<string, { volume: number; muted: boolean }>()
 
 
 /** Wipe all per-production audio state. Called when the pipeline changes. */
@@ -148,6 +189,12 @@ function clearAudioState(productionId: string): void {
   activeFlowIdByProduction.delete(productionId)
   sourceOffsetsByProduction.delete(productionId)
   numAudioChannelsByProduction.delete(productionId)
+  channelLevelsByProduction.delete(productionId)
+  auxSendByProduction.delete(productionId)
+  auxMasterByProduction.delete(productionId)
+  grpSendByProduction.delete(productionId)
+  grpMasterByProduction.delete(productionId)
+  monitorByProduction.delete(productionId)
 }
 
 /**
@@ -490,6 +537,11 @@ async function handleMessage(
           // Debounce: coalesce rapid nudges into one Strom PATCH.
           // Broadcast immediately for UI responsiveness; only the final value is sent to Strom.
           broadcast(productionId, { type: 'AUDIO_STATE', elementId: msg.elementId, property: msg.property, value: msg.value });
+          // Cache fader level immediately so reconnecting clients get the correct position.
+          if (typeof msg.value === 'number') {
+            if (!channelLevelsByProduction.has(productionId)) channelLevelsByProduction.set(productionId, new Map());
+            channelLevelsByProduction.get(productionId)!.set(msg.elementId, msg.value as number);
+          }
           // Extract ch number before closure (only valid when elementId !== 'main')
           const chMatch = msg.elementId !== 'main' ? /^ch(\d+)$/.exec(msg.elementId) : null;
           if (msg.elementId !== 'main' && !chMatch) {
@@ -600,19 +652,12 @@ async function handleMessage(
       const chMatch = /^ch(\d+)$/.exec(msg.elementId);
       if (chMatch && doc.stromFlowId && ctx.audioBlockId) {
         const strom = await makeStromClient();
-        const anySolo = anySoloActive(productionId);
         const props: Record<string, unknown> = { [`ch${chMatch[1]}_pfl`]: msg.enabled };
         if (msg.enabled) props[`ch${chMatch[1]}_afl`] = false;
         await strom.flows.updateBlockProperties(doc.stromFlowId, ctx.audioBlockId, {
           properties: props,
           ramp_ms: 50,
         }).catch((err: unknown) => console.warn('[controller] PFL_SET block props error:', err));
-        await Promise.all([
-          strom.properties.updateElement(doc.stromFlowId, `${ctx.audioBlockId}:solo_to_mon`,
-            { property_name: 'volume', value: anySolo ? 1.0 : 0.0, ramp_ms: 50 }),
-          strom.properties.updateElement(doc.stromFlowId, `${ctx.audioBlockId}:main_to_mon`,
-            { property_name: 'volume', value: anySolo ? 0.0 : 1.0, ramp_ms: 50 }),
-        ]).catch((err: unknown) => console.warn('[controller] PFL_SET gate error:', err));
       }
 
       broadcast(productionId, { type: 'PFL_STATE', elementId: msg.elementId, enabled: msg.enabled });
@@ -630,19 +675,12 @@ async function handleMessage(
       const aflChMatch = /^ch(\d+)$/.exec(msg.elementId);
       if (aflChMatch && doc.stromFlowId && ctx.audioBlockId) {
         const strom = await makeStromClient();
-        const anySolo = anySoloActive(productionId);
         const aflProps: Record<string, unknown> = { [`ch${aflChMatch[1]}_afl`]: msg.enabled };
         if (msg.enabled) aflProps[`ch${aflChMatch[1]}_pfl`] = false;
         await strom.flows.updateBlockProperties(doc.stromFlowId, ctx.audioBlockId, {
           properties: aflProps,
           ramp_ms: 50,
         }).catch((err: unknown) => console.warn('[controller] AFL_SET block props error:', err));
-        await Promise.all([
-          strom.properties.updateElement(doc.stromFlowId, `${ctx.audioBlockId}:solo_to_mon`,
-            { property_name: 'volume', value: anySolo ? 1.0 : 0.0, ramp_ms: 50 }),
-          strom.properties.updateElement(doc.stromFlowId, `${ctx.audioBlockId}:main_to_mon`,
-            { property_name: 'volume', value: anySolo ? 0.0 : 1.0, ramp_ms: 50 }),
-        ]).catch((err: unknown) => console.warn('[controller] AFL_SET gate error:', err));
       }
 
       broadcast(productionId, { type: 'AFL_STATE', elementId: msg.elementId, enabled: msg.enabled });
@@ -655,6 +693,12 @@ async function handleMessage(
       // auxBus is 1-indexed on the wire (AUX 1 → auxIdx=0).
       // Strom receives enabled ? level : 0.  The fader position (level) is always
       // broadcast so all clients preserve the saved level across ON/OFF.
+      //
+      // IMPORTANT: ch{N}_aux{M}_pre is a build-time topology property (element_id: "_block")
+      // that controls which tee (pre_fader_tee vs post_fader_tee) the send is wired to.
+      // It CANNOT be applied to a running pipeline — only the level property maps to a live
+      // GStreamer element. We send pre and level as SEPARATE updateBlockProperties calls so
+      // that a pre rejection never silences the level update.
       const chMatch = /^ch(\d+)$/.exec(msg.elementId);
       if (chMatch && doc.stromFlowId && ctx.audioBlockId) {
         const chIdx = parseInt(chMatch[1], 10) - 1;     // 0-based
@@ -662,23 +706,40 @@ async function handleMessage(
         const stromValue = msg.enabled ? msg.level : 0;
         const flowId = doc.stromFlowId;
         const capturedAudioBlockId = ctx.audioBlockId;
-        const debounceKey = `${productionId}:aux:ch${chNum}_aux${msg.auxBus}`;
+        const capturedAuxBus = msg.auxBus;
+        const capturedPre = msg.pre;
+        const debounceKey = `${productionId}:aux:ch${chNum}_aux${capturedAuxBus}`;
         const prev = pendingVolume.get(debounceKey);
         if (prev) clearTimeout(prev);
         pendingVolume.set(debounceKey, setTimeout(async () => {
           pendingVolume.delete(debounceKey);
           try {
             const s = await makeStromClient();
+            // Send level update first — this IS live-applicable (aux_send element volume).
             await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
-              properties: { [`ch${chNum}_aux${msg.auxBus}_level`]: stromValue },
+              properties: { [`ch${chNum}_aux${capturedAuxBus}_level`]: stromValue },
             });
+            // Send pre separately — this is a build-time property stored in the flow JSON
+            // so it takes effect on next production start. Keeping it separate means a
+            // rejection of pre (non-live topology change) never blocks the level update.
+            if (capturedPre !== undefined) {
+              await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
+                properties: { [`ch${chNum}_aux${capturedAuxBus}_pre`]: capturedPre },
+              }).catch((err) => console.warn('[controller] AUX pre update error (non-live, stored for next start):', err));
+            }
           } catch (err) {
             console.warn('[controller] AUX_SEND_SET error:', err);
           }
         }, 150));
       }
-      // Broadcast level + enabled so all clients can restore fader position and ON/OFF state
-      broadcast(productionId, { type: 'AUX_SEND_STATE', elementId: msg.elementId, auxBus: msg.auxBus, level: msg.level, enabled: msg.enabled });
+      // Cache for reconnect restore — keyed by 'ch{N}_aux{M}'
+      if (/^ch\d+$/.test(msg.elementId)) {
+        const cache = auxSendByProduction.get(productionId) ?? new Map()
+        cache.set(`${msg.elementId}_aux${msg.auxBus}`, { level: msg.level, enabled: msg.enabled, pre: msg.pre ?? true })
+        auxSendByProduction.set(productionId, cache)
+      }
+      // Broadcast level + enabled (+ pre when set) so all clients stay in sync
+      broadcast(productionId, { type: 'AUX_SEND_STATE', elementId: msg.elementId, auxBus: msg.auxBus, level: msg.level, enabled: msg.enabled, ...(msg.pre !== undefined && { pre: msg.pre }) });
       break;
     }
     case 'AUX_MASTER_SET': {
@@ -707,6 +768,10 @@ async function handleMessage(
           }
         }, 150));
       }
+      // Cache for reconnect restore
+      const amCache = auxMasterByProduction.get(productionId) ?? new Map()
+      amCache.set(msg.auxBus, { volume: msg.volume, muted: msg.muted })
+      auxMasterByProduction.set(productionId, amCache)
       broadcast(productionId, { type: 'AUX_MASTER_STATE', auxBus: msg.auxBus, volume: msg.volume, muted: msg.muted });
       break;
     }
@@ -734,6 +799,12 @@ async function handleMessage(
             console.warn('[controller] GRP_SEND_SET error:', err);
           }
         }, 150));
+      }
+      // Cache for reconnect restore — keyed by 'ch{N}_grp{M}'
+      if (/^ch\d+$/.test(msg.elementId)) {
+        const cache = grpSendByProduction.get(productionId) ?? new Map()
+        cache.set(`${msg.elementId}_grp${msg.grpBus}`, { level: msg.level, enabled: msg.enabled })
+        grpSendByProduction.set(productionId, cache)
       }
       broadcast(productionId, { type: 'GRP_SEND_STATE', elementId: msg.elementId, grpBus: msg.grpBus, level: msg.level, enabled: msg.enabled });
       break;
@@ -764,7 +835,43 @@ async function handleMessage(
           }
         }, 150));
       }
+      // Cache for reconnect restore
+      const gmCache = grpMasterByProduction.get(productionId) ?? new Map()
+      gmCache.set(msg.grpBus, { volume: msg.volume, muted: msg.muted })
+      grpMasterByProduction.set(productionId, gmCache)
       broadcast(productionId, { type: 'GRP_MASTER_STATE', grpBus: msg.grpBus, volume: msg.volume, muted: msg.muted });
+      break;
+    }
+    case 'MONITOR_SET': {
+      // Set monitor_fader / monitor_mute on the builtin.mixer block.
+      // The monitor bus (monitor_out pad) is the operator's local listening feed —
+      // zero effect on the programme mix or any output bus.
+      // NOTE: Property names 'monitor_fader' and 'monitor_mute' follow the
+      // aux/group naming convention — confirm with Strom developer if these differ.
+      if (doc.stromFlowId && ctx.audioBlockId) {
+        const flowId = doc.stromFlowId;
+        const capturedAudioBlockId = ctx.audioBlockId;
+        const debounceKey = `${productionId}:monitor`;
+        const prev = pendingVolume.get(debounceKey);
+        if (prev) clearTimeout(prev);
+        pendingVolume.set(debounceKey, setTimeout(async () => {
+          pendingVolume.delete(debounceKey);
+          try {
+            const s = await makeStromClient();
+            await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
+              properties: {
+                monitor_fader: msg.volume,
+                monitor_mute:  msg.muted,
+              },
+            });
+          } catch (err) {
+            console.warn('[controller] MONITOR_SET error:', err);
+          }
+        }, 150));
+      }
+      // Cache for reconnect restore
+      monitorByProduction.set(productionId, { volume: msg.volume, muted: msg.muted })
+      broadcast(productionId, { type: 'MONITOR_STATE', volume: msg.volume, muted: msg.muted });
       break;
     }
     case 'SOURCE_OFFSET_SET': {
@@ -807,6 +914,19 @@ async function handleMessage(
       }
 
       broadcast(productionId, { type: 'SOURCE_OFFSET_STATE', mixerInput, offsetMs });
+      break;
+    }
+    case 'LOUDNESS_RESET': {
+      if (!doc.stromFlowId || !doc.loudnessMainBlockId) {
+        console.warn('[controller] LOUDNESS_RESET: no active loudness block');
+        break;
+      }
+      try {
+        const strom = await makeStromClient();
+        await strom.loudness.reset(doc.stromFlowId, doc.loudnessMainBlockId);
+      } catch (err) {
+        console.warn('[controller] LOUDNESS_RESET error:', String(err));
+      }
       break;
     }
     default: {
@@ -921,61 +1041,99 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               }
               await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
                 .catch((err) => console.warn('[controller] init channel props error:', err));
-            } else {
-              // Returning/additional client — re-apply Strom state from registries in
-              // case Strom restarted and lost its in-memory routing state.
-              const afvSet   = afvChannelsByProduction.get(id) ?? new Set<string>();
-              const mutedSet = mutedElementsByProduction.get(id) ?? new Set<string>();
-              // Re-apply signal mute (always false) and routing from registry in one batch.
-              const channelProps: Record<string, unknown> = {};
-              for (let i = 1; i <= numChannels; i++) {
-                channelProps[`ch${i}_mute`]    = false;
-                channelProps[`ch${i}_to_main`] = !mutedSet.has(`ch${i}`);
-              }
-              await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: channelProps })
-                .catch((err) => console.warn('[controller] re-apply channel props error:', err));
-              // Re-apply AFV routing for channels that opted in
-              if (afvSet.size > 0) {
-                const tally = getTally(id);
-                void applyAudioFollow(id, connectDoc, tally.pgm, connectDoc.stromFlowId!, audioBlockId, strom);
-              }
-              // Re-apply PFL/AFL state after a restart.
-              const currentPflSet = activePflByProduction.get(id);
-              const currentAflSet = activeAflByProduction.get(id);
-              const soloProps: Record<string, unknown> = {};
-              for (const elId of (currentPflSet ?? [])) {
-                const m = /^ch(\d+)$/.exec(elId);
-                if (m) soloProps[`ch${m[1]}_pfl`] = true;
-              }
-              for (const elId of (currentAflSet ?? [])) {
-                const m = /^ch(\d+)$/.exec(elId);
-                if (m) soloProps[`ch${m[1]}_afl`] = true;
-              }
-              if (Object.keys(soloProps).length > 0) {
-                await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: soloProps, ramp_ms: 50 })
-                  .catch((err: unknown) => console.warn('[controller] solo re-apply error:', err));
-                const anySolo = anySoloActive(id);
-                await Promise.all([
-                  strom.properties.updateElement(connectDoc.stromFlowId!, `${audioBlockId}:solo_to_mon`, { property_name: 'volume', value: anySolo ? 1.0 : 0.0, ramp_ms: 50 }),
-                  strom.properties.updateElement(connectDoc.stromFlowId!, `${audioBlockId}:main_to_mon`, { property_name: 'volume', value: anySolo ? 0.0 : 1.0, ramp_ms: 50 }),
-                ]).catch((err: unknown) => console.warn('[controller] solo gate re-apply error:', err));
-              }
             }
-            // Read live fader levels via block-properties; mute state from registry.
+            // Restore fader levels and mute state.
+            // Server-side cache (channelLevelsByProduction) is authoritative — it is updated
+            // on every AUDIO_SET volume and survives page refreshes / new tabs within the
+            // same server session. Strom block properties are used as a fallback for
+            // values set before the server started (e.g. pipeline defaults).
             const mutedSet = mutedElementsByProduction.get(id) ?? new Set<string>();
+            const levelCache = channelLevelsByProduction.get(id);
             const blockProps = await strom.flows.getBlockProperties(connectDoc.stromFlowId, audioBlockId).catch(() => null);
             for (let i = 1; i <= numChannels; i++) {
-              const volume = blockProps?.properties[`ch${i}_fader`];
-              if (typeof volume === 'number') {
+              const cachedLevel = levelCache?.get(`ch${i}`);
+              const stromLevel = blockProps?.properties[`ch${i}_fader`];
+              const volume = cachedLevel ?? (typeof stromLevel === 'number' ? stromLevel : undefined);
+              if (volume !== undefined) {
                 socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'volume', value: volume }));
               }
               const isMuted = mutedSet.has(`ch${i}`);
               socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: `ch${i}`, property: 'mute', value: isMuted }));
             }
-            // Read main fader level
-            const mainVolume = blockProps?.properties['main_fader'];
-            if (typeof mainVolume === 'number') {
+            // Restore main fader level
+            const cachedMain = levelCache?.get('main');
+            const stromMain = blockProps?.properties['main_fader'];
+            const mainVolume = cachedMain ?? (typeof stromMain === 'number' ? stromMain : undefined);
+            if (mainVolume !== undefined) {
               socket.send(JSON.stringify({ type: 'AUDIO_STATE', elementId: 'main', property: 'volume', value: mainVolume }));
+            }
+            // Restore AUX master state — prefer in-memory cache (set by this session's
+            // AUX_MASTER_SET messages), fall back to Strom block properties for the first
+            // connect after a server restart when the cache is empty.
+            const cachedAuxMasters = auxMasterByProduction.get(id);
+            const props = blockProps?.properties ?? {};
+            if (cachedAuxMasters && cachedAuxMasters.size > 0) {
+              for (const [auxBus, { volume, muted }] of cachedAuxMasters) {
+                socket.send(JSON.stringify({ type: 'AUX_MASTER_STATE', auxBus, volume, muted }));
+              }
+            } else {
+              for (const [key, value] of Object.entries(props)) {
+                const auxMatch = /^aux(\d+)_fader$/.exec(key);
+                if (auxMatch && typeof value === 'number') {
+                  const auxBus = parseInt(auxMatch[1], 10);
+                  const muted = props[`aux${auxBus}_mute`] === true;
+                  socket.send(JSON.stringify({ type: 'AUX_MASTER_STATE', auxBus, volume: value, muted }));
+                }
+              }
+            }
+            // Restore GRP master state — same cache-first pattern
+            const cachedGrpMasters = grpMasterByProduction.get(id);
+            if (cachedGrpMasters && cachedGrpMasters.size > 0) {
+              for (const [grpBus, { volume, muted }] of cachedGrpMasters) {
+                socket.send(JSON.stringify({ type: 'GRP_MASTER_STATE', grpBus, volume, muted }));
+              }
+            } else {
+              for (const [key, value] of Object.entries(props)) {
+                const grpMatch = /^group(\d+)_fader$/.exec(key);
+                if (grpMatch && typeof value === 'number') {
+                  const grpBus = parseInt(grpMatch[1], 10);
+                  const muted = props[`group${grpBus}_mute`] === true;
+                  socket.send(JSON.stringify({ type: 'GRP_MASTER_STATE', grpBus, volume: value, muted }));
+                }
+              }
+            }
+            // Restore monitor master state — prefer in-memory cache, fall back to Strom block props
+            const cachedMonitor = monitorByProduction.get(id);
+            if (cachedMonitor) {
+              socket.send(JSON.stringify({ type: 'MONITOR_STATE', volume: cachedMonitor.volume, muted: cachedMonitor.muted }));
+            } else {
+              const monVol = props['monitor_fader'];
+              if (typeof monVol === 'number') {
+                const monMuted = props['monitor_mute'] === true;
+                socket.send(JSON.stringify({ type: 'MONITOR_STATE', volume: monVol, muted: monMuted }));
+              }
+            }
+            // Restore per-channel AUX send state (fader level, ON/OFF, pre/post)
+            const cachedAuxSends = auxSendByProduction.get(id);
+            if (cachedAuxSends) {
+              for (const [key, { level, enabled, pre }] of cachedAuxSends) {
+                // key format: 'ch{N}_aux{M}'
+                const m = /^(ch\d+)_aux(\d+)$/.exec(key);
+                if (m) {
+                  socket.send(JSON.stringify({ type: 'AUX_SEND_STATE', elementId: m[1], auxBus: parseInt(m[2], 10), level, enabled, pre }));
+                }
+              }
+            }
+            // Restore per-channel GRP send state (G1/G2 assignments + fader level)
+            const cachedGrpSends = grpSendByProduction.get(id);
+            if (cachedGrpSends) {
+              for (const [key, { level, enabled }] of cachedGrpSends) {
+                // key format: 'ch{N}_grp{M}'
+                const m = /^(ch\d+)_grp(\d+)$/.exec(key);
+                if (m) {
+                  socket.send(JSON.stringify({ type: 'GRP_SEND_STATE', elementId: m[1], grpBus: parseInt(m[2], 10), level, enabled }));
+                }
+              }
             }
             // Send current AFV state to this connecting client so it can restore
             // its store without the operator having to re-enable AFV per strip.
