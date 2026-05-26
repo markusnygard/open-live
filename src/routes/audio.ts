@@ -48,10 +48,11 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
         );
         if (!mixerBlock) return reply.send([]);
 
-        const numChannels = typeof mixerBlock.properties?.num_channels === 'number'
-          ? mixerBlock.properties.num_channels as number
+        const rawNumCh = mixerBlock.properties?.num_channels;
+        const numChannels = typeof rawNumCh === 'number' ? rawNumCh as number
+          : typeof rawNumCh === 'string' ? parseInt(rawNumCh, 10)
           : 0;
-        if (numChannels === 0) return reply.send([]);
+        if (!numChannels || isNaN(numChannels)) return reply.send([]);
 
         // Build audio-channel-index → source name map.
         // Audio channels are assigned to SRT/EFP/WHIP sources (not test or HTML),

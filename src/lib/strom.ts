@@ -193,31 +193,76 @@ export interface TransitionResponse {
   success: boolean
 }
 
+/**
+ * Strom Source union — externally-tagged JSON: { "input": N } or { "pip": N }.
+ * Confirmed from origin/main:types/src/vision_mixer.rs — #[serde(rename_all = "lowercase")].
+ */
+export type StromSource = { input: number } | { pip: number }
+
+/**
+ * Strom SelectPreviewRequest (Strom 0.5+): { source: StromSource }
+ * Changed from { input: N, multi?: bool } in Strom 0.4.x.
+ * Route also changed from POST to PUT — confirmed origin/main:backend/src/lib.rs.
+ */
 export interface SelectPreviewRequest {
-  source: { input: number } | { pip: number }
+  source: StromSource
+}
+
+/**
+ * A rectangular zone in normalised [0,1] coordinates within the PiP area.
+ * Our own concept — not a Strom API type.
+ */
+export interface PipZone {
+  rect: { x: number; y: number; w: number; h: number } | null
+  capacity: number | null
+  sources: number[]
+}
+
+/**
+ * Layout config for one PiP slot (background + overlay zones).
+ * Our own concept — not a Strom API type.
+ */
+export interface PipConfig {
+  bg: number | null
+  zones: PipZone[]
+}
+
+/**
+ * Body for PUT /api/flows/{id}/blocks/{bid}/pip/{pip_idx}.
+ * Confirmed from memory: UpdatePipConfigRequest { bg?, zones[] }.
+ * zones[] entries match PipZone (rect, capacity, sources).
+ */
+export interface UpdatePipConfigRequest {
+  bg?: number | null
+  zones: PipZone[]
 }
 
 export interface SelectPreviewResponse {
-  preview_input: number | null
-  program_input: number | null
-  preview_pip: number | null
-  program_pip: number | null
+  preview_input: number
+  program_input: number
+  preview_inputs: number[]
+  program_inputs: number[]
 }
 
 export interface VisionMixerStateResponse {
-  program_input: number | null
-  preview_input: number | null
-  program_pip: number | null
-  preview_pip: number | null
+  /** First input in PGM group (0-based, backward compat) */
+  program_input: number
+  /** First input in PVW group (0-based, backward compat) */
+  preview_input: number
+  program_inputs: number[]
+  preview_inputs: number[]
+  num_inputs: number
+  input_labels: string[]
   ftb_active: boolean
   dsk_enabled: boolean[]
   overlay_alpha: number
 }
 
 export interface AnimateInputRequest {
-  input: string
-  x?: number
-  y?: number
+  /** 0-based input index */
+  input: number
+  xpos?: number
+  ypos?: number
   width?: number
   height?: number
   duration_ms?: number
@@ -679,6 +724,11 @@ export class StromClient {
     transition: (flowId: string, blockId: string, body: TriggerTransitionRequest) =>
       this.post<TransitionResponse>(`/api/flows/${flowId}/blocks/${blockId}/transition`, body),
 
+    /**
+     * Select a preview source on the vision mixer.
+     * PUT (confirmed against origin/main lib.rs — changed from POST in 0.4.x).
+     * Body: { input: 0-based index, multi?: boolean }
+     */
     selectPreview: (flowId: string, blockId: string, body: SelectPreviewRequest) =>
       this.put<SelectPreviewResponse>(`/api/flows/${flowId}/blocks/${blockId}/preview`, body),
 
@@ -694,8 +744,8 @@ export class StromClient {
     setOverlayAlpha: (flowId: string, blockId: string, body: OverlayAlphaRequest) =>
       this.put<OverlayAlphaResponse>(`/api/flows/${flowId}/blocks/${blockId}/overlay-alpha`, body),
 
-    getState: (flowId: string, blockId: string) =>
-      this.get<VisionMixerStateResponse>(`/api/flows/${flowId}/blocks/${blockId}/state`),
+    updatePipConfig: (flowId: string, blockId: string, pipIdx: number, body: UpdatePipConfigRequest) =>
+      this.put<void>(`/api/flows/${flowId}/blocks/${blockId}/pip/${pipIdx}`, body),
 
     multiviewEndpoint: (flowId: string, blockId: string) =>
       this.get<MultiviewEndpointResponse>(`/api/flows/${flowId}/blocks/${blockId}/multiview-endpoint`),

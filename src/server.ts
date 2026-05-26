@@ -7,7 +7,6 @@ import healthRoutes from './routes/health.js';
 import statusRoutes from './routes/status.js';
 import productionsRoutes from './routes/productions.js';
 import sourcesRoutes from './routes/sources.js';
-import templatesRoutes from './routes/templates.js';
 import pipelineRoutes from './routes/pipeline.js';
 import macrosRoutes from './routes/macros.js';
 import audioRoutes from './routes/audio.js';
@@ -62,7 +61,6 @@ export async function buildServer() {
   await fastify.register(statusRoutes);
   await fastify.register(productionsRoutes);
   await fastify.register(sourcesRoutes);
-  await fastify.register(templatesRoutes);
   await fastify.register(pipelineRoutes);
   await fastify.register(macrosRoutes);
   await fastify.register(audioRoutes);

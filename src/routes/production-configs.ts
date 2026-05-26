@@ -6,13 +6,12 @@ import type { ProductionConfigDoc } from '../db/types.js';
 
 const ConfigInput = z.object({
   name: z.string().min(1),
-  templateId: z.string().min(1),
-  values: z.record(z.union([z.string(), z.number()])),
+  values: z.record(z.union([z.string(), z.number(), z.boolean()])),
 });
 
 const ConfigPatch = z.object({
   name: z.string().min(1).optional(),
-  values: z.record(z.union([z.string(), z.number()])).optional(),
+  values: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
 });
 
 function toApi(doc: ProductionConfigDoc) {
@@ -22,14 +21,11 @@ function toApi(doc: ProductionConfigDoc) {
 }
 
 const productionConfigsRoutes: FastifyPluginAsync = async (fastify) => {
-  // List configs, optionally filtered by templateId
-  fastify.get<{ Querystring: { templateId?: string } }>('/api/v1/production-configs', async (req, reply) => {
+  // List all configs
+  fastify.get('/api/v1/production-configs', async (_req, reply) => {
     const db = getConfigsDb();
-    const baseSelector = { type: 'production-config' as const };
-    const result = await db.find({
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      selector: req.query.templateId ? { ...baseSelector, templateId: req.query.templateId } as any : baseSelector as any,
-    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = await db.find({ selector: { type: 'production-config' } as any });
     return reply.send((result.docs as unknown as ProductionConfigDoc[]).map(toApi));
   });
 
@@ -41,7 +37,6 @@ const productionConfigsRoutes: FastifyPluginAsync = async (fastify) => {
       _id: `cfg-${randomUUID()}`,
       type: 'production-config',
       name: body.name,
-      templateId: body.templateId,
       values: body.values,
       createdAt: now,
       updatedAt: now,

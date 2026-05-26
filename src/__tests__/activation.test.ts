@@ -18,7 +18,6 @@ const mockFind = vi.fn();
 vi.mock('../db/index.js', () => ({
   getDb: () => ({ get: mockGet, insert: mockInsert, find: mockFind }),
   getSourcesDb: () => ({ get: mockGet }),
-  getTemplatesDb: () => ({ get: mockGet }),
   connectDb: vi.fn().mockResolvedValue(undefined),
   isDbReady: vi.fn().mockResolvedValue(true),
 }));
@@ -113,7 +112,7 @@ describe('POST /api/v1/productions/:id/activate', () => {
   });
 
   it('returns 200 with status "activating" immediately', async () => {
-    const doc = makeProductionDoc({ templateId: 'tmpl-1' });
+    const doc = makeProductionDoc();
     mockGet.mockResolvedValue(doc);
     mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true, id: doc._id });
     // The async polling loop will call activateStromFlow — we just let it

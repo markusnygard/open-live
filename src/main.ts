@@ -1,6 +1,6 @@
 import { config } from './config.js';
 import { connectDb, getDb } from './db/index.js';
-import { seedDefaultTemplate } from './db/seed.js';
+import { cleanLegacyFixtures } from './db/seed.js';
 import { buildServer } from './server.js';
 import { StromClient } from './lib/strom.js';
 import { getStromToken } from './lib/strom-token.js';
@@ -74,7 +74,7 @@ async function reconcileProductionStatuses(
 
 async function main() {
   await connectDb();
-  await seedDefaultTemplate();
+  await cleanLegacyFixtures();
 
   const app = await buildServer();
   await reconcileProductionStatuses(app.log);

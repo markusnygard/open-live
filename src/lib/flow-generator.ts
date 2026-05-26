@@ -1,7 +1,8 @@
 import { randomUUID } from 'crypto';
-import type { ProductionDoc, SourceDoc, GraphicDoc, StromFlowTemplate, OutputDoc } from '../db/types.js';
-import { getSourcesDb, getTemplatesDb, getGraphicsDb } from '../db/index.js';
+import type { ProductionDoc, SourceDoc, GraphicDoc, OutputDoc } from '../db/types.js';
+import { getSourcesDb, getGraphicsDb } from '../db/index.js';
 import { StromClient } from './strom.js';
+import { DEFAULT_FLOW, type FlowTopology } from './default-flow.js';
 
 /**
  * Generates a Strom flow from a template + source assignments,
@@ -18,13 +19,15 @@ export interface ActivationResult {
   loudnessMainBlockId: string | null;
   whepOutputEntries?: Array<{ outputId: string; endpointId: string }>;
   pgmWhepEndpointId?: string;
-  /** WHEP endpoint ID for the mixer's monitor_out (headphone/PFL) bus — undefined if no audio mixer */
+  /** WHEP endpoint ID for the mixer's monitor_out (headphone/monitor bus) — undefined if no audio mixer */
   monitorWhepEndpointId?: string;
   /** Maps mixerInput (e.g. 'video_in_1') → time_offset block ID — so the WS layer can apply live offset changes */
   sourceOffsetBlockIds: Record<string, string>;
+  /** Maps mixerInput → audio time_offset block ID (one per source with audio, keyed same as sourceOffsetBlockIds) */
+  sourceAudioOffsetBlockIds: Record<string, string>;
 }
 
-function findPgmFeedPad(flow: StromFlowTemplate['flow']): string | null {
+function findPgmFeedPad(flow: FlowTopology): string | null {
   const existingOutput = flow.blocks.find(
     (b) => (b as Record<string, unknown>)['block_definition_id'] === 'builtin.mpegtssrt_output',
   ) as Record<string, unknown> | undefined;
@@ -51,14 +54,6 @@ export async function activateStromFlow(
   stromUrl?: string,
   outputDocs?: OutputDoc[],
 ): Promise<ActivationResult> {
-  if (!production.templateId) {
-    throw new Error('Production has no templateId — cannot activate Strom flow');
-  }
-
-  // Load template
-  const templatesDb = getTemplatesDb();
-  const template = await templatesDb.get(production.templateId) as unknown as StromFlowTemplate;
-
   // Virtual source IDs for test streams — no DB lookup needed
   const VIRTUAL_SOURCES: Record<string, Pick<SourceDoc, 'streamType' | 'address' | 'name'>> = {
     'Whip': { streamType: 'whip', address: '', name: 'WHIP Input' },
@@ -75,8 +70,8 @@ export async function activateStromFlow(
     sourceMap.set(assignment.sourceId, src);
   }
 
-  // Deep-clone the template flow so we don't mutate the stored template
-  const flow = JSON.parse(JSON.stringify(template.flow)) as StromFlowTemplate['flow'];
+  // Deep-clone the default flow so we don't mutate the module-level constant
+  const flow = JSON.parse(JSON.stringify(DEFAULT_FLOW)) as FlowTopology;
 
   // Derive a per-production suffix from the production ID so that WHEP endpoint
   // names and SRT output ports are unique — multiple productions can run
@@ -140,6 +135,13 @@ export async function activateStromFlow(
     if (typeof v === 'string') { const n = parseInt(v, 10); return isNaN(n) ? undefined : n; }
     return undefined;
   })();
+  const mixLatency = (() => {
+    const v = production.values?.mix_latency;
+    if (typeof v === 'number' && Number.isFinite(v)) return Math.max(0, Math.round(v));
+    if (typeof v === 'string') { const n = parseInt(v, 10); return isNaN(n) ? 100 : Math.max(0, n); }
+    return 100;
+  })();
+  const clockType = typeof production.values?.clock === 'string' && production.values.clock !== '' ? production.values.clock : undefined;
 
   for (const block of flow.blocks) {
     const b = block as Record<string, unknown>;
@@ -147,6 +149,7 @@ export async function activateStromFlow(
 
     if (b['block_definition_id'] === 'builtin.vision_mixer') {
       props['pgm_resolution'] = pgmResolution;
+      // num_inputs and input labels are set after source assignment is known (see below).
       if (pgmFramerate !== undefined) props['pgm_framerate'] = pgmFramerate;
       if (multiviewResolution !== undefined) props['multiview_resolution'] = multiviewResolution;
       if (multiviewFramerate !== undefined) props['multiview_framerate'] = multiviewFramerate;
@@ -243,25 +246,43 @@ export async function activateStromFlow(
   // The block is pushed to flow.blocks after the output loop so its y position
   // lands below the output/encoder blocks in the same Strom GUI column.
   let loudnessMainBlockId: string | null = null;
-  if (audioMixerBlockId) {
+  const ebuMainEnabled = production.values?.ebu_main === true;
+  if (audioMixerBlockId && ebuMainEnabled) {
     loudnessMainBlockId = `b-loudness-main-${endpointSuffix}`;
   }
   // Main audio goes directly from the mixer — loudness is a side tap, not in the chain.
   const mainAudioSource = audioMixerBlockId ? `${audioMixerBlockId}:main_out` : null;
 
   // Wire all template WHEP outputs:
-  //   audio_in (track 0) ← main programme mix
-  // TODO: add monitor_out (PFL/AFL bus) to audio_in_1 once Strom multi-track WHEP API is confirmed.
+  //   audio_in   (track 0) ← main programme mix
+  //   audio_in_1 (track 1) ← monitor_out (headphone/monitor bus) when audio mixer present
+  // num_audio_tracks=2 creates the second audio input pad on the WHEP output block.
+  const monitorAudioSource = audioMixerBlockId ? `${audioMixerBlockId}:monitor_out` : null;
   for (const block of flow.blocks) {
     const b = block as Record<string, unknown>;
     if (b['block_definition_id'] !== 'builtin.whep_output') continue;
     const whepId = b['id'] as string;
+    const props = ((b['properties'] ?? {}) as Record<string, unknown>);
     // Remove any existing audio links to this block — we rebuild them below.
     flow.links = (flow.links as Array<Record<string, unknown>>).filter(
       (l) => !((l['to'] as string | undefined) ?? '').startsWith(`${whepId}:audio`),
     );
     if (mainAudioSource) {
+      const auxCount = numAuxBuses ?? 0;
+      props['num_audio_tracks'] = 1 + (monitorAudioSource ? 1 : 0) + auxCount;
+      b['properties'] = props;
       flow.links.push({ from: mainAudioSource, to: `${whepId}:audio_in` });
+      let audioTrack = 1;
+      if (monitorAudioSource) {
+        flow.links.push({ from: monitorAudioSource, to: `${whepId}:audio_in_${audioTrack}` });
+        audioTrack++;
+      }
+      for (let i = 1; i <= auxCount; i++) {
+        if (audioMixerBlockId) {
+          flow.links.push({ from: `${audioMixerBlockId}:aux_out_${i}`, to: `${whepId}:audio_in_${audioTrack}` });
+          audioTrack++;
+        }
+      }
     }
   }
 
@@ -318,11 +339,22 @@ export async function activateStromFlow(
   // Allowed values: 2, 4, 6, 8, 10 (non-live property — must be set at creation).
   // Also set input_{N}_label for each assigned source so Strom renders the name
   // in the multiview overlay (verified: property format from strom/backend/src/blocks/builtin/vision_mixer/properties.rs).
-  if (mixerBlock && mixerBlockId) {
-    const numInputs = Math.max(2, sortedAssignments.length);
-    const props = (mixerBlock['properties'] ?? {}) as Record<string, unknown>;
-    props['num_inputs'] = numInputs;
+  const numSourceInputs = Math.max(2, sortedAssignments.length);
 
+  if (mixerBlock && mixerBlockId) {
+    // num_inputs = real sources only, rounded up to Strom's allowed range (2..16).
+    // PiPs are a separate first-class concept in Strom 0.5+ — set via num_pips, NOT
+    // by expanding num_inputs. max num_inputs is 16 per Strom's MAX_NUM_INPUTS constant.
+    const numTotalInputs = Math.max(2, Math.min(16, numSourceInputs));
+    const props = (mixerBlock['properties'] ?? {}) as Record<string, unknown>;
+    props['num_inputs'] = String(numTotalInputs);
+
+    // num_pips: 0–4 (Strom MAX_NUM_PIPS = 4, DEFAULT_NUM_PIPS = 0).
+    // Taken directly from production config — validated against the max at runtime by Strom.
+    const configuredPips = Number(production.values?.num_pips ?? 0);
+    props['num_pips'] = String(Math.min(4, Math.max(0, configuredPips)));
+
+    // Label source inputs
     for (const assignment of sortedAssignments) {
       const padMatch = /video_in_(\d+)$/.exec(assignment.mixerInput);
       if (!padMatch) continue;
@@ -338,7 +370,7 @@ export async function activateStromFlow(
 
   // Set num_channels on the audio mixer = number of SRT/EFP/WHIP sources
   // (test1/test2/html sources don't carry audio in this template).
-  // num_channels is a Strom enum: valid values are 2, 4, 8, 12, 16, 24, 32.
+  // num_channels is a Strom string enum: valid values are '2', '4', '8', '12', '16', '24', '32'.
   // Round up to the nearest valid value; never set it below 2.
   if (audioMixerBlock) {
     const ALLOWED_CHANNEL_COUNTS = [2, 4, 8, 12, 16, 24, 32];
@@ -348,7 +380,17 @@ export async function activateStromFlow(
     }).length;
     const numChannels = ALLOWED_CHANNEL_COUNTS.find((n) => n >= srtEfpCount) ?? 32;
     const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
-    props['num_channels'] = numChannels;
+    props['num_channels'] = String(numChannels);
+    // ch{N}_aux{M}_pre is a build-time topology property — must be set here at flow
+    // generation time; attempts to change it on a running pipeline are rejected by Strom.
+    const auxPreFader = production.values?.aux_pre_fader;
+    if (typeof auxPreFader === 'boolean' && typeof numAuxBuses === 'number' && numAuxBuses > 0) {
+      for (let ch = 1; ch <= numChannels; ch++) {
+        for (let aux = 1; aux <= numAuxBuses; aux++) {
+          props[`ch${ch}_aux${aux}_pre`] = auxPreFader;
+        }
+      }
+    }
     audioMixerBlock['properties'] = props;
   }
 
@@ -363,13 +405,13 @@ export async function activateStromFlow(
 
   if (mixerBlock) {
     const props = (mixerBlock['properties'] ?? {}) as Record<string, unknown>;
-    props['latency'] = 100;
+    props['latency'] = mixLatency;
     props['min_upstream_latency'] = maxSourceLatency;
     mixerBlock['properties'] = props;
   }
   if (audioMixerBlock) {
     const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
-    props['latency'] = 100;
+    props['latency'] = mixLatency;
     props['min_upstream_latency'] = maxSourceLatency;
     audioMixerBlock['properties'] = props;
   }
@@ -384,6 +426,7 @@ export async function activateStromFlow(
 
   // Maps mixerInput → time_offset block ID — returned so the WS layer can apply live changes.
   const sourceOffsetBlockIds: Record<string, string> = {};
+  const sourceAudioOffsetBlockIds: Record<string, string> = {};
 
   for (const assignment of sortedAssignments) {
     const padMatch = /video_in_(\d+)$/.exec(assignment.mixerInput);
@@ -456,7 +499,17 @@ export async function activateStromFlow(
       flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
       flow.links.push({ from: `${inputId}:audio_out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
       if (audioMixerBlock && audioMixerBlockId) {
-        flow.links.push({ from: `${inputId}:audio_out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
+        const audioOffsetId = `b-audio-offset-${padIndex}-${endpointSuffix}`;
+        flow.blocks.push({
+          id: audioOffsetId,
+          block_definition_id: 'builtin.time_offset',
+          name: `Offset A${padIndex}`,
+          properties: { offset_ms: 0.0 },
+          position: { x: COL_OFFSET, y: yPos + 80 },
+        });
+        sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
+        flow.links.push({ from: `${inputId}:audio_out`, to: `${audioOffsetId}:in` });
+        flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
         if (source.name) {
           const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
           props[`ch${audioChannel + 1}_label`] = source.name;
@@ -480,10 +533,20 @@ export async function activateStromFlow(
       // Wire audio:
       //  - Vision mixer: audio_in_N must match the video pad index N so the mixer
       //    correlates audio with the correct video source (a3 for video_in_3, etc.).
-      //  - Audio mixer: sequential 1-indexed inputs (it doesn't know about video pads).
+      //  - Audio mixer: goes via a time_offset block so operators can trim lipsync live.
       flow.links.push({ from: `${inputId}:audio_out_0`, to: `${mixerBlockId}:audio_in_${padIndex}` });
       if (audioMixerBlock && audioMixerBlockId) {
-        flow.links.push({ from: `${inputId}:audio_out_0`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
+        const audioOffsetId = `b-audio-offset-${padIndex}-${endpointSuffix}`;
+        flow.blocks.push({
+          id: audioOffsetId,
+          block_definition_id: 'builtin.time_offset',
+          name: `Offset A${padIndex}`,
+          properties: { offset_ms: 0.0 },
+          position: { x: COL_OFFSET, y: yPos + 80 },
+        });
+        sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
+        flow.links.push({ from: `${inputId}:audio_out_0`, to: `${audioOffsetId}:in` });
+        flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
         if (source.name) {
           const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
           props[`ch${audioChannel + 1}_label`] = source.name;
@@ -597,17 +660,32 @@ export async function activateStromFlow(
       const blockId = `b-out-${idSlug}-${endpointSuffix}`;
       if (outputDoc.outputType === 'whep') {
         const endpointId = `whep-out-${idSlug}-${endpointSuffix}`;
+        const auxCount = numAuxBuses ?? 0;
         flow.blocks.push({
           id: blockId,
           block_definition_id: 'builtin.whep_output',
           name: outputDoc.name,
           properties: {
             endpoint_id: endpointId,
+            ...(mainAudioSource && { num_audio_tracks: 1 + (monitorAudioSource ? 1 : 0) + auxCount }),
           },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
         if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
-        if (mainAudioSource) flow.links.push({ from: mainAudioSource, to: `${blockId}:audio_in` });
+        if (mainAudioSource) {
+          flow.links.push({ from: mainAudioSource, to: `${blockId}:audio_in` });
+          let audioTrack = 1;
+          if (monitorAudioSource) {
+            flow.links.push({ from: monitorAudioSource, to: `${blockId}:audio_in_${audioTrack}` });
+            audioTrack++;
+          }
+          for (let i = 1; i <= auxCount; i++) {
+            if (audioMixerBlockId) {
+              flow.links.push({ from: `${audioMixerBlockId}:aux_out_${i}`, to: `${blockId}:audio_in_${audioTrack}` });
+              audioTrack++;
+            }
+          }
+        }
         whepOutputEntries.push({ outputId: outputDoc._id, endpointId });
         outputBlockIndex++;
       } else {
@@ -633,19 +711,21 @@ export async function activateStromFlow(
     }
   }
 
+  // Compute encoder block positions — shared by loudness block and group drain placement.
+  const encBlocks = flow.blocks.filter(
+    (b) => (b as Record<string, unknown>)['block_definition_id'] === 'builtin.videoenc',
+  ) as Record<string, unknown>[];
+  const encX = encBlocks.length > 0
+    ? (encBlocks[0]!['position'] as { x: number; y: number }).x
+    : COL_OUTPUT;
+  const maxEncY = encBlocks.reduce((max, b) => {
+    const y = (b['position'] as { x: number; y: number }).y;
+    return y > max ? y : max;
+  }, ROW_START);
+
   // Loudness block — parallel tap, NOT in series. Placed below the video encoders.
   // mixer:main_out → loudness:audio_in → loudness:audio_out → fakesink (drain).
   if (loudnessMainBlockId && audioMixerBlockId) {
-    const encBlocks = flow.blocks.filter(
-      (b) => (b as Record<string, unknown>)['block_definition_id'] === 'builtin.videoenc',
-    ) as Record<string, unknown>[];
-    const encX = encBlocks.length > 0
-      ? (encBlocks[0]!['position'] as { x: number; y: number }).x
-      : COL_OUTPUT;
-    const maxEncY = encBlocks.reduce((max, b) => {
-      const y = (b['position'] as { x: number; y: number }).y;
-      return y > max ? y : max;
-    }, ROW_START);
     flow.blocks.push({
       id: loudnessMainBlockId,
       block_definition_id: 'builtin.loudness',
@@ -664,6 +744,23 @@ export async function activateStromFlow(
     flow.links.push({ from: `${loudnessMainBlockId}:audio_out`, to: `${fakesinkId}:sink` });
   }
 
+  // Group output drains — must be wired regardless of whether EBU metering is enabled.
+  // Strom crashes at pipeline startup (502) if any group_out_N pad is left unconnected.
+  if (audioMixerBlockId && numGroups && numGroups > 0) {
+    // Place drains below the loudness block if present, otherwise below the encoders.
+    const drainBaseY = maxEncY + ROW_H * (loudnessMainBlockId ? 3 : 2);
+    for (let i = 1; i <= numGroups; i++) {
+      const drainId = `e-grp-drain-${i}-${endpointSuffix}`;
+      flow.elements.push({
+        id: drainId,
+        element_type: 'fakesink',
+        properties: { sync: false },
+        position: [encX, drainBaseY + ROW_H * (i - 1)],
+      } as unknown as typeof flow.elements[number]);
+      flow.links.push({ from: `${audioMixerBlockId}:group_out_${i}`, to: `${drainId}:sink` });
+    }
+  }
+
   // POST /api/flows takes the full Flow struct. The server requires 'id' in the
   // body but overwrites it with a new UUID — always use created.flow.id for
   // all subsequent calls.
@@ -674,6 +771,7 @@ export async function activateStromFlow(
     properties: {
       description: `prod:${production._id}`,
       ephemeral: true,
+      ...(clockType ? { clock_type: clockType } : {}),
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     elements: flow.elements as any,
@@ -700,7 +798,7 @@ export async function activateStromFlow(
     throw err;
   }
 
-  return { flowId, mixerBlockId, audioMixerBlockId, loudnessMainBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined, pgmWhepEndpointId, sourceOffsetBlockIds };
+  return { flowId, mixerBlockId, audioMixerBlockId, loudnessMainBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined, pgmWhepEndpointId, sourceOffsetBlockIds, sourceAudioOffsetBlockIds };
 }
 
 /**

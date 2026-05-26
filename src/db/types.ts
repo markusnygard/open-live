@@ -20,15 +20,6 @@ export interface Macro {
   actions: MacroAction[];
 }
 
-// --------------- Audio element types ---------------
-
-export interface AudioElement {
-  id: string;
-  blockId: string;
-  elementId: string;
-  label: string;
-}
-
 // --------------- Source types ---------------
 
 export type StreamType = 'srt' | 'efp' | 'whip' | 'test1' | 'test2' | 'html';
@@ -88,86 +79,7 @@ export interface ProductionConfigDoc {
   _rev?: string;
   type: 'production-config';
   name: string;
-  templateId: string;
-  values: Record<string, string | number>;
-  createdAt: string;
-  updatedAt: string;
-}
-
-// --------------- Template types ---------------
-
-export interface TemplateProperty {
-  id: string;
-  label: string;
-  type: 'select' | 'text' | 'number';
-  default: string | number;
-  options?: Array<{ value: string; label: string }>;
-  min?: number;
-  max?: number;
-  unit?: string;
-}
-
-export interface FlowElement {
-  id: string;
-  element_type: string;
-  properties?: Record<string, unknown>;
-  block_id?: string;
-  x?: number;
-  y?: number;
-}
-
-export interface FlowLink {
-  from_element: string;
-  from_pad?: string;
-  to_element: string;
-  to_pad?: string;
-}
-
-export interface FlowBlock {
-  id: string;
-  name: string;
-  category?: string;
-  description?: string;
-  elements?: FlowElement[];
-  links?: FlowLink[];
-  inputs?: string[];
-  outputs?: string[];
-  properties?: Record<string, unknown>;
-}
-
-/**
- * Describes a parametric input slot in a template.
- * id must match `mixerInput` in ProductionSourceAssignment (e.g. 'video_in_0').
- * Input blocks are generated dynamically at activation time based on source type —
- * no blockId or addressProperty needed.
- */
-export interface TemplateInputSlot {
-  id: string;
-}
-
-export interface StromFlowTemplate {
-  _id: string;
-  _rev?: string;
-  type: 'template';
-  name: string;
-  description?: string;
-  /**
-   * Raw Strom flow JSON — stored and forwarded as-is.
-   * Using Record<string, unknown>[] to accommodate the full Strom block
-   * schema (block_definition_id, position, computed_external_pads, etc.)
-   * without fighting the type system.
-   */
-  flow: {
-    ephemeral?: boolean;
-    elements: Record<string, unknown>[];
-    blocks: Record<string, unknown>[];
-    links: Record<string, unknown>[];
-  };
-  /** Defines which blocks are parametric source inputs */
-  inputs: TemplateInputSlot[];
-  audioElements: AudioElement[];
-  /** Configurable properties shown when creating a production from this template */
-  properties?: TemplateProperty[];
+  values: Record<string, string | number | boolean>;
   createdAt: string;
   updatedAt: string;
 }
@@ -226,8 +138,6 @@ export interface ProductionDoc {
   whepOutputUrls?: Array<{ outputId: string; url: string }>;
   /** Graphic-to-DSK-pad assignments for this production */
   graphicAssignments?: ProductionGraphicAssignment[];
-  /** ID of the StromFlowTemplate to use when activating */
-  templateId?: string;
   /** ID of the running Strom flow (set on activate, cleared on deactivate) */
   stromFlowId?: string;
   /** WHEP multiview endpoint URL — set when flow reaches 'playing' state, cleared on deactivate */
@@ -239,7 +149,7 @@ export interface ProductionDoc {
   /** SRT program output URI (listener) — set on activate, cleared on deactivate */
   srtOutputUri?: string;
   /** Template property values chosen at production creation, keyed by property id */
-  values?: Record<string, string | number>;
+  values?: Record<string, string | number | boolean>;
   /** Scheduled on-air start time — ISO 8601 UTC string (e.g. "2026-05-01T18:30:00.000Z") */
   airTime?: string;
   pipeline: Pipeline;
@@ -253,6 +163,8 @@ export interface ProductionDoc {
   loudnessMainBlockId?: string;
   /** Maps mixerInput (e.g. 'video_in_1') → time_offset block ID — set on activate, cleared on deactivate */
   sourceOffsetBlockIds?: Record<string, string>;
+  /** Maps mixerInput → audio time_offset block ID — set on activate, cleared on deactivate */
+  sourceAudioOffsetBlockIds?: Record<string, string>;
   /** DSK layer visibility state, keyed by 0-based layer index */
   dskLayers?: Record<number, boolean>;
   /** Warnings accumulated when a referenced source/graphic/output was deleted while production was inactive */

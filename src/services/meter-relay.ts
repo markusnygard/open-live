@@ -48,6 +48,10 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
             broadcast(productionId, { type: 'METER_DATA', elementId: 'main', peak, rms });
             return;
           }
+          if (suffix === 'monitor') {
+            broadcast(productionId, { type: 'METER_DATA', elementId: 'monitor', peak, rms });
+            return;
+          }
           // AUX bus master meters: Strom emits "meter:aux1", "meter:aux2" (1-indexed)
           if (suffix.startsWith('aux')) {
             const auxNum = parseInt(suffix.slice(3), 10);
