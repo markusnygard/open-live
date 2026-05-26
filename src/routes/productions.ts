@@ -1,13 +1,14 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
-import { getDb, getOutputsDb, getTemplatesDb } from '../db/index.js';
+import { getDb, getOutputsDb } from '../db/index.js';
 import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc } from '../db/types.js';
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
-import { setTally } from '../services/tally.service.js';
+import { setTally, broadcast } from '../services/tally.service.js';
 import { clearProductionPflState } from '../services/pfl-state.js';
+import { clearPipState, clearAudioState } from '../ws/controller.js';
 import { config } from '../config.js';
 
 // ---------------------------------------------------------------------------
@@ -126,6 +127,7 @@ async function runActivationFlow(
       ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
       ...(loudnessMainBlockId !== undefined && { loudnessMainBlockId }),
       ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
+      ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
     });
 
     // Step 3: Poll until flow reaches 'playing' or we time out
@@ -159,17 +161,28 @@ async function runActivationFlow(
         );
         if (runningOffsetBlocks.length > 0) {
           const resolvedOffsetBlockIds: Record<string, string> = {};
+          const resolvedAudioOffsetBlockIds: Record<string, string> = {};
           for (const offsetBlock of runningOffsetBlocks) {
             if (!offsetBlock.id) continue;
-            // Name is "Offset V{N}" → mixerInput "video_in_{N}"
-            const nameMatch = /^Offset V(\d+)$/.exec(offsetBlock.name ?? '');
-            if (!nameMatch) continue;
-            const mixerInput = `video_in_${nameMatch[1]}`;
-            resolvedOffsetBlockIds[mixerInput] = offsetBlock.id;
+            // "Offset V{N}" → video_in_{N}
+            const videoMatch = /^Offset V(\d+)$/.exec(offsetBlock.name ?? '');
+            if (videoMatch) {
+              resolvedOffsetBlockIds[`video_in_${videoMatch[1]}`] = offsetBlock.id;
+              continue;
+            }
+            // "Offset A{N}" → video_in_{N} (audio delay, keyed by the same mixerInput)
+            const audioMatch = /^Offset A(\d+)$/.exec(offsetBlock.name ?? '');
+            if (audioMatch) {
+              resolvedAudioOffsetBlockIds[`video_in_${audioMatch[1]}`] = offsetBlock.id;
+            }
           }
           if (Object.keys(resolvedOffsetBlockIds).length > 0) {
             activation.sourceOffsetBlockIds = resolvedOffsetBlockIds;
             log.info({ productionId, resolvedOffsetBlockIds }, 'Re-resolved sourceOffsetBlockIds from running flow');
+          }
+          if (Object.keys(resolvedAudioOffsetBlockIds).length > 0) {
+            activation.sourceAudioOffsetBlockIds = resolvedAudioOffsetBlockIds;
+            log.info({ productionId, resolvedAudioOffsetBlockIds }, 'Re-resolved sourceAudioOffsetBlockIds from running flow');
           }
         }
 
@@ -243,6 +256,7 @@ async function runActivationFlow(
           ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
           ...(loudnessMainBlockId !== undefined && { loudnessMainBlockId }),
           ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
+          ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
         });
 
         log.info({ productionId, stromFlowId, whepEndpoint, initialTally, audioMixerBlockId }, 'Production activated — flow playing');
@@ -296,8 +310,7 @@ const ProductionInput = z.object({
 
 const ProductionPatch = z.object({
   name: z.string().min(1).optional(),
-  templateId: z.string().nullable().optional(),
-  values: z.record(z.union([z.string(), z.number()])).optional(),
+  values: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
   airTime: z.string().datetime().nullable().optional(),
 });
 
@@ -366,7 +379,6 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       const updated: ProductionDoc = {
         ...doc,
         ...(body.name !== undefined && { name: body.name }),
-        ...(body.templateId !== undefined && { templateId: body.templateId ?? undefined }),
         ...(body.values !== undefined && { values: body.values }),
         ...(body.airTime !== undefined && { airTime: body.airTime ?? undefined }),
         updatedAt: new Date().toISOString(),
@@ -499,6 +511,11 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       }
 
       clearProductionPflState(doc._id);
+      clearAudioState(doc._id);
+      clearPipState(doc._id);
+      // Broadcast group-state reset so all connected clients clear their ephemeral
+      // group assignments — these are live-only and must not survive deactivation.
+      broadcast(doc._id, { type: 'GRP_STATE_RESET' });
       if (doc.stromFlowId) {
         const stromToken = await getStromToken(config.stromToken).catch((err) => { req.log.error({ err }, "SAT exchange failed — proceeding without auth"); return undefined; });
         const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
@@ -513,6 +530,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         audioMixerBlockId: undefined,
         loudnessMainBlockId: undefined,
         sourceOffsetBlockIds: undefined,
+        sourceAudioOffsetBlockIds: undefined,
         whepEndpoint: undefined,
         pgmWhepEndpoint: undefined,
         whipEndpoints: undefined,
@@ -535,19 +553,25 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
   // Assign a source to a mixer input
   fastify.post<{ Params: { id: string } }>('/api/v1/productions/:id/sources', async (req, reply) => {
     const body = SourceAssignmentInput.parse(req.body);
-    try {
-      const doc = await getDb().get(req.params.id);
-      // Replace existing assignment for the same mixerInput, or add new
-      const existing = doc.sources.findIndex((s) => s.mixerInput === body.mixerInput);
-      const assignment: ProductionSourceAssignment = { sourceId: body.sourceId, mixerInput: body.mixerInput };
-      const sources = existing !== -1
-        ? doc.sources.map((s, i) => (i === existing ? assignment : s))
-        : [...doc.sources, assignment];
-      const updated: ProductionDoc = { ...doc, sources, updatedAt: new Date().toISOString() };
-      const response = await getDb().insert(updated);
-      return reply.status(201).send({ ...assignment, _rev: response.rev });
-    } catch {
-      return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+    const assignment: ProductionSourceAssignment = { sourceId: body.sourceId, mixerInput: body.mixerInput };
+    for (let attempt = 0; attempt < MAX_DB_WRITE_RETRIES; attempt++) {
+      try {
+        const doc = await getDb().get(req.params.id);
+        // Replace existing assignment for the same mixerInput, or add new
+        const existing = doc.sources.findIndex((s) => s.mixerInput === body.mixerInput);
+        const unsorted = existing !== -1
+          ? doc.sources.map((s, i) => (i === existing ? assignment : s))
+          : [...doc.sources, assignment];
+        const sources = [...unsorted].sort((a, b) => a.mixerInput.localeCompare(b.mixerInput));
+        const updated: ProductionDoc = { ...doc, sources, updatedAt: new Date().toISOString() };
+        const response = await getDb().insert(updated);
+        return reply.status(201).send({ ...assignment, _rev: response.rev });
+      } catch (err) {
+        if (err instanceof Error && 'statusCode' in err && (err as { statusCode?: number }).statusCode === 409) {
+          if (attempt < MAX_DB_WRITE_RETRIES - 1) continue;
+        }
+        return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+      }
     }
   });
 
@@ -555,19 +579,24 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.delete<{ Params: { id: string; mixerInput: string } }>(
     '/api/v1/productions/:id/sources/:mixerInput',
     async (req, reply) => {
-      try {
-        const doc = await getDb().get(req.params.id);
-        const exists = doc.sources.some((s) => s.mixerInput === req.params.mixerInput);
-        if (!exists) return reply.status(404).send({ error: 'Source assignment not found', statusCode: 404 });
-        const updated: ProductionDoc = {
-          ...doc,
-          sources: doc.sources.filter((s) => s.mixerInput !== req.params.mixerInput),
-          updatedAt: new Date().toISOString(),
-        };
-        await getDb().insert(updated);
-        return reply.status(204).send();
-      } catch {
-        return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+      for (let attempt = 0; attempt < MAX_DB_WRITE_RETRIES; attempt++) {
+        try {
+          const doc = await getDb().get(req.params.id);
+          const exists = doc.sources.some((s) => s.mixerInput === req.params.mixerInput);
+          if (!exists) return reply.status(404).send({ error: 'Source assignment not found', statusCode: 404 });
+          const updated: ProductionDoc = {
+            ...doc,
+            sources: doc.sources.filter((s) => s.mixerInput !== req.params.mixerInput),
+            updatedAt: new Date().toISOString(),
+          };
+          await getDb().insert(updated);
+          return reply.status(204).send();
+        } catch (err) {
+          if (err instanceof Error && 'statusCode' in err && (err as { statusCode?: number }).statusCode === 409) {
+            if (attempt < MAX_DB_WRITE_RETRIES - 1) continue;
+          }
+          return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+        }
       }
     }
   );

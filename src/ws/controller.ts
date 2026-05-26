@@ -5,7 +5,7 @@ import { updateProductionDoc } from '../routes/productions.js';
 import type { ProductionDoc } from '../db/types.js';
 import { getTally, setTally, subscribe, unsubscribe, broadcast } from '../services/tally.service.js';
 import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
-import { StromClient, type TransitionType as StromTransitionType } from '../lib/strom.js';
+import { StromClient, type TransitionType as StromTransitionType, type PipZone, type PipConfig } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
@@ -13,7 +13,7 @@ import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioCh
 type InboundMessage =
   | { type: 'CUT'; mixerInput: string; afvRampMs?: number }
   | { type: 'TRANSITION'; mixerInput: string; transitionType: string; durationMs?: number; afvRampMs?: number }
-  | { type: 'TAKE'; afvRampMs?: number }
+  | { type: 'TAKE'; transitionType?: string; durationMs?: number; afvRampMs?: number }
   | { type: 'SET_PVW'; mixerInput: string }
   | { type: 'FTB'; active?: boolean; durationMs?: number }
   | { type: 'SET_OVL'; alpha: number }
@@ -33,7 +33,10 @@ type InboundMessage =
   | { type: 'GRP_MASTER_SET'; grpBus: number; volume: number; muted: boolean }
   | { type: 'MONITOR_SET'; volume: number; muted: boolean }
   | { type: 'SOURCE_OFFSET_SET'; mixerInput: string; offsetMs: number }
-  | { type: 'LOUDNESS_RESET' };
+  | { type: 'SOURCE_AUDIO_OFFSET_SET'; mixerInput: string; offsetMs: number }
+  | { type: 'LOUDNESS_RESET' }
+  | { type: 'SELECT_PVW_PIP'; pip: number }
+  | { type: 'SET_PIP'; pip: number; bg: number | null; zones: PipZone[] };
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -78,14 +81,22 @@ async function stromTransition(
     console.warn('[controller] Strom transition skipped — cannot parse index from pad:', toMixerInput);
     return;
   }
-  // Strom's trigger_transition API always transitions from its current PGM to
-  // its current PVW — it ignores from_input/to_input entirely (they are only
-  // fallbacks when no overlay state exists). We must therefore call selectPreview
-  // first to ensure Strom's PVW is the input we want to cut/transition to.
+  // Set Strom's PVW to the target input first, then fire the transition.
+  // Strom's trigger_transition uses from_input/to_input directly — selectPreview
+  // call is belt-and-suspenders so Strom's own UI also reflects the new PVW.
   const fromIndex = fromMixerInput ? (padToIndex(fromMixerInput) ?? toIndex) : toIndex;
+  const strom = await makeStromClient();
   try {
-    const strom = await makeStromClient();
+    // selectPreview is belt-and-suspenders so Strom's own UI reflects the new
+    // PVW. It can legitimately fail (400) when the target input is already the
+    // sole program source (e.g. cutting away from a PiP overlay whose background
+    // is the same real input). Treat the failure as non-fatal and still fire the
+    // transition so the actual cut always reaches Strom.
     await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { input: toIndex } });
+  } catch (err) {
+    console.warn('[controller] Strom selectPreview (non-fatal, transition will still fire):', err);
+  }
+  try {
     await strom.mixer.transition(doc.stromFlowId, doc.mixerBlockId, {
       from_input: fromIndex,
       to_input: toIndex,
@@ -152,6 +163,13 @@ const channelLevelsByProduction = new Map<string, Map<string, number>>()
 const sourceOffsetsByProduction = new Map<string, Map<string, number>>()
 
 /**
+ * Per-production runtime audio offset registry.
+ * Maps productionId → (mixerInput → offsetMs).
+ * Populated by SOURCE_AUDIO_OFFSET_SET messages; sent to new clients on connect.
+ */
+const sourceAudioOffsetsByProduction = new Map<string, Map<string, number>>()
+
+/**
  * Per-production AUX send state cache.
  * Maps productionId → (`ch{N}_aux{M}` → { level, enabled, pre }).
  * Updated on every AUX_SEND_SET so reconnecting clients restore the full per-channel
@@ -181,9 +199,30 @@ const grpSendByProduction = new Map<string, Map<string, { level: number; enabled
 const grpMasterByProduction = new Map<string, Map<number, { volume: number; muted: boolean }>>()
 const monitorByProduction   = new Map<string, { volume: number; muted: boolean }>()
 
+const pgmPipByProduction    = new Map<string, number | null>()
+const pvwPipByProduction    = new Map<string, number | null>()
+const pipConfigsByProduction = new Map<string, PipConfig[]>()
 
-/** Wipe all per-production audio state. Called when the pipeline changes. */
-function clearAudioState(productionId: string): void {
+/**
+ * PVW mixer-input pad that was on PVW immediately before SELECT_PVW_PIP was
+ * received.  Stored so the PiP TAKE can pass it as `to_input` to Strom,
+ * which becomes Strom's `pgm_input` (real background behind the PiP) after
+ * the swap — keeping pgm_input ≠ pvw_input and avoiding the 400 "sole
+ * program source" error on the next selectPreview call.
+ */
+const pvwBeforePipByProduction = new Map<string, string | null>()
+
+/**
+ * Strom's real pgm_input (background behind the PiP) while a PiP is on PGM.
+ * Set when a PiP TAKE completes; cleared when a real-source CUT/TRANSITION
+ * removes the PiP from PGM.  Used as `fromMixerInput` in stromTransition so
+ * the cut has the correct from_input instead of defaulting to toIndex.
+ */
+const pgmBgByProduction = new Map<string, string | null>()
+
+
+/** Wipe all per-production audio state. Called when the pipeline changes or production deactivates. */
+export function clearAudioState(productionId: string): void {
   afvChannelsByProduction.delete(productionId)
   mutedElementsByProduction.delete(productionId)
   activeFlowIdByProduction.delete(productionId)
@@ -195,6 +234,28 @@ function clearAudioState(productionId: string): void {
   grpSendByProduction.delete(productionId)
   grpMasterByProduction.delete(productionId)
   monitorByProduction.delete(productionId)
+  pvwBeforePipByProduction.delete(productionId)
+  pgmBgByProduction.delete(productionId)
+  pgmPipByProduction.delete(productionId)
+  pvwPipByProduction.delete(productionId)
+}
+
+/**
+ * Flush PiP pgm/pvw selection state on deactivation. Preserves pipConfigsByProduction
+ * (zone layout) so the operator's PiP configuration survives a restart.
+ * Broadcasts PIP_STATE so all connected clients clear their pgmPip/pvwPip indicators.
+ */
+export function clearPipState(productionId: string): void {
+  pgmPipByProduction.delete(productionId)
+  pvwPipByProduction.delete(productionId)
+  pvwBeforePipByProduction.delete(productionId)
+  pgmBgByProduction.delete(productionId)
+  broadcast(productionId, {
+    type: 'PIP_STATE',
+    pgmPip: null,
+    pvwPip: null,
+    pips: pipConfigsByProduction.get(productionId) ?? [],
+  })
 }
 
 /**
@@ -312,12 +373,34 @@ async function handleMessage(
   switch (msg.type) {
     case 'CUT': {
       const tally = getTally(productionId);
+      // When a PiP is on PGM, tally.pgm is null. Use the tracked Strom PGM
+      // background input so stromTransition has a valid from_input.
+      const curPgmPipCut = pgmPipByProduction.get(productionId) ?? null;
+      const fromPadCut = (curPgmPipCut !== null && tally.pgm === null)
+        ? (pgmBgByProduction.get(productionId) ?? null)
+        : tally.pgm;
       const newTally = { pgm: msg.mixerInput, pvw: tally.pgm };
       setTally(productionId, newTally);
+      // CUT to a real source clears any active PiP from PGM; PiP moves to PVW.
+      if (curPgmPipCut !== null) {
+        pgmPipByProduction.set(productionId, null);
+        pvwPipByProduction.set(productionId, curPgmPipCut);
+        pvwBeforePipByProduction.set(productionId, pgmBgByProduction.get(productionId) ?? null);
+        pgmBgByProduction.delete(productionId);
+        broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: curPgmPipCut, pips: pipConfigsByProduction.get(productionId) ?? [] });
+      }
       const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
       await db.insert(updated);
       broadcast(productionId, { type: 'TALLY', ...newTally });
-      await stromTransition(doc, tally.pgm, msg.mixerInput, 'cut');
+      await stromTransition(doc, fromPadCut, msg.mixerInput, 'cut');
+      if (curPgmPipCut !== null && doc.stromFlowId && doc.mixerBlockId) {
+        try {
+          const strom = await makeStromClient();
+          await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: curPgmPipCut } });
+        } catch (err) {
+          console.warn('[controller] Strom selectPreview (pip restore after cut) error:', err);
+        }
+      }
       if (doc.stromFlowId && ctx.audioBlockId) {
         void applyAudioFollow(productionId, doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampMs);
       }
@@ -325,12 +408,31 @@ async function handleMessage(
     }
     case 'TRANSITION': {
       const tally = getTally(productionId);
+      const curPgmPipTrans = pgmPipByProduction.get(productionId) ?? null;
+      const fromPadTrans = (curPgmPipTrans !== null && tally.pgm === null)
+        ? (pgmBgByProduction.get(productionId) ?? null)
+        : tally.pgm;
       const newTally = { pgm: msg.mixerInput, pvw: tally.pgm };
       setTally(productionId, newTally);
+      if (curPgmPipTrans !== null) {
+        pgmPipByProduction.set(productionId, null);
+        pvwPipByProduction.set(productionId, curPgmPipTrans);
+        pvwBeforePipByProduction.set(productionId, pgmBgByProduction.get(productionId) ?? null);
+        pgmBgByProduction.delete(productionId);
+        broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: curPgmPipTrans, pips: pipConfigsByProduction.get(productionId) ?? [] });
+      }
       const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
       await db.insert(updated);
       broadcast(productionId, { type: 'TALLY', ...newTally, transitionType: msg.transitionType, durationMs: msg.durationMs });
-      await stromTransition(doc, tally.pgm, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
+      await stromTransition(doc, fromPadTrans, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
+      if (curPgmPipTrans !== null && doc.stromFlowId && doc.mixerBlockId) {
+        try {
+          const strom = await makeStromClient();
+          await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: curPgmPipTrans } });
+        } catch (err) {
+          console.warn('[controller] Strom selectPreview (pip restore after transition) error:', err);
+        }
+      }
       if (doc.stromFlowId && ctx.audioBlockId) {
         void applyAudioFollow(productionId, doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampMs);
       }
@@ -338,12 +440,77 @@ async function handleMessage(
     }
     case 'TAKE': {
       const tally = getTally(productionId);
+      const curPvwPip = pvwPipByProduction.get(productionId) ?? null;
+      const curPgmPip = pgmPipByProduction.get(productionId) ?? null;
       const newTally = { pgm: tally.pvw, pvw: tally.pgm };
+      const newPgmPip = curPvwPip;
+      const newPvwPip = curPgmPip;
       setTally(productionId, newTally);
+      pgmPipByProduction.set(productionId, newPgmPip);
+      pvwPipByProduction.set(productionId, newPvwPip);
       const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
       await db.insert(updated);
       broadcast(productionId, { type: 'TALLY', ...newTally });
-      await stromTransition(doc, tally.pgm, tally.pvw, 'cut');
+      broadcast(productionId, { type: 'PIP_STATE', pgmPip: newPgmPip, pvwPip: newPvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
+      const takeTransition = toStromTransition(msg.transitionType ?? 'cut');
+      if (curPvwPip !== null) {
+        // PiP is on PVW → moving to PGM.
+        // from_input: the real source currently on PGM (will move to PVW).
+        // to_input: the real source that was on PVW *before* the PiP was
+        //   selected.  This becomes Strom's pgm_input (background behind the
+        //   PiP) after the swap, ensuring pgm_input ≠ pvw_input so subsequent
+        //   selectPreview calls don't hit the "sole program source" 400.
+        if (doc.stromFlowId && doc.mixerBlockId) {
+          try {
+            const strom = await makeStromClient();
+            const fromInputIndex = tally.pgm ? (padToIndex(tally.pgm) ?? 0) : 0;
+            const pvwBeforePip = pvwBeforePipByProduction.get(productionId) ?? null;
+            const toInputIndex = pvwBeforePip !== null ? (padToIndex(pvwBeforePip) ?? fromInputIndex) : fromInputIndex;
+            await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: curPvwPip } });
+            await strom.mixer.transition(doc.stromFlowId, doc.mixerBlockId, {
+              from_input: fromInputIndex,
+              to_input: toInputIndex,
+              transition_type: takeTransition,
+              ...(msg.durationMs !== undefined ? { duration_ms: msg.durationMs } : {}),
+            });
+            // Track the new Strom PGM background (pvwBeforePip) so CUT/TRANSITION
+            // can pass the correct from_input while the PiP remains on PGM.
+            pgmBgByProduction.set(productionId, pvwBeforePip);
+            pvwBeforePipByProduction.delete(productionId);
+          } catch (err) {
+            console.warn('[controller] Strom PiP transition error:', err);
+          }
+        }
+      } else if (curPgmPip !== null) {
+        // PiP is on PGM → taking to a real input; PiP moves to PVW.
+        // Use the tracked PGM background as from_input (tally.pgm is null while a
+        // PiP occupies PGM).  Save pgmBg as pvwBeforePip so the next forward PiP
+        // take has a valid to_input ≠ from_input (avoids "sole program source" 400).
+        const pgmBg = pgmBgByProduction.get(productionId) ?? null;
+        pvwBeforePipByProduction.set(productionId, pgmBg);
+        pgmBgByProduction.delete(productionId);
+        if (doc.stromFlowId && doc.mixerBlockId) {
+          try {
+            const strom = await makeStromClient();
+            const fromInputIndex = pgmBg ? (padToIndex(pgmBg) ?? 0) : 0;
+            const toInputIndex = tally.pvw ? (padToIndex(tally.pvw) ?? fromInputIndex) : fromInputIndex;
+            await strom.mixer.transition(doc.stromFlowId, doc.mixerBlockId, {
+              from_input: fromInputIndex,
+              to_input: toInputIndex,
+              transition_type: takeTransition,
+              ...(msg.durationMs !== undefined ? { duration_ms: msg.durationMs } : {}),
+            });
+            // Restore the PiP to Strom's preview so subsequent forward takes work.
+            await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: curPgmPip } });
+          } catch (err) {
+            console.warn('[controller] Strom reverse-PiP transition error:', err);
+          }
+        }
+      } else {
+        // No PiP involved: clear any stale PGM background tracking.
+        pgmBgByProduction.delete(productionId);
+        await stromTransition(doc, tally.pgm, tally.pvw, takeTransition, msg.durationMs);
+      }
       if (doc.stromFlowId && ctx.audioBlockId) {
         void applyAudioFollow(productionId, doc, tally.pvw, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampMs);
       }
@@ -351,11 +518,15 @@ async function handleMessage(
     }
     case 'SET_PVW': {
       const tally = getTally(productionId);
+      pvwPipByProduction.set(productionId, null);
+      // A real source is going on PVW: discard any saved pre-PiP PVW reference.
+      pvwBeforePipByProduction.delete(productionId);
       const newTally = { pgm: tally.pgm, pvw: msg.mixerInput };
       setTally(productionId, newTally);
       const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
       await db.insert(updated);
       broadcast(productionId, { type: 'TALLY', ...newTally });
+      broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: null, pips: pipConfigsByProduction.get(productionId) ?? [] });
       if (doc.stromFlowId && doc.mixerBlockId) {
         const inputIndex = padToIndex(msg.mixerInput);
         if (inputIndex !== null) {
@@ -366,6 +537,49 @@ async function handleMessage(
             console.warn('[controller] Strom selectPreview error:', err);
           }
         }
+      }
+      break;
+    }
+    case 'SELECT_PVW_PIP': {
+      const tally = getTally(productionId);
+      // Save the current PVW real source before the PiP takes over. The TAKE
+      // handler uses this as to_input in trigger_transition so Strom ends up
+      // with pgm_input ≠ pvw_input (avoids "sole program source" 400 errors).
+      pvwBeforePipByProduction.set(productionId, tally.pvw);
+      pvwPipByProduction.set(productionId, msg.pip);
+      const newTally = { pgm: tally.pgm, pvw: null };
+      setTally(productionId, newTally);
+      await db.insert({ ...doc, tally: newTally, updatedAt: new Date().toISOString() });
+      broadcast(productionId, { type: 'TALLY', ...newTally });
+      broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: msg.pip, pips: pipConfigsByProduction.get(productionId) ?? [] });
+      if (doc.stromFlowId && doc.mixerBlockId) {
+        try {
+          const strom = await makeStromClient();
+          // Strom 0.5+: PiPs are first-class sources — address via { pip: N }, not by offset into inputs.
+          await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { pip: msg.pip } });
+        } catch (err) {
+          console.warn('[controller] Strom selectPreview (pip) error:', err);
+        }
+      }
+      break;
+    }
+    case 'SET_PIP': {
+      if (!doc.stromFlowId || !doc.mixerBlockId) break;
+      try {
+        const strom = await makeStromClient();
+
+        // Persist config so reconnecting clients see current PiP layout
+        const pips = (pipConfigsByProduction.get(productionId) ?? []).slice();
+        pips[msg.pip] = { bg: msg.bg, zones: msg.zones };
+        pipConfigsByProduction.set(productionId, pips);
+        broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: pvwPipByProduction.get(productionId) ?? null, pips });
+
+        await strom.mixer.updatePipConfig(doc.stromFlowId, doc.mixerBlockId, msg.pip, {
+          bg: msg.bg,
+          zones: msg.zones,
+        });
+      } catch (err) {
+        console.warn('[controller] Strom SET_PIP error:', err);
       }
       break;
     }
@@ -916,6 +1130,41 @@ async function handleMessage(
       broadcast(productionId, { type: 'SOURCE_OFFSET_STATE', mixerInput, offsetMs });
       break;
     }
+    case 'SOURCE_AUDIO_OFFSET_SET': {
+      const { mixerInput, offsetMs } = msg;
+      if (!Number.isFinite(offsetMs)) break;
+
+      const audioOffsets = sourceAudioOffsetsByProduction.get(productionId) ?? new Map<string, number>();
+      audioOffsets.set(mixerInput, offsetMs);
+      sourceAudioOffsetsByProduction.set(productionId, audioOffsets);
+
+      if (!doc.stromFlowId) {
+        console.warn('[controller] SOURCE_AUDIO_OFFSET_SET: production not active, offset stored in registry only');
+      } else if (!doc.sourceAudioOffsetBlockIds?.[mixerInput]) {
+        console.warn(`[controller] SOURCE_AUDIO_OFFSET_SET: no audio offset block for ${mixerInput} — re-activate production to pick up time_offset blocks`);
+      } else {
+        const offsetBlockId = doc.sourceAudioOffsetBlockIds[mixerInput];
+        const flowId = doc.stromFlowId;
+        const debounceKey = `${productionId}:audio-offset:${mixerInput}`;
+        const prev = pendingVolume.get(debounceKey);
+        if (prev) clearTimeout(prev);
+        pendingVolume.set(debounceKey, setTimeout(async () => {
+          pendingVolume.delete(debounceKey);
+          try {
+            const s = await makeStromClient();
+            await s.properties.updateElement(flowId, `${offsetBlockId}:offset_identity`, {
+              property_name: 'offset_ms',
+              value: offsetMs,
+            });
+          } catch (err) {
+            console.warn(`[controller] SOURCE_AUDIO_OFFSET_SET error (${mixerInput}):`, String(err));
+          }
+        }, 150));
+      }
+
+      broadcast(productionId, { type: 'SOURCE_AUDIO_OFFSET_STATE', mixerInput, offsetMs });
+      break;
+    }
     case 'LOUDNESS_RESET': {
       if (!doc.stromFlowId || !doc.loudnessMainBlockId) {
         console.warn('[controller] LOUDNESS_RESET: no active loudness block');
@@ -989,20 +1238,30 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       }
       socket.send(JSON.stringify({ type: 'TALLY', ...tally }));
 
-      // Sync OVL alpha: prefer live Strom value, fall back to persisted value in doc
-      if (connectDoc?.stromFlowId && connectDoc?.mixerBlockId) {
-        try {
-          const strom = await makeStromClient();
-          const state = await strom.mixer.getState(connectDoc.stromFlowId, connectDoc.mixerBlockId);
-          socket.send(JSON.stringify({ type: 'OVL_STATE', alpha: state.overlay_alpha }));
-        } catch {
-          if (connectDoc.overlayAlpha !== undefined) {
-            socket.send(JSON.stringify({ type: 'OVL_STATE', alpha: connectDoc.overlayAlpha }));
-          }
-        }
-      } else if (connectDoc?.overlayAlpha !== undefined) {
+      // Sync OVL alpha from persisted doc value (Strom has no GET /state endpoint).
+      // When set_overlay_alpha fires it persists to the doc via the WS handler.
+      if (connectDoc?.overlayAlpha !== undefined) {
         socket.send(JSON.stringify({ type: 'OVL_STATE', alpha: connectDoc.overlayAlpha }));
       }
+
+      // Sync PiP state from in-memory server cache (populated by SET_PIP / SELECT_PVW_PIP).
+      // If the cache is empty after a server restart, seed it from num_pips in production values
+      // so the PipPanel shows the correct number of PiP slots without requiring SET_PIP first.
+      if (!pipConfigsByProduction.has(id)) {
+        const rawNumPips = connectDoc?.values?.num_pips;
+        const numPips = typeof rawNumPips === 'number' ? Math.max(0, Math.round(rawNumPips))
+          : typeof rawNumPips === 'string' ? Math.max(0, parseInt(rawNumPips, 10) || 0)
+          : 0;
+        if (numPips > 0) {
+          pipConfigsByProduction.set(id, Array.from({ length: numPips }, () => ({ bg: null, zones: [] })));
+        }
+      }
+      socket.send(JSON.stringify({
+        type: 'PIP_STATE',
+        pgmPip: pgmPipByProduction.get(id) ?? null,
+        pvwPip: pvwPipByProduction.get(id) ?? null,
+        pips:   pipConfigsByProduction.get(id) ?? [],
+      }));
 
       // Send persisted DSK layer states so the controller reflects the live pipeline
       if (connectDoc?.dskLayers) {
@@ -1124,9 +1383,13 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
                 }
               }
             }
-            // Restore per-channel GRP send state (G1/G2 assignments + fader level)
+            // Restore per-channel GRP send state (G1/G2 assignments + fader level).
+            // If there are no cached assignments (fresh production start or after deactivation),
+            // send GRP_STATE_RESET so the client clears any stale state it retained from a
+            // previous session — the deactivation broadcast may have been missed if the socket
+            // reconnected after clearAudioState was called.
             const cachedGrpSends = grpSendByProduction.get(id);
-            if (cachedGrpSends) {
+            if (cachedGrpSends && cachedGrpSends.size > 0) {
               for (const [key, { level, enabled }] of cachedGrpSends) {
                 // key format: 'ch{N}_grp{M}'
                 const m = /^(ch\d+)_grp(\d+)$/.exec(key);
@@ -1134,6 +1397,8 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
                   socket.send(JSON.stringify({ type: 'GRP_SEND_STATE', elementId: m[1], grpBus: parseInt(m[2], 10), level, enabled }));
                 }
               }
+            } else {
+              socket.send(JSON.stringify({ type: 'GRP_STATE_RESET' }));
             }
             // Send current AFV state to this connecting client so it can restore
             // its store without the operator having to re-enable AFV per strip.
@@ -1154,6 +1419,12 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             if (currentOffsets) {
               for (const [mixerInput, offsetMs] of currentOffsets) {
                 socket.send(JSON.stringify({ type: 'SOURCE_OFFSET_STATE', mixerInput, offsetMs }));
+              }
+            }
+            const currentAudioOffsets = sourceAudioOffsetsByProduction.get(id);
+            if (currentAudioOffsets) {
+              for (const [mixerInput, offsetMs] of currentAudioOffsets) {
+                socket.send(JSON.stringify({ type: 'SOURCE_AUDIO_OFFSET_STATE', mixerInput, offsetMs }));
               }
             }
             startMeterRelay(id, connectDoc.stromFlowId, audioBlockId, connectDoc.loudnessMainBlockId);
