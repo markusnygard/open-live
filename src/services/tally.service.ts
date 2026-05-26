@@ -24,6 +24,10 @@ export function unsubscribe(productionId: string, ws: WebSocket): void {
   subscribers.get(productionId)?.delete(ws);
 }
 
+export function getSubscriberCount(productionId: string): number {
+  return subscribers.get(productionId)?.size ?? 0;
+}
+
 export function broadcast(productionId: string, message: unknown): void {
   const subs = subscribers.get(productionId);
   if (!subs) return;

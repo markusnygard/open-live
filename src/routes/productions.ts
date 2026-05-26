@@ -6,7 +6,7 @@ import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssign
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
-import { setTally, broadcast } from '../services/tally.service.js';
+import { setTally, broadcast, getSubscriberCount } from '../services/tally.service.js';
 import { clearProductionPflState } from '../services/pfl-state.js';
 import { clearPipState, clearAudioState } from '../ws/controller.js';
 import { config } from '../config.js';
@@ -675,6 +675,14 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       } catch {
         return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
       }
+    }
+  );
+  // Connected controller count for a production (used by the companion module
+  // to show a "peers connected" indicator on the landing page)
+  fastify.get<{ Params: { id: string } }>(
+    '/api/v1/productions/:id/controllers',
+    async (req, reply) => {
+      return reply.send({ count: getSubscriberCount(req.params.id) });
     }
   );
 };
