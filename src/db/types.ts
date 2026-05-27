@@ -167,6 +167,9 @@ export interface ProductionDoc {
   sourceAudioOffsetBlockIds?: Record<string, string>;
   /** DSK layer visibility state, keyed by 0-based layer index */
   dskLayers?: Record<number, boolean>;
+  /** AFV audio ramp durations — fade-in and fade-out times applied on CUT/TRANSITION/TAKE */
+  afvRampUpMs?: number;
+  afvRampDownMs?: number;
   /** Warnings accumulated when a referenced source/graphic/output was deleted while production was inactive */
   deletionWarnings?: Array<{ type: 'source' | 'graphic' | 'output'; name: string }>;
   createdAt: string;

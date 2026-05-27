@@ -309,6 +309,7 @@ export interface OverlayAlphaResponse {
 export interface UpdateBlockPropertiesRequest {
   properties: Record<string, unknown>
   ramp_ms?: number
+  ramp_ms_overrides?: Record<string, number>
 }
 
 export interface BlockPropertiesResponse {

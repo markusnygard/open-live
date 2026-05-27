@@ -11,9 +11,9 @@ import { config } from '../config.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
 
 type InboundMessage =
-  | { type: 'CUT'; mixerInput: string; afvRampMs?: number }
-  | { type: 'TRANSITION'; mixerInput: string; transitionType: string; durationMs?: number; afvRampMs?: number }
-  | { type: 'TAKE'; transitionType?: string; durationMs?: number; afvRampMs?: number }
+  | { type: 'CUT'; mixerInput: string; afvRampUpMs?: number; afvRampDownMs?: number }
+  | { type: 'TRANSITION'; mixerInput: string; transitionType: string; durationMs?: number; afvRampUpMs?: number; afvRampDownMs?: number }
+  | { type: 'TAKE'; pip?: number; transitionType?: string; durationMs?: number; afvRampUpMs?: number; afvRampDownMs?: number }
   | { type: 'SET_PVW'; mixerInput: string }
   | { type: 'FTB'; active?: boolean; durationMs?: number }
   | { type: 'SET_OVL'; alpha: number }
@@ -25,6 +25,7 @@ type InboundMessage =
   | { type: 'MACRO_EXEC'; macroId: string }
   | { type: 'AUDIO_SET'; elementId: string; property: 'volume' | 'mute'; value: unknown; ramp_ms?: number }
   | { type: 'AFV_SET'; mixerInput: string; enabled: boolean }
+  | { type: 'AFV_RAMP_SET'; rampUpMs: number; rampDownMs: number }
   | { type: 'PFL_SET'; elementId: string; enabled: boolean; volume?: number }
   | { type: 'AFL_SET'; elementId: string; enabled: boolean }
   | { type: 'AUX_SEND_SET'; elementId: string; auxBus: number; level: number; enabled: boolean; pre?: boolean }
@@ -170,6 +171,13 @@ const sourceOffsetsByProduction = new Map<string, Map<string, number>>()
 const sourceAudioOffsetsByProduction = new Map<string, Map<string, number>>()
 
 /**
+ * Per-production AFV ramp settings.
+ * Maps productionId → { rampUpMs, rampDownMs }.
+ * Populated by AFV_RAMP_SET messages; sent to new clients on connect.
+ */
+const afvRampByProduction = new Map<string, { rampUpMs: number; rampDownMs: number }>()
+
+/**
  * Per-production AUX send state cache.
  * Maps productionId → (`ch{N}_aux{M}` → { level, enabled, pre }).
  * Updated on every AUX_SEND_SET so reconnecting clients restore the full per-channel
@@ -241,11 +249,13 @@ export function clearAudioState(productionId: string): void {
 }
 
 /**
- * Flush PiP pgm/pvw selection state on deactivation. Preserves pipConfigsByProduction
- * (zone layout) so the operator's PiP configuration survives a restart.
- * Broadcasts PIP_STATE so all connected clients clear their pgmPip/pvwPip indicators.
+ * Flush all PiP state on deactivation — zone configs, pgm/pvw selection.
+ * Strom resets its own PiP config on flow teardown, so preserving zones would
+ * cause a UI/Strom mismatch on restart.
+ * Broadcasts PIP_STATE so all connected clients reset their PiP indicators.
  */
 export function clearPipState(productionId: string): void {
+  pipConfigsByProduction.delete(productionId)
   pgmPipByProduction.delete(productionId)
   pvwPipByProduction.delete(productionId)
   pvwBeforePipByProduction.delete(productionId)
@@ -254,7 +264,7 @@ export function clearPipState(productionId: string): void {
     type: 'PIP_STATE',
     pgmPip: null,
     pvwPip: null,
-    pips: pipConfigsByProduction.get(productionId) ?? [],
+    pips: [],
   })
 }
 
@@ -305,7 +315,8 @@ async function applyAudioFollow(
   stromFlowId: string,
   audioBlockId: string,
   strom: StromClient,
-  rampMs = 200,
+  rampUpMs = 300,
+  rampDownMs = 50,
 ): Promise<void> {
   // Default to empty set — an uninitialised registry never routes all channels.
   const afvChannels = afvChannelsByProduction.get(productionId) ?? new Set<string>();
@@ -314,6 +325,7 @@ async function applyAudioFollow(
 
   let audioIdx = 0;
   const properties: Record<string, unknown> = {};
+  const ramp_ms_overrides: Record<string, number> = {};
   for (const assignment of sorted) {
     let streamType: string | undefined;
     try {
@@ -335,10 +347,12 @@ async function applyAudioFollow(
     if (!afvChannels.has(assignment.mixerInput)) continue;
 
     const routed = newPgmMixerInput === null || assignment.mixerInput === newPgmMixerInput;
-    properties[`ch${chIdx}_to_main`] = routed;
+    const key = `ch${chIdx}_to_main`;
+    properties[key] = routed;
+    ramp_ms_overrides[key] = routed ? rampUpMs : rampDownMs;
   }
   if (Object.keys(properties).length > 0) {
-    await strom.flows.updateBlockProperties(stromFlowId, audioBlockId, { properties, ramp_ms: rampMs })
+    await strom.flows.updateBlockProperties(stromFlowId, audioBlockId, { properties, ramp_ms_overrides })
       .catch((err) => console.warn('[controller] audio follow error:', String(err)));
   }
 }
@@ -381,16 +395,21 @@ async function handleMessage(
         : tally.pgm;
       const newTally = { pgm: msg.mixerInput, pvw: tally.pgm };
       setTally(productionId, newTally);
-      // CUT to a real source clears any active PiP from PGM; PiP moves to PVW.
+      const curPvwPipCut = pvwPipByProduction.get(productionId) ?? null;
       if (curPgmPipCut !== null) {
+        // PiP was on PGM → moves to PVW
         pgmPipByProduction.set(productionId, null);
         pvwPipByProduction.set(productionId, curPgmPipCut);
         pvwBeforePipByProduction.set(productionId, pgmBgByProduction.get(productionId) ?? null);
         pgmBgByProduction.delete(productionId);
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: curPgmPipCut, pips: pipConfigsByProduction.get(productionId) ?? [] });
+      } else if (curPvwPipCut !== null) {
+        // PiP was in PVW — cutting a real source to PGM replaces PVW, so clear it
+        pvwPipByProduction.set(productionId, null);
+        broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: null, pips: pipConfigsByProduction.get(productionId) ?? [] });
       }
       const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
-      await db.insert(updated);
+      await db.insert(updated).catch((err: any) => { if (err?.statusCode !== 409) throw err });
       broadcast(productionId, { type: 'TALLY', ...newTally });
       await stromTransition(doc, fromPadCut, msg.mixerInput, 'cut');
       if (curPgmPipCut !== null && doc.stromFlowId && doc.mixerBlockId) {
@@ -402,7 +421,7 @@ async function handleMessage(
         }
       }
       if (doc.stromFlowId && ctx.audioBlockId) {
-        void applyAudioFollow(productionId, doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampMs);
+        void applyAudioFollow(productionId, doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampUpMs, msg.afvRampDownMs);
       }
       break;
     }
@@ -422,7 +441,7 @@ async function handleMessage(
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: null, pvwPip: curPgmPipTrans, pips: pipConfigsByProduction.get(productionId) ?? [] });
       }
       const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
-      await db.insert(updated);
+      await db.insert(updated).catch((err: any) => { if (err?.statusCode !== 409) throw err });
       broadcast(productionId, { type: 'TALLY', ...newTally, transitionType: msg.transitionType, durationMs: msg.durationMs });
       await stromTransition(doc, fromPadTrans, msg.mixerInput, toStromTransition(msg.transitionType), msg.durationMs);
       if (curPgmPipTrans !== null && doc.stromFlowId && doc.mixerBlockId) {
@@ -434,12 +453,23 @@ async function handleMessage(
         }
       }
       if (doc.stromFlowId && ctx.audioBlockId) {
-        void applyAudioFollow(productionId, doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampMs);
+        void applyAudioFollow(productionId, doc, msg.mixerInput, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampUpMs, msg.afvRampDownMs);
       }
       break;
     }
     case 'TAKE': {
       const tally = getTally(productionId);
+      // Atomic PiP take: pip supplied directly so no SELECT_PVW_PIP is needed,
+      // avoiding the concurrent-broadcast race that puts the PiP in both PGM and PVW.
+      if (msg.pip !== undefined) {
+        if (tally.pvw !== null) {
+          // Save the real PVW source as the background behind the PiP, then
+          // null out the tally PVW so the swap below produces { pgm: null, pvw: old_pgm }.
+          pvwBeforePipByProduction.set(productionId, tally.pvw);
+          (tally as { pvw: string | null }).pvw = null;
+        }
+        pvwPipByProduction.set(productionId, msg.pip);
+      }
       const curPvwPip = pvwPipByProduction.get(productionId) ?? null;
       const curPgmPip = pgmPipByProduction.get(productionId) ?? null;
       const newTally = { pgm: tally.pvw, pvw: tally.pgm };
@@ -449,7 +479,7 @@ async function handleMessage(
       pgmPipByProduction.set(productionId, newPgmPip);
       pvwPipByProduction.set(productionId, newPvwPip);
       const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
-      await db.insert(updated);
+      await db.insert(updated).catch((err: any) => { if (err?.statusCode !== 409) throw err });
       broadcast(productionId, { type: 'TALLY', ...newTally });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: newPgmPip, pvwPip: newPvwPip, pips: pipConfigsByProduction.get(productionId) ?? [] });
       const takeTransition = toStromTransition(msg.transitionType ?? 'cut');
@@ -512,7 +542,7 @@ async function handleMessage(
         await stromTransition(doc, tally.pgm, tally.pvw, takeTransition, msg.durationMs);
       }
       if (doc.stromFlowId && ctx.audioBlockId) {
-        void applyAudioFollow(productionId, doc, tally.pvw, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampMs);
+        void applyAudioFollow(productionId, doc, tally.pvw, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampUpMs, msg.afvRampDownMs);
       }
       break;
     }
@@ -549,7 +579,7 @@ async function handleMessage(
       pvwPipByProduction.set(productionId, msg.pip);
       const newTally = { pgm: tally.pgm, pvw: null };
       setTally(productionId, newTally);
-      await db.insert({ ...doc, tally: newTally, updatedAt: new Date().toISOString() });
+      await db.insert({ ...doc, tally: newTally, updatedAt: new Date().toISOString() }).catch((err: any) => { if (err?.statusCode !== 409) throw err });
       broadcast(productionId, { type: 'TALLY', ...newTally });
       broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: msg.pip, pips: pipConfigsByProduction.get(productionId) ?? [] });
       if (doc.stromFlowId && doc.mixerBlockId) {
@@ -855,6 +885,20 @@ async function handleMessage(
       broadcast(productionId, { type: 'AFV_STATE', mixerInput: msg.mixerInput, enabled: msg.enabled });
       break;
     }
+    case 'AFV_RAMP_SET': {
+      const rampUpMs   = Math.max(0, Math.min(5000, Math.round(msg.rampUpMs)));
+      const rampDownMs = Math.max(0, Math.min(5000, Math.round(msg.rampDownMs)));
+      afvRampByProduction.set(productionId, { rampUpMs, rampDownMs });
+      // Persist so the values survive a server restart.
+      try {
+        const latest = await db.get(productionId);
+        await db.insert({ ...latest, afvRampUpMs: rampUpMs, afvRampDownMs: rampDownMs, updatedAt: new Date().toISOString() });
+      } catch (err) {
+        console.warn('[controller] AFV_RAMP_SET: failed to persist ramp settings:', err);
+      }
+      broadcast(productionId, { type: 'AFV_RAMP_STATE', rampUpMs, rampDownMs });
+      break;
+    }
     case 'PFL_SET': {
       if (!activePflByProduction.has(productionId)) activePflByProduction.set(productionId, new Set());
       const activeSet = activePflByProduction.get(productionId)!;
@@ -1024,10 +1068,14 @@ async function handleMessage(
       break;
     }
     case 'GRP_MASTER_SET': {
-      // Set group{N}_volume:volume on the audio mixer (group bus master fader).
+      // Set group{N}_fader on the audio mixer (group bus master fader).
       // grpBus is 1-indexed; Strom element is 0-indexed: grp1 → group0_volume.
       // Groups auto-feed into main — the group master fader controls contribution to PGM output.
-      // When muted, Strom receives 0; fader level always broadcast for multi-client sync.
+      //
+      // Use fader=0 for the muted state — never set group{N}_mute=true.
+      // Strom's VolumeRampManager.apply_mute(true) sets the GStreamer GAP flag which kills meters.
+      // apply_mute(false) restores the pre-mute volume (defaults to 1.0), overriding fader=0.
+      // fader=0 alone ramps to silence without GAP, keeping meters alive.
       if (doc.stromFlowId && ctx.audioBlockId) {
         const flowId = doc.stromFlowId;
         const capturedAudioBlockId = ctx.audioBlockId;
@@ -1040,8 +1088,7 @@ async function handleMessage(
             const s = await makeStromClient();
             await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
               properties: {
-                [`group${msg.grpBus}_fader`]: msg.volume,
-                [`group${msg.grpBus}_mute`]: msg.muted,
+                [`group${msg.grpBus}_fader`]: msg.muted ? 0 : msg.volume,
               },
             });
           } catch (err) {
@@ -1057,11 +1104,13 @@ async function handleMessage(
       break;
     }
     case 'MONITOR_SET': {
-      // Set monitor_fader / monitor_mute on the builtin.mixer block.
+      // Set monitor_fader on the builtin.mixer block.
       // The monitor bus (monitor_out pad) is the operator's local listening feed —
       // zero effect on the programme mix or any output bus.
-      // NOTE: Property names 'monitor_fader' and 'monitor_mute' follow the
-      // aux/group naming convention — confirm with Strom developer if these differ.
+      // NOTE: Strom only exposes 'monitor_fader' — there is no 'monitor_mute' property.
+      // Use fader=0 for the muted state. Do NOT call apply_mute(false): Strom's VolumeRampManager
+      // treats that as an unmute, restoring the pre-mute volume (default 1.0) and overriding fader=0.
+      // fader=0 alone ramps to silence without the GStreamer GAP flag, keeping meters alive.
       if (doc.stromFlowId && ctx.audioBlockId) {
         const flowId = doc.stromFlowId;
         const capturedAudioBlockId = ctx.audioBlockId;
@@ -1074,8 +1123,7 @@ async function handleMessage(
             const s = await makeStromClient();
             await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
               properties: {
-                monitor_fader: msg.volume,
-                monitor_mute:  msg.muted,
+                monitor_fader: msg.muted ? 0 : msg.volume,
               },
             });
           } catch (err) {
@@ -1199,7 +1247,9 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       // Register message/close handlers immediately so no messages are dropped
       // while we perform the async connect-time sync below.
       socket.on('message', (raw: Buffer | string) => {
-        void handleMessage(id, socket, raw.toString(), ctx);
+        handleMessage(id, socket, raw.toString(), ctx).catch((err) => {
+          console.error('[controller] unhandled message error:', err);
+        });
       });
 
       socket.on('close', () => {
@@ -1427,6 +1477,12 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
                 socket.send(JSON.stringify({ type: 'SOURCE_AUDIO_OFFSET_STATE', mixerInput, offsetMs }));
               }
             }
+            // Send current AFV ramp settings — prefer runtime registry, fall back to
+            // persisted values in ProductionDoc (set before the first client connects).
+            const rampEntry = afvRampByProduction.get(id);
+            const rampUpMs   = rampEntry?.rampUpMs   ?? connectDoc.afvRampUpMs   ?? 300;
+            const rampDownMs = rampEntry?.rampDownMs ?? connectDoc.afvRampDownMs ?? 50;
+            socket.send(JSON.stringify({ type: 'AFV_RAMP_STATE', rampUpMs, rampDownMs }));
             startMeterRelay(id, connectDoc.stromFlowId, audioBlockId, connectDoc.loudnessMainBlockId);
           }
         } catch (err) {

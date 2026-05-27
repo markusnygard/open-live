@@ -9,6 +9,11 @@ const statusRoutes: FastifyPluginAsync = async (fastify) => {
     return reply.send({ ok: true });
   });
 
+  fastify.get('/api/v1/server-info', async (_req, reply) => {
+    const stromHost = new URL(config.stromUrl).hostname;
+    return reply.send({ stromHost });
+  });
+
   fastify.get('/api/v1/status', async (_req, reply) => {
     const [db, strom] = await Promise.all([
       isDbReady(),
