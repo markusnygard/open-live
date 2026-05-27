@@ -45,7 +45,13 @@ async function reconcileProductionStatuses(
     if (match) flowByProdId.set(match[1], flow.id);
   }
 
-  const result = await db.find({ selector: { type: 'production' } });
+  let result: Awaited<ReturnType<typeof db.find>>;
+  try {
+    result = await db.find({ selector: { type: 'production' } });
+  } catch (err) {
+    log.warn({ err }, '[reconcile] CouchDB unreachable — skipping');
+    return;
+  }
   for (const doc of result.docs as ProductionDoc[]) {
     // A flow is alive if the stored stromFlowId exists in Strom, OR if a flow
     // tagged with this production's ID is present (covers the case where the
@@ -81,7 +87,7 @@ async function main() {
 
   // Re-run reconciliation every 30 seconds so a flow that started after the
   // activation timeout is automatically detected without requiring a restart.
-  setInterval(() => { void reconcileProductionStatuses(app.log); }, 30_000);
+  setInterval(() => { reconcileProductionStatuses(app.log).catch((err) => app.log.warn({ err }, '[reconcile] unexpected error')); }, 30_000);
 
   await app.listen({ port: config.port, host: '0.0.0.0' });
 }

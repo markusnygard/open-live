@@ -41,11 +41,17 @@ const whepProxyRoutes: FastifyPluginAsync = async (fastify) => {
     const headers: Record<string, string> = { 'Content-Type': 'application/sdp' }
     if (token) headers['Authorization'] = `Bearer ${token}`
 
-    const upstream = await fetch(targetUrl, {
-      method: 'POST',
-      headers,
-      body: req.body as string,
-    })
+    let upstream: Response
+    try {
+      upstream = await fetch(targetUrl, {
+        method: 'POST',
+        headers,
+        body: req.body as string,
+      })
+    } catch (err) {
+      fastify.log.warn({ err }, 'WHEP proxy: upstream unreachable')
+      return reply.status(502).send({ error: 'Upstream unreachable' })
+    }
 
     if (!upstream.ok) {
       const text = await upstream.text()
