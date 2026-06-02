@@ -379,7 +379,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       const updated: ProductionDoc = {
         ...doc,
         ...(body.name !== undefined && { name: body.name }),
-        ...(body.values !== undefined && { values: body.values }),
+        ...(body.values !== undefined && { values: { ...(doc.values ?? {}), ...body.values } }),
         ...(body.airTime !== undefined && { airTime: body.airTime ?? undefined }),
         updatedAt: new Date().toISOString(),
       };
@@ -536,8 +536,6 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         whipEndpoints: undefined,
         srtOutputUri: undefined,
         whepOutputUrls: undefined,
-        overlayAlpha: undefined,
-        dskLayers: undefined,
         tally: { pgm: null, pvw: null },
         updatedAt: new Date().toISOString(),
       };

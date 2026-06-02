@@ -92,6 +92,14 @@ async function main() {
   await app.listen({ port: config.port, host: '0.0.0.0' });
 }
 
+process.on('uncaughtException', (err) => {
+  console.error({ err }, '[process] Uncaught exception — keeping alive');
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error({ reason }, '[process] Unhandled promise rejection — keeping alive');
+});
+
 main().catch((err) => {
   console.error(err);
   process.exit(1);

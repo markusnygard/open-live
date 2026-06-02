@@ -61,13 +61,18 @@ export async function activateStromFlow(
     '__test2__': { streamType: 'test2', address: '', name: 'Test - Colors' },
   };
 
-  // Load all assigned real sources
+  // Load all assigned real sources — skip any whose source doc no longer exists
+  // (e.g. source was deleted while assigned to this production).
   const sourcesDb = getSourcesDb();
   const sourceMap = new Map<string, SourceDoc>();
   for (const assignment of production.sources) {
     if (assignment.sourceId in VIRTUAL_SOURCES) continue;
-    const src = await sourcesDb.get(assignment.sourceId) as unknown as SourceDoc;
-    sourceMap.set(assignment.sourceId, src);
+    try {
+      const src = await sourcesDb.get(assignment.sourceId) as unknown as SourceDoc;
+      sourceMap.set(assignment.sourceId, src);
+    } catch {
+      console.warn(`[flow-generator] Source ${assignment.sourceId} (${assignment.mixerInput}) not found — skipping`);
+    }
   }
 
   // Deep-clone the default flow so we don't mutate the module-level constant
@@ -383,11 +388,18 @@ export async function activateStromFlow(
     props['num_channels'] = String(numChannels);
     // ch{N}_aux{M}_pre is a build-time topology property — must be set here at flow
     // generation time; attempts to change it on a running pipeline are rejected by Strom.
-    const auxPreFader = production.values?.aux_pre_fader;
-    if (typeof auxPreFader === 'boolean' && typeof numAuxBuses === 'number' && numAuxBuses > 0) {
-      for (let ch = 1; ch <= numChannels; ch++) {
-        for (let aux = 1; aux <= numAuxBuses; aux++) {
-          props[`ch${ch}_aux${aux}_pre`] = auxPreFader;
+    // Per-bus setting: aux1_pre, aux2_pre, … (boolean, default true = pre-fader).
+    // Falls back to the legacy aux_pre_fader key for older productions.
+    if (typeof numAuxBuses === 'number' && numAuxBuses > 0) {
+      const legacyPre = production.values?.aux_pre_fader;
+      for (let aux = 1; aux <= numAuxBuses; aux++) {
+        const perBusKey = `aux${aux}_pre`;
+        const perBusValue = production.values?.[perBusKey];
+        const isPre = typeof perBusValue === 'boolean' ? perBusValue
+          : typeof legacyPre === 'boolean' ? legacyPre
+          : true; // default pre-fader
+        for (let ch = 1; ch <= numChannels; ch++) {
+          props[`ch${ch}_aux${aux}_pre`] = isPre;
         }
       }
     }

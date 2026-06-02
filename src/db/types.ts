@@ -156,7 +156,6 @@ export interface ProductionDoc {
   graphics: GraphicOverlay[];
   macros: Macro[];
   tally: Tally;
-  overlayAlpha?: number;
   mixerBlockId?: string;
   audioMixerBlockId?: string;
   /** ID of the builtin.loudness block on the main audio bus — set on activate, cleared on deactivate */
@@ -165,11 +164,6 @@ export interface ProductionDoc {
   sourceOffsetBlockIds?: Record<string, string>;
   /** Maps mixerInput → audio time_offset block ID — set on activate, cleared on deactivate */
   sourceAudioOffsetBlockIds?: Record<string, string>;
-  /** DSK layer visibility state, keyed by 0-based layer index */
-  dskLayers?: Record<number, boolean>;
-  /** AFV audio ramp durations — fade-in and fade-out times applied on CUT/TRANSITION/TAKE */
-  afvRampUpMs?: number;
-  afvRampDownMs?: number;
   /** Warnings accumulated when a referenced source/graphic/output was deleted while production was inactive */
   deletionWarnings?: Array<{ type: 'source' | 'graphic' | 'output'; name: string }>;
   createdAt: string;

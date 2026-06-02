@@ -5,10 +5,16 @@ import { updateProductionDoc } from '../routes/productions.js';
 import type { ProductionDoc } from '../db/types.js';
 import { getTally, setTally, subscribe, unsubscribe, broadcast } from '../services/tally.service.js';
 import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
-import { StromClient, type TransitionType as StromTransitionType, type PipZone, type PipConfig } from '../lib/strom.js';
+import { StromClient, StromClientError, type TransitionType as StromTransitionType, type PipZone, type PipConfig } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
+
+function stromErrorMessage(err: unknown): string {
+  if (err instanceof StromClientError) return err.message;
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
 
 type InboundMessage =
   | { type: 'CUT'; mixerInput: string; afvRampUpMs?: number; afvRampDownMs?: number }
@@ -211,6 +217,9 @@ const pgmPipByProduction    = new Map<string, number | null>()
 const pvwPipByProduction    = new Map<string, number | null>()
 const pipConfigsByProduction = new Map<string, PipConfig[]>()
 
+const overlayAlphaByProduction = new Map<string, number>()
+const dskLayersByProduction    = new Map<string, Record<number, boolean>>()
+
 /**
  * PVW mixer-input pad that was on PVW immediately before SELECT_PVW_PIP was
  * received.  Stored so the PiP TAKE can pass it as `to_input` to Strom,
@@ -232,6 +241,7 @@ const pgmBgByProduction = new Map<string, string | null>()
 /** Wipe all per-production audio state. Called when the pipeline changes or production deactivates. */
 export function clearAudioState(productionId: string): void {
   afvChannelsByProduction.delete(productionId)
+  afvRampByProduction.delete(productionId)
   mutedElementsByProduction.delete(productionId)
   activeFlowIdByProduction.delete(productionId)
   sourceOffsetsByProduction.delete(productionId)
@@ -260,6 +270,8 @@ export function clearPipState(productionId: string): void {
   pvwPipByProduction.delete(productionId)
   pvwBeforePipByProduction.delete(productionId)
   pgmBgByProduction.delete(productionId)
+  overlayAlphaByProduction.delete(productionId)
+  dskLayersByProduction.delete(productionId)
   broadcast(productionId, {
     type: 'PIP_STATE',
     pgmPip: null,
@@ -598,7 +610,6 @@ async function handleMessage(
       try {
         const strom = await makeStromClient();
 
-        // Persist config so reconnecting clients see current PiP layout
         const pips = (pipConfigsByProduction.get(productionId) ?? []).slice();
         pips[msg.pip] = { bg: msg.bg, zones: msg.zones };
         pipConfigsByProduction.set(productionId, pips);
@@ -610,6 +621,7 @@ async function handleMessage(
         });
       } catch (err) {
         console.warn('[controller] Strom SET_PIP error:', err);
+        ws.send(JSON.stringify({ type: 'ERROR', error: stromErrorMessage(err) }));
       }
       break;
     }
@@ -626,8 +638,7 @@ async function handleMessage(
       break;
     }
     case 'SET_OVL': {
-      // Persist alpha to DB so it survives page refreshes (retry-on-409 safe)
-      await updateProductionDoc(productionId, { overlayAlpha: msg.alpha });
+      overlayAlphaByProduction.set(productionId, msg.alpha);
       if (!doc.stromFlowId || !doc.mixerBlockId) break;
       try {
         const strom = await makeStromClient();
@@ -675,9 +686,8 @@ async function handleMessage(
         enabled: msg.visible ?? true,
       });
       const layer0 = result.dsk - 1;
-      await updateProductionDoc(productionId, {
-        dskLayers: { ...(doc.dskLayers ?? {}), [layer0]: result.enabled },
-      });
+      const dskMap = dskLayersByProduction.get(productionId) ?? {}
+      dskLayersByProduction.set(productionId, { ...dskMap, [layer0]: result.enabled })
       broadcast(productionId, { type: 'DSK_STATE', layer: layer0, visible: result.enabled });
       break;
     }
@@ -889,13 +899,6 @@ async function handleMessage(
       const rampUpMs   = Math.max(0, Math.min(5000, Math.round(msg.rampUpMs)));
       const rampDownMs = Math.max(0, Math.min(5000, Math.round(msg.rampDownMs)));
       afvRampByProduction.set(productionId, { rampUpMs, rampDownMs });
-      // Persist so the values survive a server restart.
-      try {
-        const latest = await db.get(productionId);
-        await db.insert({ ...latest, afvRampUpMs: rampUpMs, afvRampDownMs: rampDownMs, updatedAt: new Date().toISOString() });
-      } catch (err) {
-        console.warn('[controller] AFV_RAMP_SET: failed to persist ramp settings:', err);
-      }
       broadcast(productionId, { type: 'AFV_RAMP_STATE', rampUpMs, rampDownMs });
       break;
     }
@@ -1017,8 +1020,7 @@ async function handleMessage(
             const s = await makeStromClient();
             await s.flows.updateBlockProperties(flowId, capturedAudioBlockId, {
               properties: {
-                [`aux${msg.auxBus}_fader`]: msg.volume,
-                [`aux${msg.auxBus}_mute`]: msg.muted,
+                [`aux${msg.auxBus}_fader`]: msg.muted ? 0 : msg.volume,
               },
             });
           } catch (err) {
@@ -1288,15 +1290,14 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
       }
       socket.send(JSON.stringify({ type: 'TALLY', ...tally }));
 
-      // Sync OVL alpha from persisted doc value (Strom has no GET /state endpoint).
-      // When set_overlay_alpha fires it persists to the doc via the WS handler.
-      if (connectDoc?.overlayAlpha !== undefined) {
-        socket.send(JSON.stringify({ type: 'OVL_STATE', alpha: connectDoc.overlayAlpha }));
+      const cachedAlpha = overlayAlphaByProduction.get(id);
+      if (cachedAlpha !== undefined) {
+        socket.send(JSON.stringify({ type: 'OVL_STATE', alpha: cachedAlpha }));
       }
 
       // Sync PiP state from in-memory server cache (populated by SET_PIP / SELECT_PVW_PIP).
-      // If the cache is empty after a server restart, seed it from num_pips in production values
-      // so the PipPanel shows the correct number of PiP slots without requiring SET_PIP first.
+      // If the cache is cold, seed empty slots from num_pips so the PipPanel shows the
+      // correct number of slots without requiring a SET_PIP first.
       if (!pipConfigsByProduction.has(id)) {
         const rawNumPips = connectDoc?.values?.num_pips;
         const numPips = typeof rawNumPips === 'number' ? Math.max(0, Math.round(rawNumPips))
@@ -1313,9 +1314,9 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
         pips:   pipConfigsByProduction.get(id) ?? [],
       }));
 
-      // Send persisted DSK layer states so the controller reflects the live pipeline
-      if (connectDoc?.dskLayers) {
-        for (const [layer, visible] of Object.entries(connectDoc.dskLayers)) {
+      const cachedDskLayers = dskLayersByProduction.get(id);
+      if (cachedDskLayers) {
+        for (const [layer, visible] of Object.entries(cachedDskLayers)) {
           socket.send(JSON.stringify({ type: 'DSK_STATE', layer: Number(layer), visible }));
         }
       }
@@ -1478,10 +1479,9 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
               }
             }
             // Send current AFV ramp settings — prefer runtime registry, fall back to
-            // persisted values in ProductionDoc (set before the first client connects).
             const rampEntry = afvRampByProduction.get(id);
-            const rampUpMs   = rampEntry?.rampUpMs   ?? connectDoc.afvRampUpMs   ?? 300;
-            const rampDownMs = rampEntry?.rampDownMs ?? connectDoc.afvRampDownMs ?? 50;
+            const rampUpMs   = rampEntry?.rampUpMs   ?? 300;
+            const rampDownMs = rampEntry?.rampDownMs ?? 50;
             socket.send(JSON.stringify({ type: 'AFV_RAMP_STATE', rampUpMs, rampDownMs }));
             startMeterRelay(id, connectDoc.stromFlowId, audioBlockId, connectDoc.loudnessMainBlockId);
           }

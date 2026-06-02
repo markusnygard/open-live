@@ -54,7 +54,7 @@ const productionConfigsRoutes: FastifyPluginAsync = async (fastify) => {
       const updated: ProductionConfigDoc = {
         ...doc,
         ...(body.name !== undefined && { name: body.name }),
-        ...(body.values !== undefined && { values: body.values }),
+        ...(body.values !== undefined && { values: { ...(doc.values ?? {}), ...body.values } }),
         updatedAt: new Date().toISOString(),
       };
       const response = await getConfigsDb().insert(updated as never);
