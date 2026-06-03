@@ -219,22 +219,57 @@ export interface PipZone {
 }
 
 /**
- * Layout config for one PiP slot (background + overlay zones).
- * Our own concept — not a Strom API type.
+ * Normalized per-source crop: fraction of the source hidden from each edge.
+ * All components 0.0–1.0; all zero = no crop.
+ * Strom 0.6.2+: PUT /pip/{idx} accepts transforms keyed by input index.
+ */
+export interface SourceCrop {
+  left: number
+  top: number
+  right: number
+  bottom: number
+}
+
+/** Per-source crop map for a PiP slot: input index → SourceCrop. */
+export type PipTransforms = Record<number, SourceCrop>
+
+/** Negotiated resolution of a video input (from VisionMixerState.input_resolutions). */
+export interface InputResolution {
+  width: number
+  height: number
+}
+
+/**
+ * Layout config for one PiP slot (background + overlay zones + per-source crops).
+ * Our own concept — mirrors Strom's PipState.
  */
 export interface PipConfig {
   bg: number | null
   zones: PipZone[]
+  transforms: PipTransforms
 }
 
 /**
  * Body for PUT /api/flows/{id}/blocks/{bid}/pip/{pip_idx}.
- * Confirmed from memory: UpdatePipConfigRequest { bg?, zones[] }.
- * zones[] entries match PipZone (rect, capacity, sources).
+ * Strom 0.6.2+: transforms field added (serde(default) — safe to omit on older Strom).
  */
 export interface UpdatePipConfigRequest {
   bg?: number | null
   zones: PipZone[]
+  transforms?: PipTransforms
+}
+
+export interface UpdatePipConfigResponse {
+  bg: number | null
+  zones: PipZone[]
+  transforms: PipTransforms
+}
+
+/** Runtime PiP state returned by GET state and included in VisionMixerStateResponse. */
+export interface StromPipState {
+  bg: number | null
+  zones: PipZone[]
+  transforms: PipTransforms
 }
 
 export interface SelectPreviewResponse {
@@ -256,6 +291,10 @@ export interface VisionMixerStateResponse {
   ftb_active: boolean
   dsk_enabled: boolean[]
   overlay_alpha: number
+  /** Per-PiP runtime state (Strom 0.6.2+, serde(default) → [] on older Strom). */
+  pips: StromPipState[]
+  /** Negotiated resolution per input (Strom 0.6.2+, serde(default) → [] on older Strom). */
+  input_resolutions: Array<InputResolution | null>
 }
 
 export interface AnimateInputRequest {
@@ -746,7 +785,7 @@ export class StromClient {
       this.put<OverlayAlphaResponse>(`/api/flows/${flowId}/blocks/${blockId}/overlay-alpha`, body),
 
     updatePipConfig: (flowId: string, blockId: string, pipIdx: number, body: UpdatePipConfigRequest) =>
-      this.put<void>(`/api/flows/${flowId}/blocks/${blockId}/pip/${pipIdx}`, body),
+      this.put<UpdatePipConfigResponse>(`/api/flows/${flowId}/blocks/${blockId}/pip/${pipIdx}`, body),
 
     multiviewEndpoint: (flowId: string, blockId: string) =>
       this.get<MultiviewEndpointResponse>(`/api/flows/${flowId}/blocks/${blockId}/multiview-endpoint`),

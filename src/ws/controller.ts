@@ -5,7 +5,7 @@ import { updateProductionDoc } from '../routes/productions.js';
 import type { ProductionDoc } from '../db/types.js';
 import { getTally, setTally, subscribe, unsubscribe, broadcast } from '../services/tally.service.js';
 import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
-import { StromClient, StromClientError, type TransitionType as StromTransitionType, type PipZone, type PipConfig } from '../lib/strom.js';
+import { StromClient, StromClientError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
@@ -43,7 +43,7 @@ type InboundMessage =
   | { type: 'SOURCE_AUDIO_OFFSET_SET'; mixerInput: string; offsetMs: number }
   | { type: 'LOUDNESS_RESET' }
   | { type: 'SELECT_PVW_PIP'; pip: number }
-  | { type: 'SET_PIP'; pip: number; bg: number | null; zones: PipZone[] };
+  | { type: 'SET_PIP'; pip: number; bg: number | null; zones: PipZone[]; transforms?: PipTransforms };
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -609,16 +609,26 @@ async function handleMessage(
       if (!doc.stromFlowId || !doc.mixerBlockId) break;
       try {
         const strom = await makeStromClient();
+        const transforms: PipTransforms = msg.transforms ?? {};
 
         const pips = (pipConfigsByProduction.get(productionId) ?? []).slice();
-        pips[msg.pip] = { bg: msg.bg, zones: msg.zones };
+        pips[msg.pip] = { bg: msg.bg, zones: msg.zones, transforms };
         pipConfigsByProduction.set(productionId, pips);
         broadcast(productionId, { type: 'PIP_STATE', pgmPip: pgmPipByProduction.get(productionId) ?? null, pvwPip: pvwPipByProduction.get(productionId) ?? null, pips });
 
-        await strom.mixer.updatePipConfig(doc.stromFlowId, doc.mixerBlockId, msg.pip, {
+        const resp = await strom.mixer.updatePipConfig(doc.stromFlowId, doc.mixerBlockId, msg.pip, {
           bg: msg.bg,
           zones: msg.zones,
+          transforms,
         });
+        // Sync back Strom-clamped transforms (may differ due to clamping)
+        if (resp?.transforms && Object.keys(resp.transforms).length > 0) {
+          const syncedPips = (pipConfigsByProduction.get(productionId) ?? []).slice();
+          if (syncedPips[msg.pip]) {
+            syncedPips[msg.pip] = { ...syncedPips[msg.pip]!, transforms: resp.transforms };
+            pipConfigsByProduction.set(productionId, syncedPips);
+          }
+        }
       } catch (err) {
         console.warn('[controller] Strom SET_PIP error:', err);
         ws.send(JSON.stringify({ type: 'ERROR', error: stromErrorMessage(err) }));
@@ -1304,7 +1314,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
           : typeof rawNumPips === 'string' ? Math.max(0, parseInt(rawNumPips, 10) || 0)
           : 0;
         if (numPips > 0) {
-          pipConfigsByProduction.set(id, Array.from({ length: numPips }, () => ({ bg: null, zones: [] })));
+          pipConfigsByProduction.set(id, Array.from({ length: numPips }, () => ({ bg: null, zones: [], transforms: {} })));
         }
       }
       socket.send(JSON.stringify({
