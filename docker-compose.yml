@@ -2,8 +2,8 @@ services:
   couchdb:
     image: couchdb:3
     environment:
-      COUCHDB_USER: admin
-      COUCHDB_PASSWORD: password
+      COUCHDB_USER: ${COUCHDB_USER:-admin}
+      COUCHDB_PASSWORD: ${COUCHDB_PASSWORD:?Set COUCHDB_PASSWORD in .env (see .env.example)}
     ports:
       - "5984:5984"
     volumes:
@@ -15,7 +15,7 @@ services:
       - "3000:3000"
     environment:
       PORT: "3000"
-      COUCHDB_URL: http://admin:password@couchdb:5984
+      COUCHDB_URL: http://${COUCHDB_USER:-admin}:${COUCHDB_PASSWORD}@couchdb:5984
       COUCHDB_NAME: open-live
       CORS_ORIGIN: http://localhost:5173
       LOG_LEVEL: info
