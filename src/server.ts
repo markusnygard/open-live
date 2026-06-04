@@ -1,5 +1,6 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import helmet from '@fastify/helmet';
 import websocket from '@fastify/websocket';
 import { ZodError } from 'zod';
 import { config } from './config.js';
@@ -25,6 +26,13 @@ export async function buildServer() {
       level: config.logLevel,
     },
     disableRequestLogging: true,
+  });
+
+  await fastify.register(helmet, {
+    contentSecurityPolicy: {
+      directives: { defaultSrc: ["'none'"], connectSrc: ["'self'"] },
+    },
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
   });
 
   await fastify.register(cors, {
