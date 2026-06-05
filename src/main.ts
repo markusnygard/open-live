@@ -1,5 +1,5 @@
 import { config } from './config.js';
-import { connectDb, getDb } from './db/index.js';
+import { connectDb, getDb, isDbConnected } from './db/index.js';
 import { cleanLegacyFixtures } from './db/seed.js';
 import { buildServer } from './server.js';
 import { StromClient } from './lib/strom.js';
@@ -20,6 +20,10 @@ import type { FastifyBaseLogger } from 'fastify';
 async function reconcileProductionStatuses(
   log: FastifyBaseLogger,
 ): Promise<void> {
+  if (!isDbConnected()) {
+    log.debug('[reconcile] Database not connected — skipping');
+    return;
+  }
   const db = getDb();
 
   let liveFlows: import('./lib/strom.js').Flow[];
@@ -79,15 +83,16 @@ async function reconcileProductionStatuses(
 }
 
 async function main() {
-  await connectDb();
-  await cleanLegacyFixtures();
-
   const app = await buildServer();
-  await reconcileProductionStatuses(app.log);
 
-  // Re-run reconciliation every 30 seconds so a flow that started after the
-  // activation timeout is automatically detected without requiring a restart.
-  setInterval(() => { reconcileProductionStatuses(app.log).catch((err) => app.log.warn({ err }, '[reconcile] unexpected error')); }, 30_000);
+  try {
+    await connectDb();
+    app.log.info('[db] Connected to CouchDB');
+    await cleanLegacyFixtures();
+    await reconcileProductionStatuses(app.log);
+  } catch (err: any) {
+    app.log.error('[db] Failed to connect to CouchDB — continuing without database (status: %s)', err?.statusCode ?? err?.message ?? 'unknown');
+  }
 
   await app.listen({ port: config.port, host: '0.0.0.0' });
 }

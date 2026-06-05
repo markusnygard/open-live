@@ -3,6 +3,7 @@ import cors from '@fastify/cors';
 import websocket from '@fastify/websocket';
 import { ZodError } from 'zod';
 import { config } from './config.js';
+import { isDbConnected } from './db/index.js';
 import healthRoutes from './routes/health.js';
 import statusRoutes from './routes/status.js';
 import productionsRoutes from './routes/productions.js';
@@ -44,6 +45,13 @@ export async function buildServer() {
       done(null, body ? JSON.parse(body as string) : {});
     } catch (e) {
       done(e instanceof Error ? e : new Error(String(e)), undefined);
+    }
+  });
+
+  // Reject DB-dependent routes when database is unavailable
+  fastify.addHook('onRequest', async (req, reply) => {
+    if (!isDbConnected() && req.url.startsWith('/api/v1') && req.url !== '/api/v1/status' && req.url !== '/api/v1/server-info' && req.url !== '/api/v1/reconnect') {
+      reply.status(503).send({ error: 'Database unavailable — please check your CouchDB is running' });
     }
   });
 

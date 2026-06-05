@@ -8,6 +8,10 @@ export function getDb(): Nano.DocumentScope<ProductionDoc> {
   return db;
 }
 
+export function isDbConnected(): boolean {
+  return !!db;
+}
+
 export function getSourcesDb(): Nano.DocumentScope<SourceDoc> {
   return db as unknown as Nano.DocumentScope<SourceDoc>;
 }
