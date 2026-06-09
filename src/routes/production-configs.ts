@@ -24,9 +24,15 @@ const productionConfigsRoutes: FastifyPluginAsync = async (fastify) => {
   // List all configs
   fastify.get('/api/v1/production-configs', async (_req, reply) => {
     const db = getConfigsDb();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const result = await db.find({ selector: { type: 'production-config' } as any });
-    return reply.send((result.docs as unknown as ProductionConfigDoc[]).map(toApi));
+    let result: Awaited<ReturnType<typeof db.find>>;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      result = await db.find({ selector: { type: 'production-config' } as any });
+    } catch (err) {
+      fastify.log.warn({ err }, 'GET /api/v1/production-configs — DB query failed');
+      return reply.status(503).send({ error: 'Database unavailable' });
+    }
+    return reply.send((Array.isArray(result?.docs) ? (result.docs as unknown as ProductionConfigDoc[]) : []).map(toApi));
   });
 
   // Create a config

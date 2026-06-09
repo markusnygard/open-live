@@ -24,8 +24,14 @@ function toApi(doc: OutputDoc) {
 const outputsRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get('/api/v1/outputs', async (_req, reply) => {
     const db = getOutputsDb();
-    const result = await db.find({ selector: { type: 'output' } });
-    return reply.send(result.docs.map(toApi));
+    let result: Awaited<ReturnType<typeof db.find>>;
+    try {
+      result = await db.find({ selector: { type: 'output' } });
+    } catch (err) {
+      fastify.log.warn({ err }, 'GET /api/v1/outputs — DB query failed');
+      return reply.status(503).send({ error: 'Database unavailable' });
+    }
+    return reply.send((Array.isArray(result?.docs) ? result.docs : []).map(toApi));
   });
 
   fastify.post('/api/v1/outputs', async (req, reply) => {

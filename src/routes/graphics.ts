@@ -29,8 +29,14 @@ function toApi(doc: GraphicDoc) {
 const graphicsRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get('/api/v1/graphics', async (_req, reply) => {
     const db = getGraphicsDb();
-    const result = await db.find({ selector: { type: 'graphic' } });
-    return reply.send(result.docs.map(toApi));
+    let result: Awaited<ReturnType<typeof db.find>>;
+    try {
+      result = await db.find({ selector: { type: 'graphic' } });
+    } catch (err) {
+      fastify.log.warn({ err }, 'GET /api/v1/graphics — DB query failed');
+      return reply.status(503).send({ error: 'Database unavailable' });
+    }
+    return reply.send((Array.isArray(result?.docs) ? result.docs : []).map(toApi));
   });
 
   fastify.post('/api/v1/graphics', async (req, reply) => {

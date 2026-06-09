@@ -39,8 +39,9 @@ export async function connectDb(): Promise<void> {
 
 export async function isDbReady(): Promise<boolean> {
   try {
-    const nano = Nano(config.couchdbUrl);
-    await nano.db.list();
+    // Use the actual working db handle so we test the same path as real queries
+    if (!db) return false;
+    await db.info();
     return true;
   } catch {
     return false;

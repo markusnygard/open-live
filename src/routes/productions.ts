@@ -10,6 +10,7 @@ import { setTally, broadcast, getSubscriberCount } from '../services/tally.servi
 import { clearProductionPflState } from '../services/pfl-state.js';
 import { clearPipState, clearAudioState } from '../ws/controller.js';
 import { config } from '../config.js';
+import { getIdleSince } from '../services/idle-watchdog.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -336,8 +337,20 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
   // List all productions
   fastify.get('/api/v1/productions', async (_req, reply) => {
     const db = getDb();
-    const result = await db.find({ selector: { type: 'production' } });
-    return reply.send(result.docs);
+    let result: Awaited<ReturnType<typeof db.find>>;
+    try {
+      result = await db.find({ selector: { type: 'production' } });
+    } catch (err) {
+      fastify.log.warn({ err }, 'GET /api/v1/productions — DB query failed');
+      return reply.status(503).send({ error: 'Database unavailable' });
+    }
+    const docs = (Array.isArray(result?.docs) ? (result.docs as ProductionDoc[]) : []).map((doc) => {
+      if (doc.status !== 'active') return doc;
+      const subscriberCount = getSubscriberCount(doc._id);
+      const idleSinceAt = getIdleSince(doc._id);
+      return { ...doc, subscriberCount, ...(idleSinceAt !== undefined ? { idleSinceAt } : {}) };
+    });
+    return reply.send(docs);
   });
 
   // Create a production

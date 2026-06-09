@@ -32,8 +32,14 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
   // List all sources
   fastify.get('/api/v1/sources', async (_req, reply) => {
     const db = getSourcesDb();
-    const result = await db.find({ selector: { type: 'source' } });
-    return reply.send(result.docs.map(toApi));
+    let result: Awaited<ReturnType<typeof db.find>>;
+    try {
+      result = await db.find({ selector: { type: 'source' } });
+    } catch (err) {
+      fastify.log.warn({ err }, 'GET /api/v1/sources — DB query failed');
+      return reply.status(503).send({ error: 'Database unavailable' });
+    }
+    return reply.send((Array.isArray(result?.docs) ? result.docs : []).map(toApi));
   });
 
   // Create a source

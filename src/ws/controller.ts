@@ -8,6 +8,7 @@ import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
 import { StromClient, StromClientError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
+import { notifySubscriberJoin } from '../services/idle-watchdog.js';
 import { activePflByProduction, activeAflByProduction, anySoloActive, numAudioChannelsByProduction } from '../services/pfl-state.js';
 
 function stromErrorMessage(err: unknown): string {
@@ -1251,6 +1252,7 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
     async (socket, req) => {
       const { id } = req.params;
       subscribe(id, socket);
+      notifySubscriberJoin(id);
 
       // Per-connection context — mutable so the audio block ID can be populated
       // at connect time and reused on every subsequent AUDIO_SET without a flow fetch.
