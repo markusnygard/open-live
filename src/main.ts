@@ -4,6 +4,7 @@ import { cleanLegacyFixtures } from './db/seed.js';
 import { buildServer } from './server.js';
 import { StromClient } from './lib/strom.js';
 import { getStromToken } from './lib/strom-token.js';
+import { startIdleWatchdog } from './services/idle-watchdog.js';
 import type { ProductionDoc } from './db/types.js';
 import type { FastifyBaseLogger } from 'fastify';
 
@@ -93,6 +94,8 @@ async function main() {
   } catch (err: any) {
     app.log.error('[db] Failed to connect to CouchDB — continuing without database (status: %s)', err?.statusCode ?? err?.message ?? 'unknown');
   }
+
+  startIdleWatchdog(app.log);
 
   await app.listen({ port: config.port, host: '0.0.0.0' });
 }
