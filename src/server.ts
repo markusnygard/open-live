@@ -29,18 +29,10 @@ export async function buildServer() {
   });
 
   await fastify.register(cors, {
-    origin: (origin, cb) => {
-      // Allow requests with no origin (server-to-server, curl) and any osaas.io subdomain.
-      // Wildcard origin is incompatible with credentials:true, so we reflect the origin back.
-      if (!origin || origin.endsWith('.osaas.io') || origin === 'http://localhost:5173') {
-        cb(null, true);
-      } else {
-        cb(new Error('Not allowed by CORS'), false);
-      }
-    },
+    origin: '*',
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true,
+    credentials: false,
     maxAge: 86400,
     strictPreflight: false,
   });

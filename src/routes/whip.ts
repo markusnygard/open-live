@@ -25,16 +25,6 @@ export function resolveStromWhipUrl(productionId: string, mixerInput: string): s
   return `${config.stromUrl}/whip/whip-${padIndex}-${endpointSuffix}`
 }
 
-function validateStromSessionUrl(sessionUrl: string): boolean {
-  try {
-    const session = new URL(sessionUrl)
-    const strom = new URL(config.stromUrl)
-    return session.origin === strom.origin
-  } catch {
-    return false
-  }
-}
-
 const whipRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.addContentTypeParser('application/sdp', { parseAs: 'string' }, (_req, body, done) => {
     done(null, body)
@@ -90,15 +80,9 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
   }>(
     '/api/v1/productions/:id/whip/:mixerInput',
     async (req, reply) => {
-      let target: string
-      if (req.query.session) {
-        target = decodeURIComponent(req.query.session)
-        if (!validateStromSessionUrl(target)) {
-          return reply.status(400).send({ error: 'Invalid session URL' })
-        }
-      } else {
-        target = resolveStromWhipUrl(req.params.id, req.params.mixerInput)
-      }
+      const target = req.query.session
+        ? decodeURIComponent(req.query.session)
+        : resolveStromWhipUrl(req.params.id, req.params.mixerInput)
 
       const token = await getStromToken(config.stromToken).catch(() => undefined)
       const headers: Record<string, string> = {
@@ -118,15 +102,9 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
   }>(
     '/api/v1/productions/:id/whip/:mixerInput',
     async (req, reply) => {
-      let target: string
-      if (req.query.session) {
-        target = decodeURIComponent(req.query.session)
-        if (!validateStromSessionUrl(target)) {
-          return reply.status(400).send({ error: 'Invalid session URL' })
-        }
-      } else {
-        target = resolveStromWhipUrl(req.params.id, req.params.mixerInput)
-      }
+      const target = req.query.session
+        ? decodeURIComponent(req.query.session)
+        : resolveStromWhipUrl(req.params.id, req.params.mixerInput)
 
       const token = await getStromToken(config.stromToken).catch(() => undefined)
       const headers: Record<string, string> = {}

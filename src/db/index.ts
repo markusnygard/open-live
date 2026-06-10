@@ -28,15 +28,13 @@ export function getOutputsDb(): Nano.DocumentScope<OutputDoc> {
   return db as unknown as Nano.DocumentScope<OutputDoc>;
 }
 
-const DB_NAME = 'open-live';
-
 export async function connectDb(): Promise<void> {
   const nano = Nano(config.couchdbUrl);
   const dbList = await nano.db.list();
-  if (!dbList.includes(DB_NAME)) {
-    await nano.db.create(DB_NAME);
+  if (!dbList.includes(config.couchdbName)) {
+    await nano.db.create(config.couchdbName);
   }
-  db = nano.use<ProductionDoc>(DB_NAME);
+  db = nano.use<ProductionDoc>(config.couchdbName);
 }
 
 export async function isDbReady(): Promise<boolean> {
