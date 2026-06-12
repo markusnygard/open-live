@@ -6,7 +6,7 @@ import { updateProductionDoc } from '../routes/productions.js';
 import type { ProductionDoc } from '../db/types.js';
 import { getTally, setTally, subscribe, unsubscribe, broadcast } from '../services/tally.service.js';
 import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
-import { StromClient, StromClientError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms } from '../lib/strom.js';
+import { StromClient, StromClientError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
 import { notifySubscriberJoin } from '../services/idle-watchdog.js';
@@ -45,7 +45,8 @@ type InboundMessage =
   | { type: 'SOURCE_AUDIO_OFFSET_SET'; mixerInput: string; offsetMs: number }
   | { type: 'LOUDNESS_RESET' }
   | { type: 'SELECT_PVW_PIP'; pip: number }
-  | { type: 'SET_PIP'; pip: number; bg: number | null; zones: PipZone[]; transforms?: PipTransforms };
+  | { type: 'SET_PIP'; pip: number; bg: number | null; zones: PipZone[]; transforms?: PipTransforms }
+  | { type: 'SET_EFFECT'; target: EffectTarget; effect: VideoEffect };
 
 // ---------------------------------------------------------------------------
 // Runtime schema validation for inbound WS messages
@@ -108,6 +109,11 @@ const InboundMessageSchema = z.discriminatedUnion('type', [
     zones: z.array(PipZoneSchema).max(15),
     transforms: z.record(z.string(), z.object({ left: z.number().min(0).max(1), top: z.number().min(0).max(1), right: z.number().min(0).max(1), bottom: z.number().min(0).max(1) })).optional(),
   }),
+  z.object({
+    type: z.literal('SET_EFFECT'),
+    target: z.union([z.object({ input: z.number().int().min(0).max(15) }), z.literal('master')]),
+    effect: z.object({ type: z.string().min(1).max(64) }).passthrough(),
+  }),
 ]);
 
 // ---------------------------------------------------------------------------
@@ -123,12 +129,8 @@ function padToIndex(mixerInput: string): number | null {
   return match ? parseInt(match[1], 10) : null;
 }
 
-const VALID_STROM_TRANSITIONS = new Set<StromTransitionType>(['cut', 'fade', 'slide_left', 'slide_right', 'slide_up', 'slide_down']);
-
-
 function toStromTransition(type: string): StromTransitionType {
-  if (VALID_STROM_TRANSITIONS.has(type as StromTransitionType)) return type as StromTransitionType;
-  return 'cut';
+  return type || 'cut';
 }
 
 async function makeStromClient(): Promise<StromClient> {
@@ -166,7 +168,7 @@ async function stromTransition(
     // transition so the actual cut always reaches Strom.
     await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { input: toIndex } });
   } catch (err) {
-    console.warn('[controller] Strom selectPreview (non-fatal, transition will still fire):', err);
+    console.debug('[controller] Strom selectPreview (non-fatal, transition will still fire):', err);
   }
   try {
     await strom.mixer.transition(doc.stromFlowId, doc.mixerBlockId, {
@@ -282,6 +284,13 @@ const pgmPipByProduction    = new Map<string, number | null>()
 const pvwPipByProduction    = new Map<string, number | null>()
 const pipConfigsByProduction = new Map<string, PipConfig[]>()
 
+/** productionId → per-input effects (index = mixerInput index) */
+const inputEffectsByProduction = new Map<string, VideoEffect[]>();
+/** productionId → master output effect */
+const masterEffectByProduction = new Map<string, VideoEffect>();
+/** productionId → whether FX engine is available (GPU backend) */
+const fxAvailableByProduction = new Map<string, boolean>();
+
 const overlayAlphaByProduction = new Map<string, number>()
 const dskLayersByProduction    = new Map<string, Record<number, boolean>>()
 
@@ -343,6 +352,13 @@ export function clearPipState(productionId: string): void {
     pvwPip: null,
     pips: [],
   })
+}
+
+/** Wipe all per-production FX state. Called when the pipeline changes or production deactivates. */
+export function clearFxState(productionId: string): void {
+  inputEffectsByProduction.delete(productionId)
+  masterEffectByProduction.delete(productionId)
+  fxAvailableByProduction.delete(productionId)
 }
 
 /**
@@ -456,12 +472,12 @@ async function handleMessage(
     ws.send(JSON.stringify({ type: 'ERROR', error: parseResult.error.issues[0]?.message ?? 'Invalid message' }));
     return;
   }
-  const msg: InboundMessage = parseResult.data;
+  const msg: InboundMessage = parseResult.data as unknown as InboundMessage;
 
   // Enforce project rule: never send mute=true via AUDIO_SET — use fader=0 instead.
   // (GStreamer GAP flag from mute=true kills meters; VolumeRampManager.apply_mute(false) overrides fader=0)
   if (msg.type === 'AUDIO_SET' && msg.property === 'mute') {
-    ws.send(JSON.stringify({ type: 'ERROR', error: 'Use fader=0 instead of the mute property' }));
+    console.warn('[controller] AUDIO_SET mute ignored — use fader=0:', msg.elementId);
     return;
   }
 
@@ -1316,6 +1332,33 @@ async function handleMessage(
       }
       break;
     }
+    case 'SET_EFFECT': {
+      if (!doc.stromFlowId || !doc.mixerBlockId) break;
+      const target = msg.target;
+      const effect = msg.effect as VideoEffect;
+      try {
+        const strom = await makeStromClient();
+        await strom.mixer.setVideoEffect(doc.stromFlowId, doc.mixerBlockId, { target, effect });
+        // Update in-memory state
+        if (target === 'master') {
+          masterEffectByProduction.set(productionId, effect);
+        } else if (typeof target === 'object' && 'input' in target) {
+          const effects = inputEffectsByProduction.get(productionId) ?? [];
+          effects[target.input] = effect;
+          inputEffectsByProduction.set(productionId, effects);
+        }
+        broadcast(productionId, {
+          type: 'FX_STATE',
+          fxAvailable: fxAvailableByProduction.get(productionId) ?? false,
+          inputEffects: inputEffectsByProduction.get(productionId) ?? [],
+          masterEffect: masterEffectByProduction.get(productionId) ?? { type: 'none' },
+        });
+      } catch (err) {
+        const message = err instanceof StromClientError ? err.message : String(err);
+        ws.send(JSON.stringify({ type: 'ERROR', error: `FX: ${message}` }));
+      }
+      break;
+    }
     default: {
       ws.send(JSON.stringify({ type: 'ERROR', error: 'Unknown message type' }));
     }
@@ -1432,12 +1475,20 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             if (isFirstConnect) {
               afvChannelsByProduction.set(id, new Set());
               mutedElementsByProduction.set(id, new Set());
-              // All channels: signal always active, all open to main at start.
+              // All channels: open at unity gain, routed to main, unmuted.
+              // Explicitly set faders so the UI always shows a consistent 1.0 on fresh start
+              // regardless of what Strom's internal default happens to be.
               const initProps: Record<string, unknown> = {};
+              const levelCache = channelLevelsByProduction.get(id) ?? new Map<string, number>();
               for (let i = 1; i <= numChannels; i++) {
+                initProps[`ch${i}_fader`]   = 1.0;
                 initProps[`ch${i}_mute`]    = false;
                 initProps[`ch${i}_to_main`] = true;
+                levelCache.set(`ch${i}`, 1.0);
               }
+              initProps['main_fader'] = 1.0;
+              levelCache.set('main', 1.0);
+              channelLevelsByProduction.set(id, levelCache);
               await strom.flows.updateBlockProperties(connectDoc.stromFlowId!, audioBlockId, { properties: initProps })
                 .catch((err) => console.warn('[controller] init channel props error:', err));
             }
@@ -1572,6 +1623,29 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
             const rampUpMs   = rampEntry?.rampUpMs   ?? 300;
             const rampDownMs = rampEntry?.rampDownMs ?? 50;
             socket.send(JSON.stringify({ type: 'AFV_RAMP_STATE', rampUpMs, rampDownMs }));
+            // Fetch live FX state from Strom on connect so fxAvailable is authoritative
+            try {
+              const stromFx = await makeStromClient();
+              const mixerState = await stromFx.mixer.getState(connectDoc.stromFlowId!, connectDoc.mixerBlockId!);
+              if (mixerState.fx_available !== undefined) {
+                fxAvailableByProduction.set(id, mixerState.fx_available);
+              }
+              if (Array.isArray(mixerState.input_effects)) {
+                inputEffectsByProduction.set(id, mixerState.input_effects);
+              }
+              if (mixerState.master_effect) {
+                masterEffectByProduction.set(id, mixerState.master_effect);
+              }
+            } catch {
+              // Non-fatal — older Strom versions may not support this endpoint
+            }
+            const fxAvailable = fxAvailableByProduction.get(id) ?? false;
+            socket.send(JSON.stringify({
+              type: 'FX_STATE',
+              fxAvailable,
+              inputEffects: inputEffectsByProduction.get(id) ?? [],
+              masterEffect: masterEffectByProduction.get(id) ?? { type: 'none' },
+            }));
             startMeterRelay(id, connectDoc.stromFlowId, audioBlockId, connectDoc.loudnessMainBlockId);
           }
         } catch (err) {

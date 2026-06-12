@@ -180,7 +180,7 @@ export interface UpdateFlowPropertiesRequest {
 
 // --- Flow operations ---
 
-export type TransitionType = 'cut' | 'fade' | 'slide_left' | 'slide_right' | 'slide_up' | 'slide_down'
+export type TransitionType = string
 
 export interface TriggerTransitionRequest {
   from_input: number
@@ -216,6 +216,7 @@ export interface PipZone {
   rect: { x: number; y: number; w: number; h: number } | null
   capacity: number | null
   sources: number[]
+  border?: { color: string; width: number } | null   // PR #625: ZoneBorder
 }
 
 /**
@@ -279,6 +280,44 @@ export interface SelectPreviewResponse {
   program_inputs: number[]
 }
 
+// ---------------------------------------------------------------------------
+// Video Effects (PR #626 + #639)
+// ---------------------------------------------------------------------------
+
+// #[serde(tag = "type", rename_all = "snake_case")]
+export type VideoEffect =
+  | { type: 'none' }
+  | { type: 'chroma_key'; key_color?: string; similarity?: number; smoothness?: number; spill?: number }
+  | { type: 'pixelate'; block_size?: number }
+  | { type: 'blur'; radius?: number }
+  | { type: 'duotone'; low?: string; high?: string; mix?: number }
+  | { type: 'vignette'; amount?: number; softness?: number }
+  | { type: 'vhs'; intensity?: number }
+  | { type: 'old_film'; intensity?: number }
+  | { type: 'edge_glow'; color?: string; intensity?: number }
+  | { type: 'crt'; intensity?: number }
+  | { type: 'halftone'; dot_size?: number }
+  | { type: 'thermal'; intensity?: number }
+  | { type: 'night_vision'; intensity?: number }
+  | { type: 'posterize'; levels?: number }
+  | { type: 'underwater'; intensity?: number }
+  | { type: 'color_correct'; brightness?: number; contrast?: number; saturation?: number; hue?: number; gamma?: number; temperature?: number; tint?: number }
+
+// EffectTarget — exact serde from tests:
+// EffectTarget::Input(2) → {"input": 2}
+// EffectTarget::Master  → "master"
+export type EffectTarget = { input: number } | 'master'
+
+export interface SetVideoEffectRequest {
+  target: EffectTarget
+  effect: VideoEffect
+}
+
+export interface SetVideoEffectResponse {
+  message: string
+  effect: VideoEffect
+}
+
 export interface VisionMixerStateResponse {
   /** First input in PGM group (0-based, backward compat) */
   program_input: number
@@ -295,6 +334,12 @@ export interface VisionMixerStateResponse {
   pips: StromPipState[]
   /** Negotiated resolution per input (Strom 0.6.2+, serde(default) → [] on older Strom). */
   input_resolutions: Array<InputResolution | null>
+  /** Whether the FX engine is available (false on CPU backend or enable_fx=false). PR #626. */
+  fx_available?: boolean
+  /** Per-input video effect (length = num_inputs, serde(default) → [] on older Strom). PR #626. */
+  input_effects?: VideoEffect[]
+  /** Master output video effect (serde(default) → none on older Strom). PR #626. */
+  master_effect?: VideoEffect
 }
 
 export interface AnimateInputRequest {
@@ -789,6 +834,15 @@ export class StromClient {
 
     multiviewEndpoint: (flowId: string, blockId: string) =>
       this.get<MultiviewEndpointResponse>(`/api/flows/${flowId}/blocks/${blockId}/multiview-endpoint`),
+
+    getState: (flowId: string, blockId: string) =>
+      this.get<VisionMixerStateResponse>(`/api/flows/${flowId}/blocks/${blockId}/state`),
+
+    setVideoEffect: (flowId: string, blockId: string, body: SetVideoEffectRequest) =>
+      this.post<SetVideoEffectResponse>(`/api/flows/${flowId}/blocks/${blockId}/effect`, body),
+
+    getPipState: (flowId: string, blockId: string, pipIdx: number) =>
+      this.get<StromPipState>(`/api/flows/${flowId}/blocks/${blockId}/pip/${pipIdx}`),
   }
 
   // -------------------------------------------------------------------------
