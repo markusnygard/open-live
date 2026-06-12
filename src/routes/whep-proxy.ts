@@ -2,6 +2,22 @@ import type { FastifyPluginAsync } from 'fastify';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
 
+/** Validates a proxy target URL is on the configured Strom host (prevents SSRF + token exfiltration). */
+function validateProxyTarget(targetUrl: string): void {
+  let parsed: URL;
+  try { parsed = new URL(targetUrl); } catch { throw new Error('Invalid target URL'); }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('Target URL must use http or https');
+  }
+  const strom = new URL(config.stromUrl);
+  if (parsed.hostname !== strom.hostname) {
+    throw new Error('Target URL host does not match configured Strom host');
+  }
+  if (strom.port && parsed.port && parsed.port !== strom.port) {
+    throw new Error('Target URL port does not match configured Strom port');
+  }
+}
+
 /**
  * WHEP signaling proxy — forwards SDP offer/answer and teardown to Strom.
  *
@@ -32,9 +48,9 @@ const whepProxyRoutes: FastifyPluginAsync = async (fastify) => {
     let targetUrl: string
     try {
       targetUrl = decodeURIComponent(target)
-      new URL(targetUrl) // validate
-    } catch {
-      return reply.status(400).send({ error: 'Invalid target URL' })
+      validateProxyTarget(targetUrl)
+    } catch (err) {
+      return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid target URL' })
     }
 
     const token = await getStromToken(config.stromToken).catch(() => undefined)
@@ -82,9 +98,9 @@ const whepProxyRoutes: FastifyPluginAsync = async (fastify) => {
     let targetUrl: string
     try {
       targetUrl = decodeURIComponent(target)
-      new URL(targetUrl)
-    } catch {
-      return reply.status(400).send({ error: 'Invalid target URL' })
+      validateProxyTarget(targetUrl)
+    } catch (err) {
+      return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid target URL' })
     }
 
     const token = await getStromToken(config.stromToken).catch(() => undefined)

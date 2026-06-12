@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { getSourcesDb, getDb } from '../db/index.js';
 import type { SourceDoc, ProductionDoc } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
+import { httpUrlOnly, srtUrl } from '../lib/url-validation.js';
 
 const SourceInput = z.object({
   name: z.string().min(1),
@@ -12,6 +13,22 @@ const SourceInput = z.object({
   status: z.enum(['active', 'inactive']).default('inactive'),
   liveCamera: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
+}).superRefine((data, ctx) => {
+  if (data.streamType === 'html') {
+    // html sources use a browser URL — validate for SSRF (file://, javascript:, private IPs, etc.)
+    try {
+      httpUrlOnly(data.address);
+    } catch (err) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['address'], message: err instanceof Error ? err.message : 'Invalid HTML source URL' });
+    }
+  } else if (data.streamType === 'srt' || data.streamType === 'efp') {
+    // SRT/EFP sources: must be a valid srt:// URI pointing to a non-private host
+    try {
+      srtUrl(data.address);
+    } catch (err) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['address'], message: err instanceof Error ? err.message : 'Invalid SRT source address' });
+    }
+  }
 });
 
 const SourcePatch = z.object({
@@ -23,9 +40,14 @@ const SourcePatch = z.object({
   latency: z.number().int().min(20).max(8000).optional(),
 });
 
+/** Masks passphrase values in SRT URIs so credentials are never returned to clients. */
+function maskSrtPassphrase(address: string): string {
+  return address.replace(/([?&]passphrase=)[^&]*/gi, '$1***');
+}
+
 function toApi(doc: SourceDoc) {
   const { _id, _rev, type, ...rest } = doc;
-  return { id: _id, ...rest };
+  return { id: _id, ...rest, address: maskSrtPassphrase(rest.address) };
 }
 
 const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
@@ -77,11 +99,28 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
     const body = SourcePatch.parse(req.body);
     try {
       const doc = await getSourcesDb().get(req.params.id);
+      // Determine effective streamType and address after the patch
+      const effectiveStreamType = body.streamType ?? doc.streamType;
+      const effectiveAddress = body.address ?? doc.address;
+      if (effectiveAddress) {
+        try {
+          if (effectiveStreamType === 'html') {
+            httpUrlOnly(effectiveAddress);
+          } else if (effectiveStreamType === 'srt' || effectiveStreamType === 'efp') {
+            srtUrl(effectiveAddress);
+          }
+        } catch (err) {
+          return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid source address' });
+        }
+      }
       const updated: SourceDoc = { ...doc, ...body, updatedAt: new Date().toISOString() };
       await getSourcesDb().insert(updated);
       return reply.send(toApi(updated));
-    } catch {
-      return reply.status(404).send({ error: 'Source not found', statusCode: 404 });
+    } catch (err: unknown) {
+      if (err && typeof err === 'object' && 'statusCode' in err && (err as { statusCode: number }).statusCode === 404) {
+        return reply.status(404).send({ error: 'Source not found', statusCode: 404 });
+      }
+      throw err;
     }
   });
 

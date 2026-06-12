@@ -798,9 +798,14 @@ export async function activateStromFlow(
   try {
     await strom.flows.start(flowId);
   } catch (err) {
-    // Log the full flow JSON so we can see what topology failed at GStreamer READY
-    console.error('[flow-generator] Flow start failed. Generated flow JSON:',
-      JSON.stringify({ blocks: flow.blocks, links: flow.links, elements: flow.elements }, null, 2));
+    // Log a sanitized flow projection — never log block properties (may contain SRT URIs, tokens, passphrases)
+    const safeFlow = {
+      blockCount: flow.blocks.length,
+      blocks: flow.blocks.map((b) => ({ id: b['id'], block_definition_id: b['block_definition_id'] })),
+      linkCount: flow.links.length,
+    };
+    console.error('[flow-generator] Flow start failed. Flow topology (properties redacted):',
+      JSON.stringify(safeFlow, null, 2));
     // Start failed — clean up the created flow so the endpoint isn't left registered
     try {
       await strom.flows.delete(flowId);

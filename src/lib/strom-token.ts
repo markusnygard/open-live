@@ -18,6 +18,11 @@ interface SatCache {
 
 let cache: SatCache | null = null
 
+// Clear cached token on shutdown so it doesn't linger in memory after process exit
+// (heap dumps taken during graceful shutdown would otherwise expose the plaintext SAT)
+process.once('SIGTERM', () => { cache = null })
+process.once('SIGINT', () => { cache = null })
+
 function isExpiringSoon(cache: SatCache): boolean {
   return Date.now() >= cache.expiresAt - REFRESH_BUFFER_MS
 }

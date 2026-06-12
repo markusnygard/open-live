@@ -1,0 +1,1743 @@
+openapi: 3.1.0
+info:
+  title: Open Live API
+  version: 1.0.0
+  description: |
+    REST API for the Open Live broadcast production platform.
+
+    **Authentication**: Pass an API key via `Authorization: Bearer <key>` header or `?key=<key>` query parameter.
+    The following paths are exempt from authentication: `/health`, `/ready`, `/api/v1/status`, `/api/v1/server-info`, `/api/v1/reconnect`.
+
+servers:
+  - url: /
+
+security:
+  - bearerAuth: []
+  - apiKeyQuery: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    apiKeyQuery:
+      type: apiKey
+      in: query
+      name: key
+
+  schemas:
+    # ── Primitives ──────────────────────────────────────────────────────────────
+
+    StreamType:
+      type: string
+      enum: [srt, efp, whip, html]
+
+    SourceStatus:
+      type: string
+      enum: [active, inactive]
+
+    OutputType:
+      type: string
+      enum: [mpegtssrt, efpsrt, whep]
+
+    ProductionStatus:
+      type: string
+      enum: [active, inactive, activating]
+
+    MacroActionType:
+      type: string
+      enum: [CUT, TRANSITION, TAKE, GRAPHIC_ON, GRAPHIC_OFF, DSK_TOGGLE]
+
+    ConfigValues:
+      type: object
+      additionalProperties:
+        oneOf:
+          - type: string
+          - type: number
+          - type: boolean
+
+    # ── Source ──────────────────────────────────────────────────────────────────
+
+    Source:
+      type: object
+      required: [id, name, address, streamType, status, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        address:
+          type: string
+        streamType:
+          $ref: '#/components/schemas/StreamType'
+        status:
+          $ref: '#/components/schemas/SourceStatus'
+        liveCamera:
+          type: boolean
+        latency:
+          type: integer
+          minimum: 20
+          maximum: 8000
+          description: SRT latency in milliseconds
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    SourceInput:
+      type: object
+      required: [name, address, streamType]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        address:
+          type: string
+        streamType:
+          $ref: '#/components/schemas/StreamType'
+        status:
+          $ref: '#/components/schemas/SourceStatus'
+          default: inactive
+        liveCamera:
+          type: boolean
+        latency:
+          type: integer
+          minimum: 20
+          maximum: 8000
+
+    SourcePatch:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+        address:
+          type: string
+        streamType:
+          $ref: '#/components/schemas/StreamType'
+        status:
+          $ref: '#/components/schemas/SourceStatus'
+        liveCamera:
+          type: boolean
+        latency:
+          type: integer
+          minimum: 20
+          maximum: 8000
+
+    # ── Graphic ─────────────────────────────────────────────────────────────────
+
+    Graphic:
+      type: object
+      required: [id, name, url, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        url:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    GraphicInput:
+      type: object
+      required: [name, url]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        url:
+          type: string
+
+    GraphicPatch:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+        url:
+          type: string
+
+    # ── Output ──────────────────────────────────────────────────────────────────
+
+    Output:
+      type: object
+      required: [id, name, outputType, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        outputType:
+          $ref: '#/components/schemas/OutputType'
+        url:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    OutputInput:
+      type: object
+      required: [name, outputType]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        outputType:
+          $ref: '#/components/schemas/OutputType'
+        url:
+          type: string
+
+    OutputPatch:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+        url:
+          type: string
+
+    # ── Production Config ────────────────────────────────────────────────────────
+
+    ProductionConfig:
+      type: object
+      required: [id, name, values, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        values:
+          $ref: '#/components/schemas/ConfigValues'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    ProductionConfigInput:
+      type: object
+      required: [name, values]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        values:
+          $ref: '#/components/schemas/ConfigValues'
+
+    ProductionConfigPatch:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+        values:
+          $ref: '#/components/schemas/ConfigValues'
+
+    # ── Macro ────────────────────────────────────────────────────────────────────
+
+    MacroAction:
+      type: object
+      required: [type]
+      properties:
+        type:
+          $ref: '#/components/schemas/MacroActionType'
+        sourceId:
+          type: string
+        transitionType:
+          type: string
+        durationMs:
+          type: integer
+          minimum: 1
+        overlayId:
+          type: string
+        layer:
+          type: integer
+          minimum: 0
+        visible:
+          type: boolean
+
+    Macro:
+      type: object
+      required: [id, slot, label, color, actions]
+      properties:
+        id:
+          type: string
+        slot:
+          type: integer
+          minimum: 0
+          maximum: 7
+        label:
+          type: string
+        color:
+          type: string
+          pattern: '^#[0-9a-fA-F]{6}$'
+        actions:
+          type: array
+          items:
+            $ref: '#/components/schemas/MacroAction'
+
+    MacroInput:
+      type: object
+      required: [slot, label, color]
+      properties:
+        slot:
+          type: integer
+          minimum: 0
+          maximum: 7
+        label:
+          type: string
+          minLength: 1
+          maxLength: 50
+        color:
+          type: string
+          pattern: '^#[0-9a-fA-F]{6}$'
+        actions:
+          type: array
+          items:
+            $ref: '#/components/schemas/MacroAction'
+          default: []
+
+    MacroPatch:
+      type: object
+      properties:
+        slot:
+          type: integer
+          minimum: 0
+          maximum: 7
+        label:
+          type: string
+          minLength: 1
+          maxLength: 50
+        color:
+          type: string
+          pattern: '^#[0-9a-fA-F]{6}$'
+        actions:
+          type: array
+          items:
+            $ref: '#/components/schemas/MacroAction'
+
+    # ── Production ───────────────────────────────────────────────────────────────
+
+    ProductionSourceAssignment:
+      type: object
+      required: [sourceId, mixerInput]
+      properties:
+        sourceId:
+          type: string
+        mixerInput:
+          type: string
+          pattern: '^video_in_\d{1,2}$'
+
+    ProductionGraphicAssignment:
+      type: object
+      required: [graphicId, dskInput]
+      properties:
+        graphicId:
+          type: string
+        dskInput:
+          type: string
+
+    ProductionOutputAssignment:
+      type: object
+      required: [outputId]
+      properties:
+        outputId:
+          type: string
+
+    Pipeline:
+      type: object
+      required: [status]
+      properties:
+        stromConfig:
+          type: object
+          nullable: true
+          additionalProperties: true
+        status:
+          type: string
+          enum: [stopped, running]
+
+    Tally:
+      type: object
+      properties:
+        pgm:
+          type: string
+          nullable: true
+        pvw:
+          type: string
+          nullable: true
+
+    Production:
+      type: object
+      required: [id, name, status, sources, pipeline, macros, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        status:
+          $ref: '#/components/schemas/ProductionStatus'
+        sources:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProductionSourceAssignment'
+        outputAssignments:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProductionOutputAssignment'
+        graphicAssignments:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProductionGraphicAssignment'
+        stromFlowId:
+          type: string
+        whepEndpoint:
+          type: string
+          description: Multiview WHEP endpoint URL
+        pgmWhepEndpoint:
+          type: string
+          description: Programme output WHEP endpoint URL
+        whipEndpoints:
+          type: array
+          items:
+            type: object
+            properties:
+              mixerInput:
+                type: string
+              url:
+                type: string
+        srtOutputUri:
+          type: string
+        values:
+          $ref: '#/components/schemas/ConfigValues'
+        airTime:
+          type: string
+          format: date-time
+          nullable: true
+        pipeline:
+          $ref: '#/components/schemas/Pipeline'
+        macros:
+          type: array
+          items:
+            $ref: '#/components/schemas/Macro'
+        tally:
+          $ref: '#/components/schemas/Tally'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    ProductionInput:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+
+    ProductionPatch:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+        values:
+          $ref: '#/components/schemas/ConfigValues'
+        airTime:
+          type: string
+          format: date-time
+          nullable: true
+
+    # ── Misc ─────────────────────────────────────────────────────────────────────
+
+    IceServer:
+      type: object
+      required: [urls]
+      properties:
+        urls:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+        username:
+          type: string
+        credential:
+          type: string
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+        statusCode:
+          type: integer
+
+paths:
+  # ── Health ──────────────────────────────────────────────────────────────────
+
+  /health:
+    get:
+      summary: Liveness probe
+      operationId: getHealth
+      security: []
+      tags: [Health]
+      responses:
+        '200':
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /ready:
+    get:
+      summary: Readiness probe
+      operationId: getReady
+      security: []
+      tags: [Health]
+      responses:
+        '200':
+          description: Service is ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ready
+        '503':
+          description: Service not ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ── Status ──────────────────────────────────────────────────────────────────
+
+  /api/v1/ping:
+    get:
+      summary: Ping
+      operationId: ping
+      security: []
+      tags: [Status]
+      responses:
+        '200':
+          description: Pong
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+
+  /api/v1/status:
+    get:
+      summary: Dependency health status
+      operationId: getStatus
+      security: []
+      tags: [Status]
+      responses:
+        '200':
+          description: Current connectivity status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  db:
+                    type: boolean
+                  strom:
+                    type: boolean
+
+  /api/v1/server-info:
+    get:
+      summary: Server information
+      operationId: getServerInfo
+      security: []
+      tags: [Status]
+      responses:
+        '200':
+          description: Server info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stromHost:
+                    type: string
+                    description: Hostname of the Strom media server
+
+  /api/v1/reconnect:
+    post:
+      summary: Reconnect to database and Strom
+      operationId: reconnect
+      security: []
+      tags: [Status]
+      responses:
+        '200':
+          description: Reconnect result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  db:
+                    type: boolean
+                  strom:
+                    type: boolean
+
+  # ── Sources ─────────────────────────────────────────────────────────────────
+
+  /api/v1/sources:
+    get:
+      summary: List sources
+      operationId: listSources
+      tags: [Sources]
+      responses:
+        '200':
+          description: Array of sources
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Source'
+    post:
+      summary: Create source
+      operationId: createSource
+      tags: [Sources]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SourceInput'
+      responses:
+        '201':
+          description: Created source
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Source'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/sources/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Get source
+      operationId: getSource
+      tags: [Sources]
+      responses:
+        '200':
+          description: Source
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Source'
+        '404':
+          description: Not found
+    patch:
+      summary: Update source
+      operationId: updateSource
+      tags: [Sources]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SourcePatch'
+      responses:
+        '200':
+          description: Updated source
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Source'
+        '404':
+          description: Not found
+    delete:
+      summary: Delete source
+      operationId: deleteSource
+      tags: [Sources]
+      responses:
+        '204':
+          description: Deleted
+        '404':
+          description: Not found
+
+  # ── Graphics ─────────────────────────────────────────────────────────────────
+
+  /api/v1/graphics:
+    get:
+      summary: List graphics
+      operationId: listGraphics
+      tags: [Graphics]
+      responses:
+        '200':
+          description: Array of graphics
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Graphic'
+    post:
+      summary: Create graphic
+      operationId: createGraphic
+      tags: [Graphics]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GraphicInput'
+      responses:
+        '201':
+          description: Created graphic
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Graphic'
+        '400':
+          description: Validation error
+
+  /api/v1/graphics/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Get graphic
+      operationId: getGraphic
+      tags: [Graphics]
+      responses:
+        '200':
+          description: Graphic
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Graphic'
+        '404':
+          description: Not found
+    patch:
+      summary: Update graphic
+      operationId: updateGraphic
+      tags: [Graphics]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GraphicPatch'
+      responses:
+        '200':
+          description: Updated graphic
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Graphic'
+        '404':
+          description: Not found
+    delete:
+      summary: Delete graphic
+      operationId: deleteGraphic
+      tags: [Graphics]
+      responses:
+        '204':
+          description: Deleted
+        '404':
+          description: Not found
+
+  # ── Outputs ──────────────────────────────────────────────────────────────────
+
+  /api/v1/outputs:
+    get:
+      summary: List outputs
+      operationId: listOutputs
+      tags: [Outputs]
+      responses:
+        '200':
+          description: Array of outputs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Output'
+    post:
+      summary: Create output
+      operationId: createOutput
+      tags: [Outputs]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OutputInput'
+      responses:
+        '201':
+          description: Created output
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Output'
+        '400':
+          description: Validation error
+
+  /api/v1/outputs/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Get output
+      operationId: getOutput
+      tags: [Outputs]
+      responses:
+        '200':
+          description: Output
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Output'
+        '404':
+          description: Not found
+    patch:
+      summary: Update output
+      operationId: updateOutput
+      tags: [Outputs]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OutputPatch'
+      responses:
+        '200':
+          description: Updated output
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Output'
+        '404':
+          description: Not found
+    delete:
+      summary: Delete output
+      operationId: deleteOutput
+      tags: [Outputs]
+      responses:
+        '204':
+          description: Deleted
+        '404':
+          description: Not found
+
+  # ── Production Configs ───────────────────────────────────────────────────────
+
+  /api/v1/production-configs:
+    get:
+      summary: List production configs
+      operationId: listProductionConfigs
+      tags: [Production Configs]
+      responses:
+        '200':
+          description: Array of production configs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProductionConfig'
+    post:
+      summary: Create production config
+      operationId: createProductionConfig
+      tags: [Production Configs]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductionConfigInput'
+      responses:
+        '201':
+          description: Created config
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductionConfig'
+        '400':
+          description: Validation error
+
+  /api/v1/production-configs/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    patch:
+      summary: Update production config
+      operationId: updateProductionConfig
+      tags: [Production Configs]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductionConfigPatch'
+      responses:
+        '200':
+          description: Updated config
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductionConfig'
+        '404':
+          description: Not found
+    delete:
+      summary: Delete production config
+      operationId: deleteProductionConfig
+      tags: [Production Configs]
+      responses:
+        '204':
+          description: Deleted
+        '404':
+          description: Not found
+
+  # ── Productions ──────────────────────────────────────────────────────────────
+
+  /api/v1/productions:
+    get:
+      summary: List productions
+      operationId: listProductions
+      tags: [Productions]
+      responses:
+        '200':
+          description: Array of productions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Production'
+    post:
+      summary: Create production
+      operationId: createProduction
+      tags: [Productions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductionInput'
+      responses:
+        '201':
+          description: Created production
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Production'
+        '400':
+          description: Validation error
+
+  /api/v1/productions/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Get production
+      operationId: getProduction
+      tags: [Productions]
+      responses:
+        '200':
+          description: Production
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Production'
+        '404':
+          description: Not found
+    patch:
+      summary: Update production
+      operationId: updateProduction
+      tags: [Productions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductionPatch'
+      responses:
+        '200':
+          description: Updated production
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Production'
+        '404':
+          description: Not found
+    delete:
+      summary: Delete production
+      operationId: deleteProduction
+      tags: [Productions]
+      responses:
+        '204':
+          description: Deleted
+        '404':
+          description: Not found
+
+  /api/v1/productions/{id}/activate:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Activate production
+      description: Starts the Strom flow for the production. Status transitions to `activating` immediately and then to `active` once the flow reaches the playing state.
+      operationId: activateProduction
+      tags: [Productions]
+      responses:
+        '200':
+          description: Production activating
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  name:
+                    type: string
+                  status:
+                    type: string
+                    enum: [activating]
+                  stromFlowId:
+                    type: string
+        '404':
+          description: Not found
+        '409':
+          description: Already active
+
+  /api/v1/productions/{id}/deactivate:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Deactivate production
+      description: Stops the Strom flow and tears down the pipeline.
+      operationId: deactivateProduction
+      tags: [Productions]
+      responses:
+        '200':
+          description: Production deactivated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  name:
+                    type: string
+                  status:
+                    type: string
+                    enum: [inactive]
+        '404':
+          description: Not found
+
+  /api/v1/productions/{id}/controllers:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Get connected controller count
+      operationId: getProductionControllers
+      tags: [Productions]
+      responses:
+        '200':
+          description: Controller count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+
+  # Production — Source assignments
+
+  /api/v1/productions/{id}/sources:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Assign source to production
+      operationId: assignSource
+      tags: [Productions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sourceId, mixerInput]
+              properties:
+                sourceId:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+                mixerInput:
+                  type: string
+                  pattern: '^video_in_\d{1,2}$'
+                  maxLength: 20
+      responses:
+        '200':
+          description: Assignment created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductionSourceAssignment'
+
+  /api/v1/productions/{id}/sources/{mixerInput}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+        description: e.g. `video_in_1`
+    delete:
+      summary: Remove source from production
+      operationId: unassignSource
+      tags: [Productions]
+      responses:
+        '204':
+          description: Removed
+        '404':
+          description: Not found
+
+  # Production — Graphic assignments
+
+  /api/v1/productions/{id}/graphics:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Assign graphic to production
+      operationId: assignGraphic
+      tags: [Productions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [graphicId, dskInput]
+              properties:
+                graphicId:
+                  type: string
+                  minLength: 1
+                dskInput:
+                  type: string
+                  minLength: 1
+      responses:
+        '200':
+          description: Assignment created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductionGraphicAssignment'
+
+  /api/v1/productions/{id}/graphics/{dskInput}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: dskInput
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      summary: Remove graphic from production
+      operationId: unassignGraphic
+      tags: [Productions]
+      responses:
+        '204':
+          description: Removed
+        '404':
+          description: Not found
+
+  # Production — Output assignments
+
+  /api/v1/productions/{id}/outputs:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Assign output to production
+      operationId: assignOutput
+      tags: [Productions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [outputId]
+              properties:
+                outputId:
+                  type: string
+                  minLength: 1
+      responses:
+        '200':
+          description: Assignment created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductionOutputAssignment'
+
+  /api/v1/productions/{id}/outputs/{outputId}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: outputId
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      summary: Remove output from production
+      operationId: unassignOutput
+      tags: [Productions]
+      responses:
+        '204':
+          description: Removed
+        '404':
+          description: Not found
+
+  # Production — Macros
+
+  /api/v1/productions/{id}/macros:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: List macros
+      operationId: listMacros
+      tags: [Productions]
+      responses:
+        '200':
+          description: Array of macros
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Macro'
+    post:
+      summary: Create macro
+      operationId: createMacro
+      tags: [Productions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MacroInput'
+      responses:
+        '201':
+          description: Created macro
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Macro'
+
+  /api/v1/productions/{id}/macros/{macroId}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: macroId
+        in: path
+        required: true
+        schema:
+          type: string
+    patch:
+      summary: Update macro
+      operationId: updateMacro
+      tags: [Productions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MacroPatch'
+      responses:
+        '200':
+          description: Updated macro
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Macro'
+        '404':
+          description: Not found
+    delete:
+      summary: Delete macro
+      operationId: deleteMacro
+      tags: [Productions]
+      responses:
+        '204':
+          description: Deleted
+        '404':
+          description: Not found
+
+  # Production — Pipeline
+
+  /api/v1/productions/{id}/pipeline:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Get pipeline state
+      operationId: getPipeline
+      tags: [Pipeline]
+      responses:
+        '200':
+          description: Pipeline
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pipeline'
+        '404':
+          description: Not found
+
+  /api/v1/productions/{id}/pipeline/config:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    patch:
+      summary: Update pipeline Strom config
+      operationId: updatePipelineConfig
+      tags: [Pipeline]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [stromConfig]
+              properties:
+                stromConfig:
+                  type: object
+                  additionalProperties:
+                    oneOf:
+                      - type: string
+                        maxLength: 1024
+                      - type: number
+                      - type: boolean
+                      - type: 'null'
+      responses:
+        '200':
+          description: Updated pipeline
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pipeline'
+
+  /api/v1/productions/{id}/pipeline/start:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Start pipeline
+      operationId: startPipeline
+      tags: [Pipeline]
+      responses:
+        '200':
+          description: Pipeline started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pipeline'
+
+  /api/v1/productions/{id}/pipeline/stop:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Stop pipeline
+      operationId: stopPipeline
+      tags: [Pipeline]
+      responses:
+        '200':
+          description: Pipeline stopped
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pipeline'
+
+  # Production — Audio
+
+  /api/v1/productions/{id}/audio:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: List audio elements
+      operationId: listAudioElements
+      tags: [Audio]
+      responses:
+        '200':
+          description: Audio elements
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                    elementId:
+                      type: string
+                    blockId:
+                      type: string
+                    label:
+                      type: string
+                    mixerInput:
+                      type: string
+                      nullable: true
+
+  /api/v1/productions/{id}/audio/{elementId}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: elementId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Get audio element properties
+      operationId: getAudioElement
+      tags: [Audio]
+      responses:
+        '200':
+          description: Audio element properties
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  element_id:
+                    type: string
+                  properties:
+                    type: object
+                    properties:
+                      volume:
+                        type: number
+                      mute:
+                        type: boolean
+        '404':
+          description: Not found
+    patch:
+      summary: Update audio element property
+      operationId: updateAudioElement
+      tags: [Audio]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [property, value]
+              properties:
+                property:
+                  type: string
+                  enum: [volume, mute]
+                value:
+                  oneOf:
+                    - type: number
+                      minimum: 0
+                      maximum: 10
+                    - type: boolean
+      responses:
+        '200':
+          description: Updated properties
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  element_id:
+                    type: string
+                  properties:
+                    type: object
+                    additionalProperties: true
+        '404':
+          description: Not found
+
+  # Production — Stats
+
+  /api/v1/productions/{id}/stats/streaming:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Get streaming statistics
+      operationId: getStreamingStats
+      tags: [Productions]
+      responses:
+        '200':
+          description: Streaming stats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  active:
+                    type: boolean
+                  rtpStats:
+                    type: object
+                    additionalProperties: true
+                  webrtcStats:
+                    type: object
+                    additionalProperties: true
+                  error:
+                    type: string
+
+  # ── ICE Servers ──────────────────────────────────────────────────────────────
+
+  /api/v1/ice-servers:
+    get:
+      summary: Get ICE server configuration
+      operationId: getIceServers
+      tags: [WebRTC]
+      responses:
+        '200':
+          description: ICE servers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  iceServers:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/IceServer'
+        '502':
+          description: Could not reach Strom for ICE config
+
+  # ── WHEP Proxy ───────────────────────────────────────────────────────────────
+
+  /api/v1/whep-proxy:
+    post:
+      summary: WHEP offer proxy
+      description: Proxies a WHEP SDP offer to the target Strom WHEP endpoint.
+      operationId: whepProxyOffer
+      tags: [WebRTC]
+      parameters:
+        - name: target
+          in: query
+          required: true
+          schema:
+            type: string
+          description: URL-encoded target WHEP endpoint URL
+      requestBody:
+        required: true
+        content:
+          application/sdp:
+            schema:
+              type: string
+          text/plain:
+            schema:
+              type: string
+      responses:
+        '201':
+          description: SDP answer
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/sdp:
+              schema:
+                type: string
+        '502':
+          description: Upstream error
+    delete:
+      summary: WHEP session teardown proxy
+      operationId: whepProxyDelete
+      tags: [WebRTC]
+      parameters:
+        - name: target
+          in: query
+          required: true
+          schema:
+            type: string
+          description: URL-encoded target WHEP session URL
+      responses:
+        '204':
+          description: Session closed
+
+  # ── WHIP ────────────────────────────────────────────────────────────────────
+
+  /api/v1/productions/{id}/whip/{mixerInput}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: mixerInput
+        in: path
+        required: true
+        schema:
+          type: string
+        description: e.g. `video_in_1`
+    post:
+      summary: WHIP offer (start ingest)
+      description: Initiates a WebRTC ingest session for the given mixer input slot.
+      operationId: whipOffer
+      tags: [WebRTC]
+      requestBody:
+        required: true
+        content:
+          application/sdp:
+            schema:
+              type: string
+      responses:
+        '201':
+          description: SDP answer
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/sdp:
+              schema:
+                type: string
+    patch:
+      summary: WHIP ICE trickle
+      operationId: whipIceTrickle
+      tags: [WebRTC]
+      parameters:
+        - name: session
+          in: query
+          schema:
+            type: string
+          description: URL-encoded session URL
+      requestBody:
+        required: true
+        content:
+          application/trickle-ice-sdpfrag:
+            schema:
+              type: string
+      responses:
+        '200':
+          description: ICE candidate accepted
+    delete:
+      summary: WHIP session teardown
+      operationId: whipDelete
+      tags: [WebRTC]
+      parameters:
+        - name: session
+          in: query
+          schema:
+            type: string
+          description: URL-encoded session URL
+      responses:
+        '204':
+          description: Session closed

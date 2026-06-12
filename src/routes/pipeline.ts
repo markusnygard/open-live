@@ -4,8 +4,10 @@ import { getDb } from '../db/index.js';
 import type { ProductionDoc } from '../db/types.js';
 import { startPipeline, stopPipeline } from '../services/pipeline.service.js';
 
+// Restrict stromConfig values to safe scalars — no nested objects, arrays, or arbitrary JSON.
+// This prevents Strom pipeline injection via deeply nested or operator-containing configs.
 const ConfigPatch = z.object({
-  stromConfig: z.record(z.unknown()),
+  stromConfig: z.record(z.union([z.string().max(1024), z.number(), z.boolean(), z.null()])),
 });
 
 const pipelineRoutes: FastifyPluginAsync = async (fastify) => {

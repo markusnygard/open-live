@@ -1,5 +1,6 @@
 import type { FastifyPluginAsync } from 'fastify';
 import type { WebSocket } from '@fastify/websocket';
+import { z } from 'zod';
 import { getDb, getSourcesDb } from '../db/index.js';
 import { updateProductionDoc } from '../routes/productions.js';
 import type { ProductionDoc } from '../db/types.js';
@@ -45,6 +46,69 @@ type InboundMessage =
   | { type: 'LOUDNESS_RESET' }
   | { type: 'SELECT_PVW_PIP'; pip: number }
   | { type: 'SET_PIP'; pip: number; bg: number | null; zones: PipZone[]; transforms?: PipTransforms };
+
+// ---------------------------------------------------------------------------
+// Runtime schema validation for inbound WS messages
+// ---------------------------------------------------------------------------
+
+const mixerInputSchema = z.string().regex(/^video_in_\d{1,2}$/).max(20);
+const elementIdSchema = z.string().min(1).max(128);
+const pipIndexSchema = z.number().int().min(0).max(3);
+const layerSchema = z.number().int().min(0).max(3);
+const alphaSchema = z.number().min(0).max(1);
+const levelSchema = z.number().min(0).max(1);
+const faderSchema = z.number().min(0).max(10); // Strom mixer ceiling
+const busSchema = z.number().int().min(1).max(8);
+const rampMsSchema = z.number().int().min(0).max(60000);
+const offsetMsSchema = z.number().int().min(0).max(60000);
+
+const PipZoneSchema = z.object({
+  rect: z.object({ x: z.number(), y: z.number(), w: z.number(), h: z.number() }).nullable(),
+  capacity: z.number().nullable(),
+  sources: z.array(z.number().int().min(0).max(15)),
+});
+
+const InboundMessageSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('CUT'), mixerInput: mixerInputSchema, afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
+  z.object({ type: z.literal('TRANSITION'), mixerInput: mixerInputSchema, transitionType: z.string().max(32), durationMs: rampMsSchema.optional(), afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
+  z.object({ type: z.literal('TAKE'), pip: pipIndexSchema.optional(), transitionType: z.string().max(32).optional(), durationMs: rampMsSchema.optional(), afvRampUpMs: rampMsSchema.optional(), afvRampDownMs: rampMsSchema.optional() }),
+  z.object({ type: z.literal('SET_PVW'), mixerInput: mixerInputSchema }),
+  z.object({ type: z.literal('FTB'), active: z.boolean().optional(), durationMs: rampMsSchema.optional() }),
+  z.object({ type: z.literal('SET_OVL'), alpha: alphaSchema }),
+  z.object({ type: z.literal('GO_LIVE') }),
+  z.object({ type: z.literal('CUT_STREAM') }),
+  z.object({ type: z.literal('GRAPHIC_ON'), overlayId: z.string().min(1).max(128) }),
+  z.object({ type: z.literal('GRAPHIC_OFF'), overlayId: z.string().min(1).max(128) }),
+  z.object({ type: z.literal('DSK_TOGGLE'), layer: layerSchema, visible: z.boolean().optional() }),
+  z.object({ type: z.literal('MACRO_EXEC'), macroId: z.string().min(1).max(128) }),
+  z.object({
+    type: z.literal('AUDIO_SET'),
+    elementId: elementIdSchema,
+    property: z.enum(['volume', 'mute']),
+    value: z.union([z.number().min(0).max(10), z.boolean()]),
+    ramp_ms: rampMsSchema.optional(),
+  }),
+  z.object({ type: z.literal('AFV_SET'), mixerInput: mixerInputSchema, enabled: z.boolean() }),
+  z.object({ type: z.literal('AFV_RAMP_SET'), rampUpMs: rampMsSchema, rampDownMs: rampMsSchema }),
+  z.object({ type: z.literal('PFL_SET'), elementId: elementIdSchema, enabled: z.boolean(), volume: levelSchema.optional() }),
+  z.object({ type: z.literal('AFL_SET'), elementId: elementIdSchema, enabled: z.boolean() }),
+  z.object({ type: z.literal('AUX_SEND_SET'), elementId: elementIdSchema, auxBus: busSchema, level: levelSchema, enabled: z.boolean(), pre: z.boolean().optional() }),
+  z.object({ type: z.literal('AUX_MASTER_SET'), auxBus: busSchema, volume: faderSchema, muted: z.boolean() }),
+  z.object({ type: z.literal('GRP_SEND_SET'), elementId: elementIdSchema, grpBus: busSchema, level: levelSchema, enabled: z.boolean() }),
+  z.object({ type: z.literal('GRP_MASTER_SET'), grpBus: busSchema, volume: faderSchema, muted: z.boolean() }),
+  z.object({ type: z.literal('MONITOR_SET'), volume: faderSchema, muted: z.boolean() }),
+  z.object({ type: z.literal('SOURCE_OFFSET_SET'), mixerInput: mixerInputSchema, offsetMs: offsetMsSchema }),
+  z.object({ type: z.literal('SOURCE_AUDIO_OFFSET_SET'), mixerInput: mixerInputSchema, offsetMs: offsetMsSchema }),
+  z.object({ type: z.literal('LOUDNESS_RESET') }),
+  z.object({ type: z.literal('SELECT_PVW_PIP'), pip: pipIndexSchema }),
+  z.object({
+    type: z.literal('SET_PIP'),
+    pip: pipIndexSchema,
+    bg: z.number().int().min(0).max(15).nullable(),
+    zones: z.array(PipZoneSchema).max(15),
+    transforms: z.record(z.string(), z.object({ left: z.number().min(0).max(1), top: z.number().min(0).max(1), right: z.number().min(0).max(1), bottom: z.number().min(0).max(1) })).optional(),
+  }),
+]);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -380,11 +444,24 @@ async function handleMessage(
   raw: string,
   ctx: { audioBlockId?: string },
 ): Promise<void> {
-  let msg: InboundMessage;
+  let rawParsed: unknown;
   try {
-    msg = JSON.parse(raw) as InboundMessage;
+    rawParsed = JSON.parse(raw);
   } catch {
     ws.send(JSON.stringify({ type: 'ERROR', error: 'Invalid JSON' }));
+    return;
+  }
+  const parseResult = InboundMessageSchema.safeParse(rawParsed);
+  if (!parseResult.success) {
+    ws.send(JSON.stringify({ type: 'ERROR', error: parseResult.error.issues[0]?.message ?? 'Invalid message' }));
+    return;
+  }
+  const msg: InboundMessage = parseResult.data;
+
+  // Enforce project rule: never send mute=true via AUDIO_SET — use fader=0 instead.
+  // (GStreamer GAP flag from mute=true kills meters; VolumeRampManager.apply_mute(false) overrides fader=0)
+  if (msg.type === 'AUDIO_SET' && msg.property === 'mute') {
+    ws.send(JSON.stringify({ type: 'ERROR', error: 'Use fader=0 instead of the mute property' }));
     return;
   }
 

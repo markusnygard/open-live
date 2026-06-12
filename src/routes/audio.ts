@@ -7,7 +7,8 @@ import { config } from '../config.js';
 
 const AudioPatch = z.object({
   property: z.enum(['volume', 'mute']),
-  value: z.unknown(),
+  // volume: 0.0–10.0 (Strom mixer ceiling); mute: boolean
+  value: z.union([z.number().min(0).max(10), z.boolean()]),
 });
 
 const MIXER_BLOCK_TYPE = 'builtin.mixer';

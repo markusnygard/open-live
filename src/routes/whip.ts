@@ -3,6 +3,39 @@ import { getStromToken } from '../lib/strom-token.js'
 import { config } from '../config.js'
 
 /**
+ * Validates that a session URL:
+ * 1. Belongs to the configured Strom host (prevents SSRF / token exfiltration).
+ * 2. Contains the expected production-specific endpoint suffix (prevents cross-production manipulation).
+ */
+function validateSessionUrl(sessionUrl: string, productionId?: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(sessionUrl);
+  } catch {
+    throw new Error('Invalid session URL');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('Session URL must use http or https');
+  }
+  const strom = new URL(config.stromUrl);
+  // hostname comparison is already lowercase via the URL parser
+  if (parsed.hostname !== strom.hostname) {
+    throw new Error('Session URL host does not match configured Strom host');
+  }
+  if (strom.port && parsed.port && parsed.port !== strom.port) {
+    throw new Error('Session URL port does not match configured Strom port');
+  }
+  // Verify the path contains the production-specific endpoint suffix so a session
+  // captured from production A cannot be replayed against production B.
+  if (productionId) {
+    const endpointSuffix = productionId.replace(/^prod-/, '').slice(0, 8);
+    if (!parsed.pathname.includes(endpointSuffix)) {
+      throw new Error('Session URL does not belong to this production');
+    }
+  }
+}
+
+/**
  * WHIP signaling proxy — forwards SDP offer/answer, ICE trickle, and teardown
  * to Strom while keeping the Strom URL internal.
  *
@@ -80,9 +113,18 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
   }>(
     '/api/v1/productions/:id/whip/:mixerInput',
     async (req, reply) => {
-      const target = req.query.session
-        ? decodeURIComponent(req.query.session)
-        : resolveStromWhipUrl(req.params.id, req.params.mixerInput)
+      let target: string;
+      if (req.query.session) {
+        const decoded = decodeURIComponent(req.query.session);
+        try {
+          validateSessionUrl(decoded, req.params.id);
+        } catch (err) {
+          return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid session URL' });
+        }
+        target = decoded;
+      } else {
+        target = resolveStromWhipUrl(req.params.id, req.params.mixerInput);
+      }
 
       const token = await getStromToken(config.stromToken).catch(() => undefined)
       const headers: Record<string, string> = {
@@ -102,9 +144,18 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
   }>(
     '/api/v1/productions/:id/whip/:mixerInput',
     async (req, reply) => {
-      const target = req.query.session
-        ? decodeURIComponent(req.query.session)
-        : resolveStromWhipUrl(req.params.id, req.params.mixerInput)
+      let target: string;
+      if (req.query.session) {
+        const decoded = decodeURIComponent(req.query.session);
+        try {
+          validateSessionUrl(decoded, req.params.id);
+        } catch (err) {
+          return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid session URL' });
+        }
+        target = decoded;
+      } else {
+        target = resolveStromWhipUrl(req.params.id, req.params.mixerInput);
+      }
 
       const token = await getStromToken(config.stromToken).catch(() => undefined)
       const headers: Record<string, string> = {}

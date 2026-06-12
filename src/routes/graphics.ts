@@ -4,21 +4,27 @@ import { z } from 'zod';
 import { getGraphicsDb, getDb } from '../db/index.js';
 import type { GraphicDoc, ProductionDoc } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
+import { graphicUrl } from '../lib/url-validation.js';
 
-// Accept both http/https URLs and data: URIs (inline HTML overlays)
-const urlOrDataUri = z.string().min(1).refine(
-  (s) => s.startsWith('data:') || (() => { try { new URL(s); return true; } catch { return false; } })(),
-  { message: 'Must be a valid URL or data URI' },
-);
+// Accept only safe http/https URLs or data:image/(png|jpeg|gif|webp) base64 URIs.
+// Rejects file://, javascript:, data:text/html, data:image/svg+xml, etc.
+// 512 KB cap prevents CouchDB storage exhaustion via large data URIs.
+const safeGraphicUrl = z.string().min(1).max(524288).superRefine((s, ctx) => {
+  try {
+    graphicUrl(s);
+  } catch (err) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: err instanceof Error ? err.message : 'Invalid graphic URL' });
+  }
+});
 
 const GraphicInput = z.object({
   name: z.string().min(1),
-  url: urlOrDataUri,
+  url: safeGraphicUrl,
 });
 
 const GraphicPatch = z.object({
   name: z.string().min(1).optional(),
-  url: urlOrDataUri.optional(),
+  url: safeGraphicUrl.optional(),
 });
 
 function toApi(doc: GraphicDoc) {

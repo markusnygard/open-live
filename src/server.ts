@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
+import rateLimit from '@fastify/rate-limit';
 import websocket from '@fastify/websocket';
 import { ZodError } from 'zod';
 import { config } from './config.js';
@@ -21,12 +22,17 @@ import graphicsRoutes from './routes/graphics.js';
 import outputsRoutes from './routes/outputs.js';
 import controllerWs from './ws/controller.js';
 
+// Routes exempt from auth and DB checks
+const EXEMPT_PATHS = new Set(['/health', '/ready', '/api/v1/status', '/api/v1/server-info', '/api/v1/reconnect']);
+
 export async function buildServer() {
   const fastify = Fastify({
     logger: {
       level: config.logLevel,
     },
     disableRequestLogging: true,
+    // Prevent memory exhaustion via oversized request bodies (1 MB limit)
+    bodyLimit: 1_048_576,
   });
 
   await fastify.register(helmet, {
@@ -36,13 +42,33 @@ export async function buildServer() {
     crossOriginResourcePolicy: { policy: 'cross-origin' },
   });
 
+  // CORS — configurable via CORS_ORIGIN env var (default '*' for backward compat)
+  const corsOrigins = config.corsOrigin === '*'
+    ? true
+    : config.corsOrigin.split(',').map((o) => o.trim()).filter(Boolean);
   await fastify.register(cors, {
-    origin: '*',
+    origin: corsOrigins,
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: false,
     maxAge: 86400,
     strictPreflight: false,
+  });
+
+  // Rate limiting — 200 requests per minute per IP on API routes
+  // Activation and WHIP/WHEP proxy get tighter limits (10/min) to prevent abuse
+  await fastify.register(rateLimit, {
+    global: true,
+    max: 200,
+    timeWindow: '1 minute',
+    // Skip health/ready probes — they are high-frequency and come from the cluster
+    skipOnError: false,
+    keyGenerator: (req) => (req.headers['x-forwarded-for'] as string ?? req.ip).split(',')[0]!.trim(),
+    errorResponseBuilder: (_req, context) => ({
+      error: 'Too many requests',
+      statusCode: 429,
+      retryAfter: context.after,
+    }),
   });
 
   await fastify.register(websocket);
@@ -56,21 +82,60 @@ export async function buildServer() {
     }
   });
 
+  // Optional API key authentication — enabled when API_KEY env var is set.
+  // Exempt: health/ready probes and status/reconnect endpoints.
+  // WS connections: pass key via Authorization header or ?key= query param on upgrade.
+  if (config.apiKey) {
+    fastify.addHook('onRequest', async (req, reply) => {
+      const path = req.url.split('?')[0]!;
+      if (EXEMPT_PATHS.has(path) || path === '/health' || path === '/ready') return;
+      if (!req.url.startsWith('/api/v1')) return;
+
+      const authHeader = req.headers['authorization'];
+      const keyFromHeader = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
+      // WS upgrade carries key in query string since JS WebSocket API doesn't support custom headers
+      const keyFromQuery = (req.query as Record<string, string>)?.['key'];
+      const provided = keyFromHeader ?? keyFromQuery;
+
+      if (provided !== config.apiKey) {
+        return reply.status(401).send({ error: 'Unauthorized', statusCode: 401 });
+      }
+    });
+  }
+
+  // Audit log — structured entry for every mutating API call (POST/PUT/PATCH/DELETE)
+  fastify.addHook('onResponse', async (req, reply) => {
+    if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return;
+    if (!req.url.startsWith('/api/v1')) return;
+    const ip = ((req.headers['x-forwarded-for'] as string | undefined) ?? req.ip ?? '').split(',')[0]!.trim();
+    fastify.log.info({
+      audit: true,
+      method: req.method,
+      url: req.url.split('?')[0],
+      status: reply.statusCode,
+      ip,
+    }, 'audit');
+  });
+
   // Reject DB-dependent routes when database is unavailable
   fastify.addHook('onRequest', async (req, reply) => {
-    if (!isDbConnected() && req.url.startsWith('/api/v1') && req.url !== '/api/v1/status' && req.url !== '/api/v1/server-info' && req.url !== '/api/v1/reconnect') {
+    const path = req.url.split('?')[0]!;
+    if (!isDbConnected() && req.url.startsWith('/api/v1') && !EXEMPT_PATHS.has(path)) {
       reply.status(503).send({ error: 'Database unavailable — please check your CouchDB is running' });
     }
   });
 
-  // Error handler
+  // Error handler — never leak internal details (stack traces, DB errors, Strom internals) on 5xx
   fastify.setErrorHandler((error: Error & { statusCode?: number }, _req, reply) => {
     if (error instanceof ZodError) {
       return reply.status(400).send({ error: 'Validation error', issues: error.issues, statusCode: 400 });
     }
     const statusCode = error.statusCode ?? 500;
     fastify.log.error(error);
-    reply.status(statusCode).send({ error: error.message, statusCode });
+    // For 4xx we expose the message (it's validation/not-found feedback for the caller).
+    // For 5xx we return a generic message to avoid leaking internals.
+    const clientMessage = statusCode < 500 ? error.message : 'An internal error occurred';
+    reply.status(statusCode).send({ error: clientMessage, statusCode });
   });
 
   await fastify.register(healthRoutes);

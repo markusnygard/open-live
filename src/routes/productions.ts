@@ -315,9 +315,12 @@ const ProductionPatch = z.object({
   airTime: z.string().datetime().nullable().optional(),
 });
 
+// mixerInput must match the Strom pad naming convention (e.g. "video_in_0", "video_in_15")
+const mixerInputSchema = z.string().regex(/^video_in_\d{1,2}$/, 'mixerInput must match video_in_N format').max(20);
+
 const SourceAssignmentInput = z.object({
-  sourceId: z.string().min(1),
-  mixerInput: z.string().min(1),
+  sourceId: z.string().min(1).max(128),
+  mixerInput: mixerInputSchema,
 });
 
 const GraphicAssignmentInput = z.object({
@@ -483,13 +486,18 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       const abortController = new AbortController();
       activationAbortControllers.set(doc._id, abortController);
 
-      const proto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim()
-        ?? req.protocol
-        ?? 'https'
-      const host = (req.headers['x-forwarded-host'] as string | undefined)
-        ?? (req.headers.host as string | undefined)
-        ?? req.hostname
-      const publicBaseUrl = `${proto}://${host}`
+      // Prefer the explicitly configured PUBLIC_BASE_URL to avoid X-Forwarded-Host injection.
+      // Only fall back to request-derived values when PUBLIC_BASE_URL is not set.
+      const publicBaseUrl = config.publicBaseUrl
+        ?? (() => {
+          const proto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim()
+            ?? req.protocol
+            ?? 'https';
+          const host = (req.headers['x-forwarded-host'] as string | undefined)
+            ?? (req.headers.host as string | undefined)
+            ?? req.hostname;
+          return `${proto}://${host}`;
+        })()
 
       // Fire-and-forget — must never let a rejection escape to the global handler
       void runActivationFlow(doc._id, abortController.signal, fastify.log, publicBaseUrl).catch((err) => {
@@ -590,6 +598,10 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.delete<{ Params: { id: string; mixerInput: string } }>(
     '/api/v1/productions/:id/sources/:mixerInput',
     async (req, reply) => {
+      const mixerInputParsed = mixerInputSchema.safeParse(req.params.mixerInput);
+      if (!mixerInputParsed.success) {
+        return reply.status(400).send({ error: 'Invalid mixerInput format', statusCode: 400 });
+      }
       for (let attempt = 0; attempt < MAX_DB_WRITE_RETRIES; attempt++) {
         try {
           const doc = await getDb().get(req.params.id);
