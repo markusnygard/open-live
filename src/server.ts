@@ -3,6 +3,8 @@ import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import websocket from '@fastify/websocket';
+import swagger from '@fastify/swagger';
+import swaggerUi from '@fastify/swagger-ui';
 import { ZodError } from 'zod';
 import { config } from './config.js';
 import { isDbConnected } from './db/index.js';
@@ -22,8 +24,10 @@ import graphicsRoutes from './routes/graphics.js';
 import outputsRoutes from './routes/outputs.js';
 import controllerWs from './ws/controller.js';
 
-// Routes exempt from auth and DB checks
-const EXEMPT_PATHS = new Set(['/health', '/ready', '/api/v1/status', '/api/v1/server-info', '/api/v1/reconnect']);
+// Routes exempt from the DB-availability guard (don't touch the DB)
+const DB_EXEMPT_PATHS = new Set(['/health', '/ready', '/api/v1/status', '/api/v1/server-info', '/api/v1/reconnect']);
+// Routes exempt from API key auth (health probes + reconnect/status used by the UI before auth is set up)
+const AUTH_EXEMPT_PATHS = new Set(['/health', '/ready', '/api/v1/status', '/api/v1/reconnect']);
 
 export async function buildServer() {
   const fastify = Fastify({
@@ -62,13 +66,31 @@ export async function buildServer() {
     max: 200,
     timeWindow: '1 minute',
     // Skip health/ready probes — they are high-frequency and come from the cluster
+    allowList: (req: { url: string }) => req.url === '/health' || req.url === '/ready',
     skipOnError: false,
-    keyGenerator: (req) => (req.headers['x-forwarded-for'] as string ?? req.ip).split(',')[0]!.trim(),
+    keyGenerator: (req: { headers: Record<string, string | string[] | undefined>; ip: string }) => (req.headers['x-forwarded-for'] as string ?? req.ip).split(',')[0]!.trim(),
     errorResponseBuilder: (_req, context) => ({
       error: 'Too many requests',
       statusCode: 429,
       retryAfter: context.after,
     }),
+  });
+
+  await fastify.register(swagger, {
+    openapi: {
+      info: { title: 'Open Live API', version: '1.0.0', description: 'REST API for the Open Live broadcast production platform.' },
+      components: {
+        securitySchemes: {
+          bearerAuth: { type: 'http', scheme: 'bearer' },
+        },
+      },
+      security: [{ bearerAuth: [] }],
+    },
+  });
+
+  await fastify.register(swaggerUi, {
+    routePrefix: '/documentation',
+    uiConfig: { docExpansion: 'list', deepLinking: true },
   });
 
   await fastify.register(websocket);
@@ -88,7 +110,7 @@ export async function buildServer() {
   if (config.apiKey) {
     fastify.addHook('onRequest', async (req, reply) => {
       const path = req.url.split('?')[0]!;
-      if (EXEMPT_PATHS.has(path) || path === '/health' || path === '/ready') return;
+      if (AUTH_EXEMPT_PATHS.has(path)) return;
       if (!req.url.startsWith('/api/v1')) return;
 
       const authHeader = req.headers['authorization'];
@@ -120,7 +142,7 @@ export async function buildServer() {
   // Reject DB-dependent routes when database is unavailable
   fastify.addHook('onRequest', async (req, reply) => {
     const path = req.url.split('?')[0]!;
-    if (!isDbConnected() && req.url.startsWith('/api/v1') && !EXEMPT_PATHS.has(path)) {
+    if (!isDbConnected() && req.url.startsWith('/api/v1') && !DB_EXEMPT_PATHS.has(path)) {
       reply.status(503).send({ error: 'Database unavailable — please check your CouchDB is running' });
     }
   });

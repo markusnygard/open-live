@@ -1,29 +1,33 @@
 /**
  * Idle watchdog — always active.
  *
- * Polls every 10 seconds. Any production that is 'active' and has had
- * zero WebSocket subscribers for IDLE_TIMEOUT_MS continuously is
- * automatically deactivated.
+ * Tracks active productions via event notifications (notifyProductionActivated /
+ * notifyProductionDeactivated). On each tick it checks subscriber counts for
+ * known active productions — no DB query needed. When the idle timeout expires
+ * it fetches the current doc once and deactivates.
  */
 
 import type { FastifyBaseLogger } from 'fastify';
 import { config } from '../config.js';
-import { getDb, isDbConnected } from '../db/index.js';
+import { isDbConnected, getDb } from '../db/index.js';
 import { StromClient } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { deactivateStromFlow } from '../lib/flow-generator.js';
 import { getSubscriberCount } from './tally.service.js';
 import { clearProductionPflState } from './pfl-state.js';
-import { clearAudioState, clearPipState } from '../ws/controller.js';
+import { clearAudioState, clearPipState, clearFxState } from '../ws/controller.js';
 import { broadcast } from './tally.service.js';
-import { activationAbortControllers } from '../routes/productions.js';
+import { activationAbortControllers, updateProductionDoc } from '../routes/productions.js';
 import type { ProductionDoc } from '../db/types.js';
 
-const IDLE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
+const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 const POLL_INTERVAL_MS = 10 * 1000;    // 10 seconds
 
 /** productionId → timestamp when subscriber count first dropped to 0 */
 const idleSince = new Map<string, number>();
+
+/** Set of production IDs currently known to be active or activating */
+const activeProductionIds = new Set<string>();
 
 let watchdogInterval: NodeJS.Timeout | null = null;
 
@@ -31,8 +35,23 @@ export function getIdleSince(productionId: string): number | undefined {
   return idleSince.get(productionId);
 }
 
+export function getIdleExpiresAt(idleSinceMs: number): number {
+  return idleSinceMs + IDLE_TIMEOUT_MS;
+}
+
 export function isWatchdogEnabled(): boolean {
   return watchdogInterval !== null;
+}
+
+/** Call when a production transitions to active or activating */
+export function notifyProductionActivated(productionId: string): void {
+  activeProductionIds.add(productionId);
+}
+
+/** Call when a production is deactivated (manually or by the watchdog itself) */
+export function notifyProductionDeactivated(productionId: string): void {
+  activeProductionIds.delete(productionId);
+  idleSince.delete(productionId);
 }
 
 /** Call immediately when a subscriber connects — clears the idle timer so the
@@ -41,10 +60,35 @@ export function notifySubscriberJoin(productionId: string): void {
   idleSince.delete(productionId);
 }
 
-
+async function seedActiveProductions(log: FastifyBaseLogger): Promise<void> {
+  if (!isDbConnected()) return;
+  try {
+    const result = await getDb().find({
+      selector: { type: 'production', status: { $in: ['active', 'activating'] } },
+      fields: ['_id'],
+    });
+    const docs = Array.isArray(result?.docs) ? result.docs as { _id: string }[] : [];
+    const now = Date.now();
+    for (const doc of docs) {
+      activeProductionIds.add(doc._id);
+      if (getSubscriberCount(doc._id) === 0) {
+        idleSince.set(doc._id, now);
+      }
+    }
+    if (docs.length > 0) {
+      log.info({ count: docs.length }, '[idle-watchdog] Seeded active productions from DB');
+    }
+  } catch (err) {
+    log.warn({ err }, '[idle-watchdog] Failed to seed active productions — watchdog will learn via events');
+  }
+}
 
 export function startIdleWatchdog(log: FastifyBaseLogger): void {
+  if (watchdogInterval !== null) return;
+
   log.info(`[idle-watchdog] Idle auto-deactivation enabled (timeout: ${IDLE_TIMEOUT_MS / 1000}s, poll: ${POLL_INTERVAL_MS / 1000}s)`);
+
+  void seedActiveProductions(log);
 
   watchdogInterval = setInterval(() => {
     tick(log).catch((err) => log.error({ err }, '[idle-watchdog] Tick error'));
@@ -55,65 +99,58 @@ export function startIdleWatchdog(log: FastifyBaseLogger): void {
 }
 
 async function tick(log: FastifyBaseLogger): Promise<void> {
-  if (!isDbConnected()) return;
+  if (activeProductionIds.size === 0) return;
 
-  type FindResult = Awaited<ReturnType<ReturnType<typeof getDb>['find']>>;
-  let result: FindResult;
-  try {
-    result = await getDb().find({
-      selector: { type: 'production', status: { $in: ['active', 'activating'] } },
-    });
-  } catch (err) {
-    const e = err as { statusCode?: number; message?: string };
-    log.warn({ statusCode: e.statusCode, msg: e.message }, '[idle-watchdog] DB query failed — skipping tick');
-    return;
-  }
-
-  const docs = Array.isArray(result?.docs) ? (result.docs as ProductionDoc[]) : [];
   const now = Date.now();
 
-  for (const doc of docs) {
-    const count = getSubscriberCount(doc._id);
+  for (const productionId of activeProductionIds) {
+    const count = getSubscriberCount(productionId);
 
     if (count > 0) {
-      // Active connections — clear idle timer
-      idleSince.delete(doc._id);
+      idleSince.delete(productionId);
       continue;
     }
 
-    // No subscribers — start or check idle timer
-    if (!idleSince.has(doc._id)) {
-      idleSince.set(doc._id, now);
-      log.debug({ productionId: doc._id }, '[idle-watchdog] Production became idle — starting timer');
+    if (!idleSince.has(productionId)) {
+      idleSince.set(productionId, now);
+      log.debug({ productionId }, '[idle-watchdog] Production became idle — starting timer');
       continue;
     }
 
-    const idleMs = now - idleSince.get(doc._id)!;
+    const idleMs = now - idleSince.get(productionId)!;
     if (idleMs < IDLE_TIMEOUT_MS) continue;
 
-    // Idle timeout exceeded — deactivate
     log.info(
-      { productionId: doc._id, name: doc.name, idleSec: Math.round(idleMs / 1000) },
+      { productionId, idleSec: Math.round(idleMs / 1000) },
       '[idle-watchdog] Auto-deactivating idle production',
     );
 
-    idleSince.delete(doc._id);
+    notifyProductionDeactivated(productionId);
 
     try {
-      await deactivateProduction(doc, log);
+      await deactivateProduction(productionId, log);
     } catch (err) {
-      log.error({ err, productionId: doc._id }, '[idle-watchdog] Failed to deactivate production');
+      log.error({ err, productionId }, '[idle-watchdog] Failed to deactivate production — will retry next tick');
+      notifyProductionActivated(productionId);
     }
-  }
-
-  // Clean up idle timers for productions no longer active
-  const activeIds = new Set(docs.map((d) => d._id));
-  for (const id of idleSince.keys()) {
-    if (!activeIds.has(id)) idleSince.delete(id);
   }
 }
 
-async function deactivateProduction(doc: ProductionDoc, log: FastifyBaseLogger): Promise<void> {
+async function deactivateProduction(productionId: string, log: FastifyBaseLogger): Promise<void> {
+  if (!isDbConnected()) {
+    log.warn({ productionId }, '[idle-watchdog] DB not connected — cannot deactivate');
+    return;
+  }
+
+  // Fetch fresh doc at deactivation time — single targeted read
+  const doc = await getDb().get(productionId) as ProductionDoc;
+
+  // Guard: already deactivated by something else between tick and now
+  if (doc.status !== 'active' && doc.status !== 'activating') {
+    log.debug({ productionId, status: doc.status }, '[idle-watchdog] Production no longer active — skipping');
+    return;
+  }
+
   // Cancel any in-progress activation loop
   const abortController = activationAbortControllers.get(doc._id);
   if (abortController) {
@@ -124,6 +161,7 @@ async function deactivateProduction(doc: ProductionDoc, log: FastifyBaseLogger):
   clearProductionPflState(doc._id);
   clearAudioState(doc._id);
   clearPipState(doc._id);
+  clearFxState(doc._id);
   broadcast(doc._id, { type: 'GRP_STATE_RESET' });
 
   if (doc.stromFlowId) {
@@ -136,9 +174,9 @@ async function deactivateProduction(doc: ProductionDoc, log: FastifyBaseLogger):
     }
   }
 
-  const updated: ProductionDoc = {
-    ...doc,
+  await updateProductionDoc(doc._id, {
     status: 'inactive',
+    autoDeactivated: true,
     stromFlowId: undefined,
     mixerBlockId: undefined,
     audioMixerBlockId: undefined,
@@ -151,9 +189,7 @@ async function deactivateProduction(doc: ProductionDoc, log: FastifyBaseLogger):
     srtOutputUri: undefined,
     whepOutputUrls: undefined,
     tally: { pgm: null, pvw: null },
-    updatedAt: new Date().toISOString(),
-  };
-
-  await getDb().insert(updated);
+  });
+  broadcast(doc._id, { type: 'PRODUCTION_DEACTIVATED' });
   log.info({ productionId: doc._id, name: doc.name }, '[idle-watchdog] Production deactivated');
 }

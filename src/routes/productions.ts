@@ -8,9 +8,9 @@ import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
 import { setTally, broadcast, getSubscriberCount } from '../services/tally.service.js';
 import { clearProductionPflState } from '../services/pfl-state.js';
-import { clearPipState, clearAudioState } from '../ws/controller.js';
+import { clearPipState, clearAudioState, clearFxState } from '../ws/controller.js';
 import { config } from '../config.js';
-import { getIdleSince } from '../services/idle-watchdog.js';
+import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -260,6 +260,7 @@ async function runActivationFlow(
           ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
         });
 
+        notifyProductionActivated(productionId);
         log.info({ productionId, stromFlowId, whepEndpoint, initialTally, audioMixerBlockId }, 'Production activated — flow playing');
         return;
       }
@@ -296,6 +297,8 @@ async function runActivationFlow(
     }).catch((resetErr) => {
       log.error({ resetErr, productionId }, 'Failed to reset production to inactive after activation failure');
     });
+
+    notifyProductionDeactivated(productionId);
   } finally {
     activationAbortControllers.delete(productionId);
   }
@@ -351,7 +354,8 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       if (doc.status !== 'active') return doc;
       const subscriberCount = getSubscriberCount(doc._id);
       const idleSinceAt = getIdleSince(doc._id);
-      return { ...doc, subscriberCount, ...(idleSinceAt !== undefined ? { idleSinceAt } : {}) };
+      const idleExpiresAt = idleSinceAt !== undefined ? getIdleExpiresAt(idleSinceAt) : undefined;
+      return { ...doc, subscriberCount, ...(idleExpiresAt !== undefined ? { idleExpiresAt } : {}) };
     });
     return reply.send(docs);
   });
@@ -478,9 +482,11 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         ...doc,
         status: 'activating',
         deletionWarnings: undefined,
+        autoDeactivated: undefined,
         updatedAt: new Date().toISOString(),
       };
       const insertResponse = await getDb().insert(activatingDoc);
+      notifyProductionActivated(doc._id);
 
       // Set up AbortController so deactivate can cancel the polling loop
       const abortController = new AbortController();
@@ -534,6 +540,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       clearProductionPflState(doc._id);
       clearAudioState(doc._id);
       clearPipState(doc._id);
+      clearFxState(doc._id);
       // Broadcast group-state reset so all connected clients clear their ephemeral
       // group assignments — these are live-only and must not survive deactivation.
       broadcast(doc._id, { type: 'GRP_STATE_RESET' });
@@ -561,6 +568,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         updatedAt: new Date().toISOString(),
       };
       const response = await getDb().insert(updated);
+      notifyProductionDeactivated(doc._id);
       return reply.send({ id: updated._id, name: updated.name, status: updated.status, _rev: response.rev });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

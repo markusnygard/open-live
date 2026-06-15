@@ -47,7 +47,7 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
 
 const macrosRoutes: FastifyPluginAsync = async (fastify) => {
   // List macros for a production
-  fastify.get<{ Params: { id: string } }>('/api/v1/productions/:id/macros', async (req, reply) => {
+  fastify.get<{ Params: { id: string } }>('/api/v1/productions/:id/macros', { schema: { hide: true } }, async (req, reply) => {
     try {
       const doc = await getDb().get(req.params.id);
       return reply.send(doc.macros ?? []);
@@ -57,7 +57,7 @@ const macrosRoutes: FastifyPluginAsync = async (fastify) => {
   });
 
   // Create a macro
-  fastify.post<{ Params: { id: string } }>('/api/v1/productions/:id/macros', async (req, reply) => {
+  fastify.post<{ Params: { id: string } }>('/api/v1/productions/:id/macros', { schema: { hide: true } }, async (req, reply) => {
     const body = MacroInput.parse(req.body);
     const macro: Macro = {
       id: `macro-${randomUUID()}`,
@@ -83,6 +83,7 @@ const macrosRoutes: FastifyPluginAsync = async (fastify) => {
   // Update a macro
   fastify.patch<{ Params: { id: string; macroId: string } }>(
     '/api/v1/productions/:id/macros/:macroId',
+    { schema: { hide: true } },
     async (req, reply) => {
       const body = MacroPatch.parse(req.body);
       let updated: Macro | undefined;
@@ -118,6 +119,7 @@ const macrosRoutes: FastifyPluginAsync = async (fastify) => {
   // Delete a macro
   fastify.delete<{ Params: { id: string; macroId: string } }>(
     '/api/v1/productions/:id/macros/:macroId',
+    { schema: { hide: true } },
     async (req, reply) => {
       let found = false;
 

@@ -166,6 +166,8 @@ export interface ProductionDoc {
   sourceAudioOffsetBlockIds?: Record<string, string>;
   /** Warnings accumulated when a referenced source/graphic/output was deleted while production was inactive */
   deletionWarnings?: Array<{ type: 'source' | 'graphic' | 'output'; name: string }>;
+  /** Set when the idle watchdog auto-deactivated this production; cleared on next activation */
+  autoDeactivated?: boolean;
   createdAt: string;
   updatedAt: string;
 }
