@@ -2,21 +2,13 @@
  * URL validation helpers for security-sensitive inputs.
  *
  * Rules:
- * - httpUrlOnly: allow only http/https, reject private/loopback IP ranges
+ * - httpUrlOnly: allow only http/https schemes
  * - graphicUrl:  httpUrlOnly OR safe data: image URIs (no svg, no text/html)
- * - srtUrl:      srt:// scheme only, reject private/loopback hosts
+ * - srtUrl:      srt:// scheme only
  */
 
-const PRIVATE_HOST_RE = /^(127\.|10\.|192\.168\.|169\.254\.|::1$|fe80:)/i;
-
-function isPrivateHost(hostname: string): boolean {
-  // 172.16.0.0/12
-  if (/^172\.(1[6-9]|2\d|3[01])\./.test(hostname)) return true;
-  return PRIVATE_HOST_RE.test(hostname);
-}
-
 /**
- * Throws if the URL is not a safe http/https URL pointing to a public host.
+ * Throws if the URL is not a safe http/https URL.
  */
 export function httpUrlOnly(url: string): void {
   let parsed: URL;
@@ -31,54 +23,42 @@ export function httpUrlOnly(url: string): void {
   if (!parsed.hostname) {
     throw new Error('URL must have a hostname');
   }
-  if (isPrivateHost(parsed.hostname)) {
-    throw new Error(`Private/loopback host "${parsed.hostname}" is not allowed`);
-  }
 }
 
-const ALLOWED_IMAGE_MIME = /^data:image\/(png|jpeg|gif|webp);base64,/i;
-const BLOCKED_SCHEMES = /^(file|javascript|ftp|gopher|chrome|about|data:text\/html|data:application):/i;
+const ALLOWED_DATA_MIME = /^data:(text\/html|image\/(png|jpeg|gif|webp))[;,]/i;
+const BLOCKED_SCHEMES = /^(file|javascript|ftp|gopher|chrome|about|data:application):/i;
 
 /**
  * Throws if the value is not a safe graphic URL.
- * Accepts: http/https URLs to public hosts, or data:image/(png|jpeg|gif|webp) base64 URIs.
- * Rejects: file://, javascript:, data:text/html, data:image/svg+xml (can carry scripts), etc.
+ * Accepts: http/https URLs, data:text/html (inline HTML overlays rendered by Strom's headless browser),
+ *          or data:image/(png|jpeg|gif|webp) base64 URIs.
+ * Rejects: file://, javascript:, data:application/*, etc.
  */
 export function graphicUrl(url: string): void {
   if (BLOCKED_SCHEMES.test(url)) {
     throw new Error(`Disallowed URL scheme in graphic URL`);
   }
   if (url.startsWith('data:')) {
-    if (!ALLOWED_IMAGE_MIME.test(url)) {
-      throw new Error('Only data:image/(png|jpeg|gif|webp) base64 URIs are allowed for graphics');
+    if (!ALLOWED_DATA_MIME.test(url)) {
+      throw new Error('Only data:text/html or data:image/(png|jpeg|gif|webp) URIs are allowed for graphics');
     }
-    return; // valid data URI
+    return;
   }
   // Otherwise must be a safe http/https URL
   httpUrlOnly(url);
 }
 
+// srt://<host>:<port>[?params] or srt://:<port>[?params] (empty host = bind all interfaces)
+const SRT_URL_RE = /^srt:\/\/[^!; ]*$/i;
+
 /**
- * Throws if the value is not a safe SRT URL pointing to a public host.
+ * Throws if the value is not a valid SRT URL.
  */
 export function srtUrl(url: string): void {
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    throw new Error(`Invalid SRT URL: ${url}`);
+  if (!url.startsWith('srt://')) {
+    throw new Error('Only srt:// URLs are allowed');
   }
-  if (parsed.protocol !== 'srt:') {
-    throw new Error(`Disallowed URL scheme "${parsed.protocol}" — only srt:// allowed`);
-  }
-  if (!parsed.hostname) {
-    throw new Error('SRT URL must have a hostname');
-  }
-  if (isPrivateHost(parsed.hostname)) {
-    throw new Error(`Private/loopback host "${parsed.hostname}" is not allowed in SRT URL`);
-  }
-  // Reject injection-prone characters in the query string
-  if (/[!; ]/.test(parsed.search)) {
-    throw new Error('SRT URL query string contains disallowed characters');
+  if (!SRT_URL_RE.test(url)) {
+    throw new Error('SRT URL contains disallowed characters');
   }
 }

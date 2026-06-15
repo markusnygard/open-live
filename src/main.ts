@@ -1,4 +1,5 @@
 import { config } from './config.js';
+import { startIdleWatchdog } from './services/idle-watchdog.js';
 import { connectDb, getDb, isDbConnected } from './db/index.js';
 import { cleanLegacyFixtures } from './db/seed.js';
 import { buildServer } from './server.js';
@@ -94,6 +95,7 @@ async function main() {
     app.log.error('[db] Failed to connect to CouchDB — continuing without database (status: %s)', err?.statusCode ?? err?.message ?? 'unknown');
   }
 
+  startIdleWatchdog(app.log);
   await app.listen({ port: config.port, host: '0.0.0.0' });
 }
 

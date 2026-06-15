@@ -3,11 +3,10 @@ import { getStromToken } from '../lib/strom-token.js'
 import { config } from '../config.js'
 
 /**
- * Validates that a session URL:
- * 1. Belongs to the configured Strom host (prevents SSRF / token exfiltration).
- * 2. Contains the expected production-specific endpoint suffix (prevents cross-production manipulation).
+ * Validates that a session URL belongs to the configured Strom host.
+ * Prevents SSRF / SAT token exfiltration to an attacker-controlled host.
  */
-function validateSessionUrl(sessionUrl: string, productionId?: string): void {
+function validateSessionUrl(sessionUrl: string): void {
   let parsed: URL;
   try {
     parsed = new URL(sessionUrl);
@@ -18,20 +17,11 @@ function validateSessionUrl(sessionUrl: string, productionId?: string): void {
     throw new Error('Session URL must use http or https');
   }
   const strom = new URL(config.stromUrl);
-  // hostname comparison is already lowercase via the URL parser
   if (parsed.hostname !== strom.hostname) {
     throw new Error('Session URL host does not match configured Strom host');
   }
   if (strom.port && parsed.port && parsed.port !== strom.port) {
     throw new Error('Session URL port does not match configured Strom port');
-  }
-  // Verify the path contains the production-specific endpoint suffix so a session
-  // captured from production A cannot be replayed against production B.
-  if (productionId) {
-    const endpointSuffix = productionId.replace(/^prod-/, '').slice(0, 8);
-    if (!parsed.pathname.includes(endpointSuffix)) {
-      throw new Error('Session URL does not belong to this production');
-    }
   }
 }
 
@@ -117,7 +107,7 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
       if (req.query.session) {
         const decoded = decodeURIComponent(req.query.session);
         try {
-          validateSessionUrl(decoded, req.params.id);
+          validateSessionUrl(decoded);
         } catch (err) {
           return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid session URL' });
         }
@@ -148,7 +138,7 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
       if (req.query.session) {
         const decoded = decodeURIComponent(req.query.session);
         try {
-          validateSessionUrl(decoded, req.params.id);
+          validateSessionUrl(decoded);
         } catch (err) {
           return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid session URL' });
         }

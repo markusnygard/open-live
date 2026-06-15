@@ -158,6 +158,9 @@ export async function activateStromFlow(
       if (pgmFramerate !== undefined) props['pgm_framerate'] = pgmFramerate;
       if (multiviewResolution !== undefined) props['multiview_resolution'] = multiviewResolution;
       if (multiviewFramerate !== undefined) props['multiview_framerate'] = multiviewFramerate;
+      // swap_pvw_pgm (PR #637): non-live property — only applied at pipeline build time.
+      const swapPvwPgm = production.values?.swap_pvw_pgm === true || production.values?.swap_pvw_pgm === 'true';
+      if (swapPvwPgm) props['swap_pvw_pgm'] = true;
       b['properties'] = props;
     }
 
