@@ -377,18 +377,16 @@ export async function activateStromFlow(
   }
 
   // Set num_channels on the audio mixer = number of SRT/EFP/WHIP sources
-  // (test1/test2/html sources don't carry audio in this template).
-  // num_channels is a Strom string enum: valid values are '2', '4', '8', '12', '16', '24', '32'.
-  // Round up to the nearest valid value; never set it below 2.
+  // (test1/test2 sources don't carry audio; html sources do via cefdemux).
+  // num_channels is a UInt — set it to exactly the number of audio-bearing sources.
   if (audioMixerBlock) {
-    const ALLOWED_CHANNEL_COUNTS = [2, 4, 8, 12, 16, 24, 32];
     const srtEfpCount = sortedAssignments.filter((a) => {
       const src = sourceMap.get(a.sourceId) ?? (VIRTUAL_SOURCES[a.sourceId] as SourceDoc | undefined);
-      return src && src.streamType !== 'test1' && src.streamType !== 'test2' && src.streamType !== 'html';
+      return src && src.streamType !== 'test1' && src.streamType !== 'test2';
     }).length;
-    const numChannels = ALLOWED_CHANNEL_COUNTS.find((n) => n >= srtEfpCount) ?? 32;
+    const numChannels = Math.max(1, srtEfpCount);
     const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
-    props['num_channels'] = String(numChannels);
+    props['num_channels'] = numChannels;
     // ch{N}_aux{M}_pre is a build-time topology property — must be set here at flow
     // generation time; attempts to change it on a running pipeline are rejected by Strom.
     // Per-bus setting: aux1_pre, aux2_pre, … (boolean, default true = pre-fader).
@@ -490,17 +488,46 @@ export async function activateStromFlow(
         { from: `${fmtId}:video_out`, to: `${offsetId}:in` },
       );
     } else if (source.streamType === 'html') {
+      const audioChannel = audioChannelIndex++;
       const elemId = `e-html-${padIndex}-${endpointSuffix}`;
+      const demuxId = `e-cefdemux-${padIndex}-${endpointSuffix}`;
       flow.elements.push({
         id: elemId,
         element_type: 'cefsrc',
         properties: { url: source.address },
         position: [COL_ELEM, yPos],
       });
-      // Connect directly to offset block — same pattern as before but via offset.
+      flow.elements.push({
+        id: demuxId,
+        element_type: 'cefdemux',
+        properties: {},
+        position: [COL_INPUT, yPos],
+      });
+      // cefsrc:src → cefdemux:sink; cefdemux splits into video and audio pads.
       // Skipping builtin.videoformat avoids autovideoconvert trying to use GL,
       // which conflicts with cefsrc's X11/Xvfb rendering context on GPU hosts.
-      flow.links.push({ from: `${elemId}:src`, to: `${offsetId}:in` });
+      flow.links.push({ from: `${elemId}:src`, to: `${demuxId}:sink` });
+      flow.links.push({ from: `${demuxId}:video`, to: `${offsetId}:in` });
+      const audioOffsetId = `b-audio-offset-${padIndex}-${endpointSuffix}`;
+      flow.blocks.push({
+        id: audioOffsetId,
+        block_definition_id: 'builtin.time_offset',
+        name: `Offset A${padIndex}`,
+        properties: { offset_ms: 0.0 },
+        position: { x: COL_OFFSET, y: yPos - 80 },
+      });
+      sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
+      flow.links.push({ from: `${demuxId}:audio`, to: `${audioOffsetId}:in` });
+      // Audio to vision mixer and audio mixer both come from the delay block.
+      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      if (audioMixerBlock && audioMixerBlockId) {
+        flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
+        if (source.name) {
+          const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
+          props[`ch${audioChannel + 1}_label`] = source.name;
+          audioMixerBlock['properties'] = props;
+        }
+      }
     } else if (source.streamType === 'whip') {
       const audioChannel = audioChannelIndex++;
       const endpointId = `whip-${padIndex}-${endpointSuffix}`;
@@ -512,19 +539,19 @@ export async function activateStromFlow(
         position: { x: COL_INPUT, y: yPos },
       });
       flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
-      flow.links.push({ from: `${inputId}:audio_out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      const audioOffsetIdWhip = `b-audio-offset-${padIndex}-${endpointSuffix}`;
+      flow.blocks.push({
+        id: audioOffsetIdWhip,
+        block_definition_id: 'builtin.time_offset',
+        name: `Offset A${padIndex}`,
+        properties: { offset_ms: 0.0 },
+        position: { x: COL_OFFSET, y: yPos + 80 },
+      });
+      sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetIdWhip;
+      flow.links.push({ from: `${inputId}:audio_out`, to: `${audioOffsetIdWhip}:in` });
+      flow.links.push({ from: `${audioOffsetIdWhip}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
       if (audioMixerBlock && audioMixerBlockId) {
-        const audioOffsetId = `b-audio-offset-${padIndex}-${endpointSuffix}`;
-        flow.blocks.push({
-          id: audioOffsetId,
-          block_definition_id: 'builtin.time_offset',
-          name: `Offset A${padIndex}`,
-          properties: { offset_ms: 0.0 },
-          position: { x: COL_OFFSET, y: yPos + 80 },
-        });
-        sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
-        flow.links.push({ from: `${inputId}:audio_out`, to: `${audioOffsetId}:in` });
-        flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
+        flow.links.push({ from: `${audioOffsetIdWhip}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
         if (source.name) {
           const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
           props[`ch${audioChannel + 1}_label`] = source.name;
@@ -545,22 +572,20 @@ export async function activateStromFlow(
         position: { x: COL_INPUT, y: yPos },
       });
       flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
-      // Wire audio:
-      //  - Vision mixer: audio_in_N must match the video pad index N so the mixer
-      //    correlates audio with the correct video source (a3 for video_in_3, etc.).
-      //  - Audio mixer: goes via a time_offset block so operators can trim lipsync live.
-      flow.links.push({ from: `${inputId}:audio_out_0`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      // Audio goes via the delay block to both vision mixer and audio mixer so
+      // operators can trim lipsync and vision mixer audio stays in sync.
+      const audioOffsetId = `b-audio-offset-${padIndex}-${endpointSuffix}`;
+      flow.blocks.push({
+        id: audioOffsetId,
+        block_definition_id: 'builtin.time_offset',
+        name: `Offset A${padIndex}`,
+        properties: { offset_ms: 0.0 },
+        position: { x: COL_OFFSET, y: yPos + 80 },
+      });
+      sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
+      flow.links.push({ from: `${inputId}:audio_out_0`, to: `${audioOffsetId}:in` });
+      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
       if (audioMixerBlock && audioMixerBlockId) {
-        const audioOffsetId = `b-audio-offset-${padIndex}-${endpointSuffix}`;
-        flow.blocks.push({
-          id: audioOffsetId,
-          block_definition_id: 'builtin.time_offset',
-          name: `Offset A${padIndex}`,
-          properties: { offset_ms: 0.0 },
-          position: { x: COL_OFFSET, y: yPos + 80 },
-        });
-        sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
-        flow.links.push({ from: `${inputId}:audio_out_0`, to: `${audioOffsetId}:in` });
         flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
         if (source.name) {
           const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;

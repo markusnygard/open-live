@@ -383,11 +383,23 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
 
   // Get a production
   fastify.get<{ Params: { id: string } }>('/api/v1/productions/:id', async (req, reply) => {
+    let doc: ProductionDoc;
     try {
-      const doc = await getDb().get(req.params.id);
-      return reply.send(doc);
+      doc = await getDb().get(req.params.id);
     } catch {
       return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+    }
+    if (doc.status !== 'active' || !doc.stromFlowId || !doc.mixerBlockId) {
+      return reply.send(doc);
+    }
+    try {
+      const stromToken = await getStromToken(config.stromToken);
+      const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
+      const mixerState = await strom.mixer.getState(doc.stromFlowId, doc.mixerBlockId);
+      return reply.send({ ...doc, inputResolutions: mixerState.input_resolutions });
+    } catch (err) {
+      fastify.log.warn({ err }, 'GET /api/v1/productions/:id — failed to fetch input_resolutions from Strom');
+      return reply.send(doc);
     }
   });
 
