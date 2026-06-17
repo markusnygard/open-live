@@ -319,6 +319,7 @@ export function clearAudioState(productionId: string): void {
   mutedElementsByProduction.delete(productionId)
   activeFlowIdByProduction.delete(productionId)
   sourceOffsetsByProduction.delete(productionId)
+  sourceAudioOffsetsByProduction.delete(productionId)
   numAudioChannelsByProduction.delete(productionId)
   channelLevelsByProduction.delete(productionId)
   auxSendByProduction.delete(productionId)
@@ -363,8 +364,8 @@ export function clearFxState(productionId: string): void {
 
 /**
  * Returns the 0-based audio channel index for a given mixerInput, or null if
- * the source has no audio channel (html/test sources are skipped).
- * WHIP sources (including the virtual "Whip" source) carry audio and are included.
+ * the source has no audio channel (test sources are skipped).
+ * WHIP and HTML sources carry audio and are included.
  */
 async function resolveAudioChannelIndex(doc: ProductionDoc, mixerInput: string): Promise<number | null> {
   const sorted = [...doc.sources].sort((a, b) => a.mixerInput.localeCompare(b.mixerInput));
@@ -380,10 +381,10 @@ async function resolveAudioChannelIndex(doc: ProductionDoc, mixerInput: string):
       if (assignment.sourceId === 'Whip') {
         streamType = 'whip';
       } else {
-        continue; // other virtual sources (test1, test2, html) have no audio
+        continue; // other virtual sources (test1, test2) have no audio
       }
     }
-    if (streamType === 'html' || streamType === 'test1' || streamType === 'test2') continue;
+    if (streamType === 'test1' || streamType === 'test2') continue;
     if (assignment.mixerInput === mixerInput) return audioIdx;
     audioIdx++;
   }
@@ -429,10 +430,10 @@ async function applyAudioFollow(
       if (assignment.sourceId === 'Whip') {
         streamType = 'whip';
       } else {
-        continue; // other virtual sources (test1, test2, html) have no audio
+        continue; // other virtual sources (test1, test2) have no audio
       }
     }
-    if (streamType === 'html' || streamType === 'test1' || streamType === 'test2') continue;
+    if (streamType === 'test1' || streamType === 'test2') continue;
 
     const chIdx = ++audioIdx;
     // Only update routing for channels the operator has opted into AFV.
@@ -474,12 +475,6 @@ async function handleMessage(
   }
   const msg: InboundMessage = parseResult.data as unknown as InboundMessage;
 
-  // Enforce project rule: never send mute=true via AUDIO_SET — use fader=0 instead.
-  // (GStreamer GAP flag from mute=true kills meters; VolumeRampManager.apply_mute(false) overrides fader=0)
-  if (msg.type === 'AUDIO_SET' && msg.property === 'mute') {
-    console.warn('[controller] AUDIO_SET mute ignored — use fader=0:', msg.elementId);
-    return;
-  }
 
   const db = getDb();
   let doc: ProductionDoc;

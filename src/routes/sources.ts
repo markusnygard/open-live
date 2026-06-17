@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { getSourcesDb, getDb } from '../db/index.js';
 import type { SourceDoc, ProductionDoc } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
-import { httpUrlOnly, srtUrl } from '../lib/url-validation.js';
+import { graphicUrl, srtUrl } from '../lib/url-validation.js';
 
 const SourceInput = z.object({
   name: z.string().min(1),
@@ -17,7 +17,7 @@ const SourceInput = z.object({
   if (data.streamType === 'html') {
     // html sources use a browser URL — validate for SSRF (file://, javascript:, private IPs, etc.)
     try {
-      httpUrlOnly(data.address);
+      graphicUrl(data.address);
     } catch (err) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['address'], message: err instanceof Error ? err.message : 'Invalid HTML source URL' });
     }
@@ -105,7 +105,7 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       if (effectiveAddress) {
         try {
           if (effectiveStreamType === 'html') {
-            httpUrlOnly(effectiveAddress);
+            graphicUrl(effectiveAddress);
           } else if (effectiveStreamType === 'srt' || effectiveStreamType === 'efp') {
             srtUrl(effectiveAddress);
           }
