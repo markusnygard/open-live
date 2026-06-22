@@ -6,10 +6,12 @@ function requireEnv(name: string): string {
 
 function buildCouchdbUrl(): string {
   const raw = requireEnv('COUCHDB_URL');
+  const url = new URL(raw);
+  // If credentials are already embedded in the URL, leave them as-is.
+  if (url.password) return raw;
   const user = process.env['COUCHDB_USER'];
   const password = process.env['COUCHDB_PASSWORD'];
   if (!password) return raw;
-  const url = new URL(raw);
   if (user) url.username = encodeURIComponent(user);
   url.password = encodeURIComponent(password);
   return url.toString();

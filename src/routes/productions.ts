@@ -556,6 +556,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       // Broadcast group-state reset so all connected clients clear their ephemeral
       // group assignments — these are live-only and must not survive deactivation.
       broadcast(doc._id, { type: 'GRP_STATE_RESET' });
+      broadcast(doc._id, { type: 'PRODUCTION_DEACTIVATED' });
       if (doc.stromFlowId) {
         const stromToken = await getStromToken(config.stromToken).catch((err) => { req.log.error({ err }, "SAT exchange failed — proceeding without auth"); return undefined; });
         const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });

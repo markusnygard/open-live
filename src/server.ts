@@ -39,14 +39,8 @@ export async function buildServer() {
     bodyLimit: 1_048_576,
   });
 
-  await fastify.register(helmet, {
-    contentSecurityPolicy: {
-      directives: { defaultSrc: ["'none'"], connectSrc: ["'self'"] },
-    },
-    crossOriginResourcePolicy: { policy: 'cross-origin' },
-  });
-
-  // CORS — configurable via CORS_ORIGIN env var (default '*' for backward compat)
+  // CORS must be registered before Helmet so its onRequest hook runs first
+  // and Access-Control-Allow-Origin is set before Helmet's hooks fire.
   const corsOrigins = config.corsOrigin === '*'
     ? true
     : config.corsOrigin.split(',').map((o) => o.trim()).filter(Boolean);
@@ -57,6 +51,13 @@ export async function buildServer() {
     credentials: false,
     maxAge: 86400,
     strictPreflight: false,
+  });
+
+  await fastify.register(helmet, {
+    contentSecurityPolicy: {
+      directives: { defaultSrc: ["'none'"], connectSrc: ["'self'"] },
+    },
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
   });
 
   // Rate limiting — 200 requests per minute per IP on API routes
