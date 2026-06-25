@@ -33,6 +33,10 @@ export async function buildServer() {
   const fastify = Fastify({
     logger: {
       level: config.logLevel,
+      redact: {
+        paths: ['*.passphrase', '*.srt_uri', '*.streamid', '*.authorization', '*.token', '*.pat', '*.secret'],
+        censor: '[REDACTED]',
+      },
     },
     disableRequestLogging: true,
     // Prevent memory exhaustion via oversized request bodies (1 MB limit)
