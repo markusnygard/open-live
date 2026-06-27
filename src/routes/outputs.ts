@@ -7,7 +7,7 @@ import { updateProductionDoc } from './productions.js';
 
 const OutputInput = z.object({
   name: z.string().min(1),
-  outputType: z.enum(['mpegtssrt', 'efpsrt', 'whep']),
+  outputType: z.enum(['mpegtssrt', 'efpsrt', 'whep', 'ndi', 'sdi']),
   url: z.string().optional(),
 });
 

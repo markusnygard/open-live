@@ -183,6 +183,8 @@ export async function activateStromFlow(
   const OUTPUT_BLOCK_DEFS = new Set([
     'builtin.mpegtssrt_output',
     'builtin.efpsrt_output',
+    'builtin.ndi_output',
+    'builtin.decklink_output',
   ]);
   const strippedOutputIds = new Set<string>(
     (flow.blocks as Record<string, unknown>[])
@@ -228,7 +230,7 @@ export async function activateStromFlow(
   // Strip ALL inputs wired to video_in_N pads on the mixer (dynamic blocks AND
   // static template placeholders like videotestsrc). We rebuild all video inputs
   // from production.sources, so the template's static elements must be removed.
-  const DYNAMIC_INPUT_BLOCK_DEFS = new Set(['builtin.mpegtssrt_input', 'builtin.efpsrt_input', 'builtin.whip_input']);
+  const DYNAMIC_INPUT_BLOCK_DEFS = new Set(['builtin.mpegtssrt_input', 'builtin.efpsrt_input', 'builtin.whip_input', 'builtin.ndi_input']);
   const strippedVideoInputIds = new Set<string>();
 
   // Collect dynamic block IDs (mpegtssrt_input, whip_input)
@@ -423,6 +425,33 @@ export async function activateStromFlow(
           audioMixerBlock['properties'] = props;
         }
       }
+    } else if (source.streamType === 'ndi') {
+      const audioChannel = audioChannelIndex++;
+      // url_address (direct IP:port) works in bridge/Docker; ndi_name requires mDNS
+      const isUrlAddr = /^\d+\.\d+\.\d+\.\d+:\d+$/.test(source.address || '');
+      const props: Record<string, string> = { mode: 'combined' };
+      if (isUrlAddr) {
+        props['url_address'] = source.address || '';
+      } else {
+        props['ndi_name'] = source.address || '';
+      }
+      flow.blocks.push({
+        id: inputId,
+        block_definition_id: 'builtin.ndi_input',
+        name: source.name || `NDI Input (V${padIndex})`,
+        properties: props,
+        position: { x: COL_INPUT, y: yPos },
+      });
+      flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
+      flow.links.push({ from: `${inputId}:audio_out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      if (audioMixerBlock && audioMixerBlockId) {
+        flow.links.push({ from: `${inputId}:audio_out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
+        if (source.name) {
+          const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
+          props[`ch${audioChannel + 1}_label`] = source.name;
+          audioMixerBlock['properties'] = props;
+        }
+      }
     } else {
       // srt → builtin.mpegtssrt_input, efp → builtin.efpsrt_input
       const audioChannel = audioChannelIndex++;
@@ -569,6 +598,28 @@ export async function activateStromFlow(
         if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in` });
         whepOutputEntries.push({ outputId: outputDoc._id, endpointId });
         outputBlockIndex++;
+      } else if (outputDoc.outputType === 'ndi') {
+        flow.blocks.push({
+          id: blockId,
+          block_definition_id: 'builtin.ndi_output',
+          name: outputDoc.name || 'NDI Output',
+          properties: { ndi_name: outputDoc.name || 'Open Live NDI', mode: 'combined' },
+          position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
+        });
+        outputBlockIndex++;
+        if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
+        if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in` });
+      } else if (outputDoc.outputType === 'sdi') {
+        flow.blocks.push({
+          id: blockId,
+          block_definition_id: 'builtin.decklink_output',
+          name: outputDoc.name || 'SDI Output',
+          properties: { device_number: '0', stream_mode: 'audio_video' },
+          position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
+        });
+        outputBlockIndex++;
+        if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
+        if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in` });
       } else {
         // mpegtssrt or efpsrt — both use the MPEG-TS/SRT output block.
         // Skip if no URL — an empty srt_uri fails at GStreamer READY state.

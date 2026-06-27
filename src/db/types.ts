@@ -31,7 +31,7 @@ export interface AudioElement {
 
 // --------------- Source types ---------------
 
-export type StreamType = 'srt' | 'efp' | 'whip' | 'test1' | 'test2' | 'html';
+export type StreamType = 'srt' | 'efp' | 'whip' | 'test1' | 'test2' | 'html' | 'ndi';
 
 export type SourceStatus = 'active' | 'inactive';
 
@@ -64,7 +64,7 @@ export interface GraphicDoc {
 
 // --------------- Output types ---------------
 
-export type OutputType = 'mpegtssrt' | 'efpsrt' | 'whep';
+export type OutputType = 'mpegtssrt' | 'efpsrt' | 'whep' | 'ndi' | 'sdi';
 
 export interface OutputDoc {
   _id: string;           // "output-{uuid}"
@@ -72,7 +72,7 @@ export interface OutputDoc {
   type: 'output';
   name: string;
   outputType: OutputType;
-  url?: string;          // SRT URI for mpegtssrt/efpsrt; undefined for whep
+  url?: string;          // SRT URI for mpegtssrt/efpsrt; undefined for whep/ndi/sdi
   createdAt: string;
   updatedAt: string;
 }

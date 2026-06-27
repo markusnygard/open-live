@@ -179,7 +179,7 @@ async function runActivationFlow(
             await deactivateStromFlow(stromFlowId, strom).catch(() => {});
             return;
           }
-          if (resp?.endpoint) whepEndpoint = `${config.stromUrl}${resp.endpoint}`;
+          if (resp?.endpoint) whepEndpoint = `${config.stromPublicUrl}${resp.endpoint}`;
         }
 
         if (signal.aborted) {
@@ -223,14 +223,14 @@ async function runActivationFlow(
           whepOutputEntries && whepOutputEntries.length > 0
             ? whepOutputEntries.map(({ outputId, endpointId }) => ({
                 outputId,
-                url: `${config.stromUrl}/whep/${endpointId}`,
+                url: `${config.stromPublicUrl}/whep/${endpointId}`,
               }))
             : undefined;
 
         await updateProductionDoc(productionId, {
           status: 'active',
           whepEndpoint,
-          pgmWhepEndpoint: pgmWhepEndpointId ? `${config.stromUrl}/whep/${pgmWhepEndpointId}` : undefined,
+          pgmWhepEndpoint: pgmWhepEndpointId ? `${config.stromPublicUrl}/whep/${pgmWhepEndpointId}` : undefined,
           whipEndpoints: whipEndpoints.length > 0 ? whipEndpoints : undefined,
           srtOutputUri: undefined,
           whepOutputUrls: whepOutputUrls && whepOutputUrls.length > 0 ? whepOutputUrls : undefined,
@@ -428,7 +428,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
           if (!activeOutputIds.has(assignment.outputId)) continue;
           let outputDoc: OutputDoc | undefined;
           try { outputDoc = await getOutputsDb().get(assignment.outputId); } catch { continue; }
-          if (outputDoc.outputType === 'whep') continue;
+          if (outputDoc.outputType === 'whep' || outputDoc.outputType === 'ndi') continue;
           const conflictProd = otherActiveProds.docs.find((p) =>
             ((p as unknown as ProductionDoc).outputAssignments ?? []).some((a) => a.outputId === assignment.outputId),
           ) as unknown as ProductionDoc | undefined;

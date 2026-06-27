@@ -9,7 +9,9 @@ export const config = {
   couchdbUrl: requireEnv('COUCHDB_URL'),
   couchdbName: process.env['COUCHDB_NAME'] ?? 'open-live',
   corsOrigin: process.env['CORS_ORIGIN'] ?? '*',
-  stromUrl: process.env['STROM_URL'] ?? 'http://localhost:7000',
+  stromUrl: process.env['STROM_URL'] ?? 'http://strom:8080',
+  /** Public URL for browser-visible endpoints (WHEP, etc). Defaults to STROM_URL. */
+  stromPublicUrl: process.env['STROM_PUBLIC_URL'] ?? process.env['STROM_URL'] ?? 'http://localhost:8080',
   stromToken: process.env['STROM_TOKEN'] ?? undefined,
   /** 'osc' = PAT→SAT exchange via token.svc.prod.osaas.io (default for OSC-hosted Strom)
    *  'direct' = API key used as Bearer token directly (self-hosted / non-OSC Strom) */

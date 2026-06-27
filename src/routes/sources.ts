@@ -8,7 +8,7 @@ import { updateProductionDoc } from './productions.js';
 const SourceInput = z.object({
   name: z.string().min(1),
   address: z.string(),
-  streamType: z.enum(['srt', 'efp', 'whip', 'html']),
+  streamType: z.enum(['srt', 'efp', 'whip', 'html', 'ndi']),
   status: z.enum(['active', 'inactive']).default('inactive'),
   liveCamera: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
@@ -17,7 +17,7 @@ const SourceInput = z.object({
 const SourcePatch = z.object({
   name: z.string().min(1).optional(),
   address: z.string().optional(),
-  streamType: z.enum(['srt', 'efp', 'whip', 'html']).optional(),
+  streamType: z.enum(['srt', 'efp', 'whip', 'html', 'ndi']).optional(),
   status: z.enum(['active', 'inactive']).optional(),
   liveCamera: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),

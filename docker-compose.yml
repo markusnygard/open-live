@@ -1,26 +1,71 @@
 services:
-  couchdb:
-    image: couchdb:3
-    environment:
-      COUCHDB_USER: admin
-      COUCHDB_PASSWORD: password
-    ports:
-      - "5984:5984"
+  # 1. STROM (The Engine)
+  strom:
+    image: eyevinntechnology/strom-full:0.5.1
+    container_name: strom-service
+    privileged: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     volumes:
-      - couchdb_data:/opt/couchdb/data
-
-  open-live:
-    build: .
+      - /dev/blackmagic:/dev/blackmagic
+      - /usr/lib/libDeckLinkAPI.so:/lib/libDeckLinkAPI.so:ro
+      - /usr/lib/libDeckLinkPreviewAPI.so:/lib/libDeckLinkPreviewAPI.so:ro
+      - /usr/lib/blackmagic:/lib/blackmagic:ro
     ports:
-      - "3000:3000"
+      - "8080:8080"
+      - "5000-5010:5000-5010/udp"
+    restart: unless-stopped
+
+  # 2. COUCHDB (The Database)
+  couchdb:
+    image: couchdb:3.3
+    container_name: open-live-db
     environment:
-      PORT: "3000"
-      COUCHDB_URL: http://admin:password@couchdb:5984
-      COUCHDB_NAME: open-live
-      CORS_ORIGIN: http://localhost:5173
-      LOG_LEVEL: info
+      - COUCHDB_USER=admin
+      - COUCHDB_PASSWORD=password
+    volumes:
+      - ./db-data:/opt/couchdb/data
+    restart: unless-stopped
+
+  # 3. OPEN-LIVE (Middleware Backend)
+  open-live:
+    image: node:23-slim
+    container_name: open-live-backend
+    working_dir: /app
+    volumes:
+      - ./backend:/app
+    command: >
+      sh -c "corepack enable && 
+      corepack prepare pnpm@latest --activate && 
+      pnpm install && 
+      pnpm run dev"
+    ports:
+      - "8000:8000"
     depends_on:
+      - strom
       - couchdb
 
-volumes:
-  couchdb_data:
+  # 4. OPEN-LIVE-STUDIO (Frontend UI)
+  studio:
+    image: node:23-slim
+    container_name: open-live-studio-ui
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    environment:
+      - VITE_OPEN_LIVE_API_URL=http://192.168.1.11:8000
+    command: >
+      sh -c "corepack enable && 
+      corepack prepare pnpm@latest --activate && 
+      pnpm install && 
+      cp -n .env.example .env || true &&
+      pnpm run dev --host"
+    ports:
+      - "3000:5173"
+    depends_on:
+      - open-live

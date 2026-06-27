@@ -18,6 +18,8 @@ import whipRoutes from './routes/whip.js';
 import productionConfigsRoutes from './routes/production-configs.js';
 import graphicsRoutes from './routes/graphics.js';
 import outputsRoutes from './routes/outputs.js';
+import ndiRoutes from './routes/ndi.js';
+import capabilitiesRoutes from './routes/capabilities.js';
 import controllerWs from './ws/controller.js';
 
 export async function buildServer() {
@@ -73,6 +75,8 @@ export async function buildServer() {
   await fastify.register(productionConfigsRoutes);
   await fastify.register(graphicsRoutes);
   await fastify.register(outputsRoutes);
+  await fastify.register(ndiRoutes);
+  await fastify.register(capabilitiesRoutes);
   await fastify.register(controllerWs);
 
   return fastify;
