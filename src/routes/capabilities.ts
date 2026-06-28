@@ -4,6 +4,7 @@ import { config } from '../config.js';
 interface Capabilities {
   ndi: boolean;
   sdi: boolean;
+  sdiDevices: number;
 }
 
 const capabilities: FastifyPluginAsync = async (app) => {
@@ -14,7 +15,7 @@ const capabilities: FastifyPluginAsync = async (app) => {
   app.get('/api/v1/capabilities', async (_req, reply) => {
     if (cached && Date.now() - cacheTime < TTL) return reply.send(cached);
 
-    const caps: Capabilities = { ndi: false, sdi: false };
+    const caps: Capabilities = { ndi: false, sdi: false, sdiDevices: 0 };
 
     try {
       const headers: Record<string, string> = { 'Accept': 'application/json' };
@@ -29,15 +30,29 @@ const capabilities: FastifyPluginAsync = async (app) => {
         caps.ndi = !!status.ndi_available;
       }
 
-      // Check SDI/DeckLink via blocks API — block exists even without hardware,
-      // but we take it as an indicator that the driver is installed
-      const blocksResp = await fetch(`${config.stromUrl}/api/blocks`, {
+      // Check SDI/DeckLink via device discovery — count actual DeckLink devices
+      const devicesResp = await fetch(`${config.stromUrl}/api/discovery/devices`, {
         headers, signal: AbortSignal.timeout(3000),
       });
-      if (blocksResp.ok) {
-        const data = await blocksResp.json() as Record<string, unknown>;
-        const blocks = (data.blocks ?? []) as Array<{ id: string }>;
-        caps.sdi = blocks.some((b) => b.id === 'builtin.decklink_output');
+      if (devicesResp.ok) {
+        const devices = await devicesResp.json() as Array<Record<string, unknown>>;
+        const decklinkDevices = devices.filter((d) =>
+          typeof d.provider === 'string' && d.provider.toLowerCase().includes('decklink')
+        );
+        caps.sdiDevices = decklinkDevices.length;
+        caps.sdi = caps.sdiDevices > 0;
+      }
+
+      // Fallback: check blocks API if no DeckLink devices found but driver may be installed
+      if (!caps.sdi) {
+        const blocksResp = await fetch(`${config.stromUrl}/api/blocks`, {
+          headers, signal: AbortSignal.timeout(3000),
+        });
+        if (blocksResp.ok) {
+          const data = await blocksResp.json() as Record<string, unknown>;
+          const blocks = (data.blocks ?? []) as Array<{ id: string }>;
+          caps.sdi = blocks.some((b) => b.id === 'builtin.decklink_output');
+        }
       }
 
       cached = caps;

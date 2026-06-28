@@ -230,7 +230,7 @@ export async function activateStromFlow(
   // Strip ALL inputs wired to video_in_N pads on the mixer (dynamic blocks AND
   // static template placeholders like videotestsrc). We rebuild all video inputs
   // from production.sources, so the template's static elements must be removed.
-  const DYNAMIC_INPUT_BLOCK_DEFS = new Set(['builtin.mpegtssrt_input', 'builtin.efpsrt_input', 'builtin.whip_input', 'builtin.ndi_input']);
+  const DYNAMIC_INPUT_BLOCK_DEFS = new Set(['builtin.mpegtssrt_input', 'builtin.efpsrt_input', 'builtin.whip_input', 'builtin.ndi_input', 'builtin.decklink_input']);
   const strippedVideoInputIds = new Set<string>();
 
   // Collect dynamic block IDs (mpegtssrt_input, whip_input)
@@ -452,6 +452,26 @@ export async function activateStromFlow(
           audioMixerBlock['properties'] = props;
         }
       }
+    } else if (source.streamType === 'sdi') {
+      const deviceNumber = source.address || '0';
+      const audioChannel = audioChannelIndex++;
+      flow.blocks.push({
+        id: inputId,
+        block_definition_id: 'builtin.decklink_input',
+        name: source.name || `SDI Input (V${padIndex})`,
+        properties: { device_number: deviceNumber, stream_mode: 'audio_video' },
+        position: { x: COL_INPUT, y: yPos },
+      });
+      flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
+      flow.links.push({ from: `${inputId}:audio_out_0`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      if (audioMixerBlock && audioMixerBlockId) {
+        flow.links.push({ from: `${inputId}:audio_out_0`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
+        if (source.name) {
+          const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
+          props[`ch${audioChannel + 1}_label`] = source.name;
+          audioMixerBlock['properties'] = props;
+        }
+      }
     } else {
       // srt → builtin.mpegtssrt_input, efp → builtin.efpsrt_input
       const audioChannel = audioChannelIndex++;
@@ -610,11 +630,12 @@ export async function activateStromFlow(
         if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
         if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in` });
       } else if (outputDoc.outputType === 'sdi') {
+        const dev = outputDoc.url && /^\d+$/.test(outputDoc.url) ? outputDoc.url : '0';
         flow.blocks.push({
           id: blockId,
           block_definition_id: 'builtin.decklink_output',
           name: outputDoc.name || 'SDI Output',
-          properties: { device_number: '0', stream_mode: 'audio_video' },
+          properties: { device_number: dev, stream_mode: 'audio_video' },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
         outputBlockIndex++;

@@ -31,7 +31,7 @@ export interface AudioElement {
 
 // --------------- Source types ---------------
 
-export type StreamType = 'srt' | 'efp' | 'whip' | 'test1' | 'test2' | 'html' | 'ndi';
+export type StreamType = 'srt' | 'efp' | 'whip' | 'test1' | 'test2' | 'html' | 'ndi' | 'sdi';
 
 export type SourceStatus = 'active' | 'inactive';
 
