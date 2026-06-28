@@ -80,7 +80,7 @@ async function stromTransition(
   const fromIndex = fromMixerInput ? (padToIndex(fromMixerInput) ?? toIndex) : toIndex;
   try {
     const strom = await makeStromClient();
-    await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { input: toIndex });
+    await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { input: toIndex } });
     await strom.mixer.transition(doc.stromFlowId, doc.mixerBlockId, {
       from_input: fromIndex,
       to_input: toIndex,
@@ -313,7 +313,7 @@ async function handleMessage(
         if (inputIndex !== null) {
           try {
             const strom = await makeStromClient();
-            await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { input: inputIndex });
+            await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { input: inputIndex } });
           } catch (err) {
             console.warn('[controller] Strom selectPreview error:', err);
           }

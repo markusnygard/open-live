@@ -194,7 +194,7 @@ export interface TransitionResponse {
 }
 
 export interface SelectPreviewRequest {
-  input: number
+  source: { input: number }
 }
 
 export interface SelectPreviewResponse {
@@ -649,7 +649,7 @@ export class StromClient {
       this.post<TransitionResponse>(`/api/flows/${flowId}/blocks/${blockId}/transition`, body),
 
     selectPreview: (flowId: string, blockId: string, body: SelectPreviewRequest) =>
-      this.post<SelectPreviewResponse>(`/api/flows/${flowId}/blocks/${blockId}/preview`, body),
+      this.put<SelectPreviewResponse>(`/api/flows/${flowId}/blocks/${blockId}/preview`, body),
 
     setBackground: (flowId: string, blockId: string, body: SetBackgroundRequest) =>
       this.post<SetBackgroundResponse>(`/api/flows/${flowId}/blocks/${blockId}/background`, body),
