@@ -41,6 +41,54 @@ function findPgmFeedPad(flow: StromFlowTemplate['flow']): string | null {
   return null;
 }
 
+function insertPreEncoderFormat(
+  flow: StromFlowTemplate['flow'],
+  endpointSuffix: string,
+): void {
+  const mixer = flow.blocks.find((b) =>
+    (b as Record<string, unknown>)['block_definition_id'] === 'builtin.vision_mixer',
+  ) as Record<string, unknown> | undefined;
+  if (!mixer) return;
+  const mixerId = mixer['id'] as string;
+
+  const encoders = [
+    { name: 'Enc PGM',  mixerPad: 'pgm_out',  encPad: 'video_in' },
+    { name: 'Enc MV',   mixerPad: 'multiview_out', encPad: 'video_in' },
+  ];
+
+  for (const enc of encoders) {
+    const encBlock = flow.blocks.find((b) =>
+      (b as Record<string, unknown>)['block_definition_id'] === 'builtin.videoenc' &&
+      (b as Record<string, unknown>)['name'] === enc.name,
+    ) as Record<string, unknown> | undefined;
+    if (!encBlock) continue;
+
+    const encId = encBlock['id'] as string;
+    const fmtId = `b-fmt-${enc.name.toLowerCase().replace(/\s+/g, '-')}-${endpointSuffix}`;
+
+    const existingLink = flow.links.findIndex((link) => {
+      const l = link as Record<string, unknown>;
+      return l['from'] === `${mixerId}:${enc.mixerPad}` && l['to'] === `${encId}:${enc.encPad}`;
+    });
+    if (existingLink === -1) continue;
+
+    flow.links.splice(existingLink, 1);
+
+    flow.blocks.push({
+      id: fmtId,
+      block_definition_id: 'builtin.videoformat',
+      name: `Format ${enc.name}`,
+      properties: { format: 'NV12' },
+      position: { x: 400, y: enc.name === 'Enc PGM' ? 50 : 600 },
+    } as any);
+
+    flow.links.push(
+      { from: `${mixerId}:${enc.mixerPad}`, to: `${fmtId}:video_in` },
+      { from: `${fmtId}:video_out`, to: `${encId}:${enc.encPad}` },
+    );
+  }
+}
+
 export async function activateStromFlow(
   production: ProductionDoc,
   strom: StromClient,
@@ -48,7 +96,8 @@ export async function activateStromFlow(
   outputDocs?: OutputDoc[],
 ): Promise<ActivationResult> {
   if (!production.templateId) {
-    throw new Error('Production has no templateId — cannot activate Strom flow');
+    // Fall back to the default vision mixer template.
+    production.templateId = 'tmpl-default-vision-mixer';
   }
 
   // Load template
@@ -157,6 +206,11 @@ export async function activateStromFlow(
       b['properties'] = props;
     }
   }
+
+  // Insert a videoformat block (NV12) between vision mixer PGM output and
+  // the encoder. This ensures proper pixel format negotiation, especially
+  // for DeckLink sources which output UYVY that some encoders can't handle.
+  insertPreEncoderFormat(flow, endpointSuffix);
 
   // Extract the PGM WHEP endpoint_id (now uniquified to 'pgm-{suffix}') so the
   // activation route can construct the full WHEP URL for the production doc.
