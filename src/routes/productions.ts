@@ -318,7 +318,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get('/api/v1/productions', async (_req, reply) => {
     const db = getDb();
     const result = await db.find({ selector: { type: 'production' } });
-    return reply.send(result.docs);
+    return reply.send(result.docs.map((d: any) => ({ ...d, id: d._id })));
   });
 
   // Create a production
@@ -340,6 +340,16 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     };
     const response = await getDb().insert(doc);
     return reply.status(201).send({ ...doc, _rev: response.rev });
+  });
+
+  // Companion module controller endpoint — returns production with id field
+  fastify.get<{ Params: { id: string } }>('/api/v1/productions/:id/controllers', async (req, reply) => {
+    try {
+      const doc = await getDb().get(req.params.id);
+      return reply.send({ ...doc, id: doc._id });
+    } catch {
+      return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+    }
   });
 
   // Get a production
