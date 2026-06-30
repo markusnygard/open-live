@@ -43,15 +43,22 @@ const capabilities: FastifyPluginAsync = async (app) => {
         caps.sdi = caps.sdiDevices > 0;
       }
 
-      // Fallback: check blocks API if no DeckLink devices found but driver may be installed
+      // Fallback: check blocks API or SDI_DEVICE_COUNT env var
       if (!caps.sdi) {
-        const blocksResp = await fetch(`${config.stromUrl}/api/blocks`, {
-          headers, signal: AbortSignal.timeout(3000),
-        });
-        if (blocksResp.ok) {
-          const data = await blocksResp.json() as Record<string, unknown>;
-          const blocks = (data.blocks ?? []) as Array<{ id: string }>;
-          caps.sdi = blocks.some((b) => b.id === 'builtin.decklink_output');
+        // Try environment variable first (most reliable for DeckLink)
+        const envCount = parseInt(process.env.SDI_DEVICE_COUNT ?? '', 10);
+        if (!isNaN(envCount) && envCount > 0) {
+          caps.sdiDevices = envCount;
+          caps.sdi = true;
+        } else {
+          const blocksResp = await fetch(`${config.stromUrl}/api/blocks`, {
+            headers, signal: AbortSignal.timeout(3000),
+          });
+          if (blocksResp.ok) {
+            const data = await blocksResp.json() as Record<string, unknown>;
+            const blocks = (data.blocks ?? []) as Array<{ id: string }>;
+            caps.sdi = blocks.some((b) => b.id === 'builtin.decklink_output');
+          }
         }
       }
 

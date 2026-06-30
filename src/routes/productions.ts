@@ -286,6 +286,10 @@ async function runActivationFlow(
 
 const ProductionInput = z.object({
   name: z.string().min(1),
+  sources: z.array(z.object({
+    sourceId: z.string().min(1),
+    mixerInput: z.string().min(1),
+  })).optional(),
 });
 
 const ProductionPatch = z.object({
@@ -330,7 +334,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       type: 'production',
       name: body.name,
       status: 'inactive',
-      sources: [],
+      sources: body.sources ?? [],
       pipeline: { stromConfig: null, status: 'stopped' },
       graphics: [],
       macros: [],
