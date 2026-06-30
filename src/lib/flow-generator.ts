@@ -517,9 +517,9 @@ export async function activateStromFlow(
         position: { x: COL_INPUT, y: yPos },
       });
       flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
-      flow.links.push({ from: `${inputId}:audio_out_0`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      flow.links.push({ from: `${inputId}:audio_out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
       if (audioMixerBlock && audioMixerBlockId) {
-        flow.links.push({ from: `${inputId}:audio_out_0`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
+        flow.links.push({ from: `${inputId}:audio_out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
         if (source.name) {
           const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
           props[`ch${audioChannel + 1}_label`] = source.name;

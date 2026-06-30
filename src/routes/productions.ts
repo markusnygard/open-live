@@ -295,7 +295,7 @@ const ProductionInput = z.object({
 const ProductionPatch = z.object({
   name: z.string().min(1).optional(),
   templateId: z.string().nullable().optional(),
-  values: z.record(z.union([z.string(), z.number()])).optional(),
+  values: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
   airTime: z.string().datetime().nullable().optional(),
 });
 
