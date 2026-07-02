@@ -695,6 +695,28 @@ export async function activateStromFlow(
         outputBlockIndex++;
         if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
         if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in` });
+      } else if (outputDoc.outputType === 'recorder') {
+        const container = outputDoc.container || 'mp4';
+        // Audio source: "pgm" = main_out, otherwise a specific mixerInput for pre-fader
+        const audioPad = (!outputDoc.audioSource || outputDoc.audioSource === 'pgm')
+          ? { from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in_0` }
+          : null;
+        flow.blocks.push({
+          id: blockId,
+          block_definition_id: 'builtin.recorder',
+          name: outputDoc.name || 'Recorder',
+          properties: {
+            container,
+            output_dir: outputDoc.outputDir || 'recordings',
+            filename_prefix: outputDoc.name || 'recording',
+            num_video_tracks: 1,
+            num_audio_tracks: 1,
+          },
+          position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
+        });
+        outputBlockIndex++;
+        if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in_0` });
+        if (audioPad) flow.links.push(audioPad);
       } else {
         // mpegtssrt or efpsrt — both use the MPEG-TS/SRT output block.
         // Skip if no URL — an empty srt_uri fails at GStreamer READY state.

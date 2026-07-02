@@ -29,7 +29,8 @@ type InboundMessage =
   | { type: 'AUX_MASTER_SET'; auxBus: number; volume: number; muted: boolean }
   | { type: 'GRP_SEND_SET'; elementId: string; grpBus: number; level: number; enabled: boolean }
   | { type: 'GRP_MASTER_SET'; grpBus: number; volume: number; muted: boolean }
-  | { type: 'SOURCE_OFFSET_SET'; mixerInput: string; offsetMs: number };
+  | { type: 'SOURCE_OFFSET_SET'; mixerInput: string; offsetMs: number }
+  | { type: 'RECORDER_SPLIT'; outputId: string };
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -775,6 +776,27 @@ async function handleMessage(
       }
 
       broadcast(productionId, { type: 'SOURCE_OFFSET_STATE', mixerInput, offsetMs });
+      break;
+    }
+    case 'RECORDER_SPLIT': {
+      if (!doc.stromFlowId) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Production not active' }));
+        break;
+      }
+      try {
+        const strom = await makeStromClient();
+        const { flow } = await strom.flows.get(doc.stromFlowId);
+        // Find the recorder block — look for builtin.recorder
+        const recorderBlock = (flow.blocks ?? []).find((b) => b.block_definition_id === 'builtin.recorder');
+        if (!recorderBlock) {
+          ws.send(JSON.stringify({ type: 'ERROR', error: 'No recorder block found in flow' }));
+          break;
+        }
+        await strom.recorder.splitNow(doc.stromFlowId, recorderBlock.id);
+      } catch (err) {
+        console.warn('[controller] RECORDER_SPLIT error:', err);
+        ws.send(JSON.stringify({ type: 'ERROR', error: String(err) }));
+      }
       break;
     }
     default: {

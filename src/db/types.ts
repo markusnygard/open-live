@@ -64,7 +64,7 @@ export interface GraphicDoc {
 
 // --------------- Output types ---------------
 
-export type OutputType = 'mpegtssrt' | 'efpsrt' | 'whep' | 'ndi' | 'sdi';
+export type OutputType = 'mpegtssrt' | 'efpsrt' | 'whep' | 'ndi' | 'sdi' | 'recorder';
 
 export interface OutputDoc {
   _id: string;           // "output-{uuid}"
@@ -73,6 +73,9 @@ export interface OutputDoc {
   name: string;
   outputType: OutputType;
   url?: string;          // SRT URI for mpegtssrt/efpsrt; undefined for whep/ndi/sdi
+  outputDir?: string;    // recorders: subdirectory within media folder
+  container?: string;    // recorders: mp4, mkv, mpegts (default: mp4)
+  audioSource?: string;  // recorders: "pgm" or mixerInput (e.g. "video_in_0") for pre-fader
   createdAt: string;
   updatedAt: string;
 }

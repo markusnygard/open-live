@@ -7,13 +7,19 @@ import { updateProductionDoc } from './productions.js';
 
 const OutputInput = z.object({
   name: z.string().min(1),
-  outputType: z.enum(['mpegtssrt', 'efpsrt', 'whep', 'ndi', 'sdi']),
+  outputType: z.enum(['mpegtssrt', 'efpsrt', 'whep', 'ndi', 'sdi', 'recorder']),
   url: z.string().optional(),
+  outputDir: z.string().optional(),
+  container: z.string().optional(),
+  audioSource: z.string().optional(),
 });
 
 const OutputPatch = z.object({
   name: z.string().min(1).optional(),
   url: z.string().optional(),
+  outputDir: z.string().optional(),
+  container: z.string().optional(),
+  audioSource: z.string().optional(),
 });
 
 function toApi(doc: OutputDoc) {
@@ -37,6 +43,9 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       name: body.name,
       outputType: body.outputType,
       url: body.url,
+      outputDir: body.outputDir,
+      container: body.container,
+      audioSource: body.audioSource,
       createdAt: now,
       updatedAt: now,
     };
