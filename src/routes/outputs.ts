@@ -30,14 +30,23 @@ function toApi(doc: OutputDoc) {
 }
 
 const outputsRoutes: FastifyPluginAsync = async (fastify) => {
-  // List known recorder output directories for the browse button
-  fastify.get('/api/v1/recorder/dirs', async (_req, reply) => {
+  // List recorder output directories from the filesystem
+  fastify.get('/api/v1/recorder/dirs', async (req, reply) => {
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
     try {
-      const result = await getOutputsDb().find({ selector: { type: 'output', outputType: 'recorder' } });
-      const dirs = [...new Set((result.docs as Array<{ outputDir?: string }>).map((d) => d.outputDir).filter(Boolean))];
-      return reply.send({ dirs: dirs.length > 0 ? dirs : ['recordings'] });
+      const basePath = (req.query as Record<string, string>).path || '';
+      const mediaRoot = '/data';
+      const dirPath = path.resolve(mediaRoot, basePath);
+      // Prevent directory traversal
+      if (!dirPath.startsWith(mediaRoot)) return reply.send({ dirs: [], path: basePath });
+      const entries = await fs.readdir(dirPath, { withFileTypes: true });
+      const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
+      const parent = basePath ? path.dirname(basePath) : null;
+      return reply.send({ dirs, path: basePath, parent: parent === '.' ? '' : parent, root: mediaRoot });
     } catch {
-      return reply.send({ dirs: ['recordings'] });
+      // If directory doesn't exist, return empty
+      return reply.send({ dirs: [], path: basePath || '', root: '/data/media' });
     }
   });
   fastify.get('/api/v1/outputs', async (_req, reply) => {
