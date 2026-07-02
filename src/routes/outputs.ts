@@ -12,6 +12,7 @@ const OutputInput = z.object({
   outputDir: z.string().optional(),
   container: z.string().optional(),
   audioSource: z.string().optional(),
+  videoSource: z.string().optional(),
 });
 
 const OutputPatch = z.object({
@@ -20,6 +21,7 @@ const OutputPatch = z.object({
   outputDir: z.string().optional(),
   container: z.string().optional(),
   audioSource: z.string().optional(),
+  videoSource: z.string().optional(),
 });
 
 function toApi(doc: OutputDoc) {
@@ -46,6 +48,7 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       outputDir: body.outputDir,
       container: body.container,
       audioSource: body.audioSource,
+      videoSource: body.videoSource,
       createdAt: now,
       updatedAt: now,
     };

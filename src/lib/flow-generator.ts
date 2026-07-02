@@ -697,10 +697,22 @@ export async function activateStromFlow(
         if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in` });
       } else if (outputDoc.outputType === 'recorder') {
         const container = outputDoc.container || 'mp4';
-        // Audio source: "pgm" = main_out, otherwise a specific mixerInput for pre-fader
         const audioPad = (!outputDoc.audioSource || outputDoc.audioSource === 'pgm')
           ? { from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in_0` }
           : null;
+        // Determine video source: "pgm" (default) or a specific source ID
+        let videoPad = pgmFeedPad;
+        const vidSrc = outputDoc.videoSource;
+        if (vidSrc && vidSrc !== 'pgm') {
+          // Find this source's index in the sorted assignments
+          const srcIdx = sortedAssignments.findIndex((a) => a.sourceId === vidSrc);
+          if (srcIdx !== -1) {
+            const offsetId = `b-offset-${srcIdx}-${endpointSuffix}`;
+            videoPad = `${offsetId}:out`;
+          } else {
+            console.warn('[flow-generator] recorder videoSource not found:', vidSrc);
+          }
+        }
         flow.blocks.push({
           id: blockId,
           block_definition_id: 'builtin.recorder',
@@ -715,7 +727,7 @@ export async function activateStromFlow(
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
         outputBlockIndex++;
-        if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in_0` });
+        if (videoPad) flow.links.push({ from: videoPad, to: `${blockId}:video_in_0` });
         if (audioPad) flow.links.push(audioPad);
       } else {
         // mpegtssrt or efpsrt — both use the MPEG-TS/SRT output block.

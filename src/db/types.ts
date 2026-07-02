@@ -76,6 +76,7 @@ export interface OutputDoc {
   outputDir?: string;    // recorders: subdirectory within media folder
   container?: string;    // recorders: mp4, mkv, mpegts (default: mp4)
   audioSource?: string;  // recorders: "pgm" or mixerInput (e.g. "video_in_0") for pre-fader
+  videoSource?: string;  // recorders: "pgm" or sourceId to record from
   createdAt: string;
   updatedAt: string;
 }
