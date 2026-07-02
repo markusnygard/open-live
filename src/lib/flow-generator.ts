@@ -703,7 +703,7 @@ export async function activateStromFlow(
         // Determine video source: "pgm" (default) or a specific source ID
         let videoPad = pgmFeedPad;
         const vidSrc = outputDoc.videoSource;
-        if (vidSrc && vidSrc !== 'pgm') {
+        if (vidSrc && vidSrc !== 'pgm' && vidSrc !== 'pgm_clean') {
           // Find this source's index in the sorted assignments
           const srcIdx = sortedAssignments.findIndex((a) => a.sourceId === vidSrc);
           if (srcIdx !== -1) {

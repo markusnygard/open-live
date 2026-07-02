@@ -30,6 +30,16 @@ function toApi(doc: OutputDoc) {
 }
 
 const outputsRoutes: FastifyPluginAsync = async (fastify) => {
+  // List known recorder output directories for the browse button
+  fastify.get('/api/v1/recorder/dirs', async (_req, reply) => {
+    try {
+      const result = await getOutputsDb().find({ selector: { type: 'output', outputType: 'recorder' } });
+      const dirs = [...new Set((result.docs as Array<{ outputDir?: string }>).map((d) => d.outputDir).filter(Boolean))];
+      return reply.send({ dirs: dirs.length > 0 ? dirs : ['recordings'] });
+    } catch {
+      return reply.send({ dirs: ['recordings'] });
+    }
+  });
   fastify.get('/api/v1/outputs', async (_req, reply) => {
     const db = getOutputsDb();
     const result = await db.find({ selector: { type: 'output' } });
