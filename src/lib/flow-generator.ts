@@ -727,8 +727,22 @@ export async function activateStromFlow(
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
         outputBlockIndex++;
-        if (videoPad) flow.links.push({ from: videoPad, to: `${blockId}:video_in_0` });
-        if (audioPad) flow.links.push(audioPad);
+        // Add valve elements to control start/stop per recorder.
+        // Default drop=true means no data reaches the recorder until REC is pressed.
+        const valveVideoId = `e-recvalve-v-${idSlug}-${endpointSuffix}`;
+        const valveAudioId = `e-recvalve-a-${idSlug}-${endpointSuffix}`;
+        flow.elements.push(
+          { id: valveVideoId, element_type: 'valve', properties: { drop: true }, position: [0, 0] },
+          { id: valveAudioId, element_type: 'valve', properties: { drop: true }, position: [0, 0] },
+        );
+        if (videoPad) flow.links.push(
+          { from: videoPad, to: `${valveVideoId}:sink` },
+          { from: `${valveVideoId}:src`, to: `${blockId}:video_in_0` },
+        );
+        if (audioPad) flow.links.push(
+          { from: audioPad.from, to: `${valveAudioId}:sink` },
+          { from: `${valveAudioId}:src`, to: `${blockId}:audio_in_0` },
+        );
       } else {
         // mpegtssrt or efpsrt — both use the MPEG-TS/SRT output block.
         // Skip if no URL — an empty srt_uri fails at GStreamer READY state.
