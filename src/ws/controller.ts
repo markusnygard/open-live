@@ -802,39 +802,13 @@ async function handleMessage(
       break;
     }
     case 'RECORDER_TOGGLE': {
-      if (!doc.stromFlowId) {
-        ws.send(JSON.stringify({ type: 'ERROR', error: 'Production not active' }));
-        break;
+      const key = `${productionId}:${msg.outputId}`;
+      if (msg.active) {
+        recorderActiveSet.add(key);
+      } else {
+        recorderActiveSet.delete(key);
       }
-      try {
-        const strom = await makeStromClient();
-        const idSlug = msg.outputId.replace(/[^a-z0-9]/gi, '').slice(-8);
-        const { flow } = await strom.flows.get(doc.stromFlowId);
-        const endpointSuffix = productionId.replace(/^prod-/, '').slice(0, 8);
-        const valveVideoId = `e-recvalve-v-${idSlug}-${endpointSuffix}`;
-        const valveAudioId = `e-recvalve-a-${idSlug}-${endpointSuffix}`;
-        // Check if the valve elements exist in this flow
-        const hasValve = (flow.elements ?? []).some((e) => e.id === valveVideoId);
-        if (!hasValve) {
-          // Fallback: no valves (old flow) — do nothing
-          ws.send(JSON.stringify({ type: 'ERROR', error: 'Recorder valves not found — reactivate production' }));
-          break;
-        }
-        // Open/close valves: drop=true blocks data, drop=false lets it through
-        await strom.properties.updateElement(doc.stromFlowId, valveVideoId, { property_name: 'drop', value: String(!msg.active) });
-        await strom.properties.updateElement(doc.stromFlowId, valveAudioId, { property_name: 'drop', value: String(!msg.active) });
-        // Track active state
-        const key = `${productionId}:${msg.outputId}`;
-        if (msg.active) {
-          recorderActiveSet.add(key);
-        } else {
-          recorderActiveSet.delete(key);
-        }
-        broadcast(productionId, { type: 'RECORDER_STATE', outputId: msg.outputId, active: msg.active });
-      } catch (err) {
-        console.warn('[controller] RECORDER_TOGGLE error:', err);
-        ws.send(JSON.stringify({ type: 'ERROR', error: String(err) }));
-      }
+      broadcast(productionId, { type: 'RECORDER_STATE', outputId: msg.outputId, active: msg.active });
       break;
     }
     case 'RECORDER_SPLIT': {
