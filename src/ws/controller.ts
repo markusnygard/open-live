@@ -31,7 +31,10 @@ type InboundMessage =
   | { type: 'GRP_MASTER_SET'; grpBus: number; volume: number; muted: boolean }
   | { type: 'SOURCE_OFFSET_SET'; mixerInput: string; offsetMs: number }
   | { type: 'RECORDER_SPLIT'; outputId: string }
-  | { type: 'RECORDER_TOGGLE'; outputId: string; active: boolean };
+  | { type: 'RECORDER_TOGGLE'; outputId: string; active: boolean }
+  | { type: 'MEDIAPLAYER_CONTROL'; sourceId: string; action: 'play' | 'pause' | 'stop' | 'next' | 'previous' }
+  | { type: 'MEDIAPLAYER_SEEK'; sourceId: string; positionMs: number }
+  | { type: 'MEDIAPLAYER_GOTO'; sourceId: string; index: number };
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -832,6 +835,49 @@ async function handleMessage(
       } catch (err) {
         console.warn('[controller] RECORDER_SPLIT error:', err);
         ws.send(JSON.stringify({ type: 'ERROR', error: String(err) }));
+      }
+      break;
+    }
+    case 'MEDIAPLAYER_CONTROL': {
+      if (!doc.stromFlowId) break;
+      try {
+        const strom = await makeStromClient();
+        const { flow } = await strom.flows.get(doc.stromFlowId);
+        // Find the media player block for this source
+        const srcSlug = msg.sourceId.replace(/[^a-z0-9]/gi, '').slice(-8);
+        const playerBlock = (flow.blocks ?? []).find((b) => b.block_definition_id === 'builtin.media_player' && b.id.includes(srcSlug));
+        if (!playerBlock) break;
+        await strom.player.control(doc.stromFlowId, playerBlock.id, { action: msg.action });
+      } catch (err) {
+        console.warn('[controller] MEDIAPLAYER_CONTROL error:', err);
+      }
+      break;
+    }
+    case 'MEDIAPLAYER_SEEK': {
+      if (!doc.stromFlowId) break;
+      try {
+        const strom = await makeStromClient();
+        const { flow } = await strom.flows.get(doc.stromFlowId);
+        const srcSlug = msg.sourceId.replace(/[^a-z0-9]/gi, '').slice(-8);
+        const playerBlock = (flow.blocks ?? []).find((b) => b.block_definition_id === 'builtin.media_player' && b.id.includes(srcSlug));
+        if (!playerBlock) break;
+        await strom.player.seek(doc.stromFlowId, playerBlock.id, { position_ns: msg.positionMs * 1_000_000 });
+      } catch (err) {
+        console.warn('[controller] MEDIAPLAYER_SEEK error:', err);
+      }
+      break;
+    }
+    case 'MEDIAPLAYER_GOTO': {
+      if (!doc.stromFlowId) break;
+      try {
+        const strom = await makeStromClient();
+        const { flow } = await strom.flows.get(doc.stromFlowId);
+        const srcSlug = msg.sourceId.replace(/[^a-z0-9]/gi, '').slice(-8);
+        const playerBlock = (flow.blocks ?? []).find((b) => b.block_definition_id === 'builtin.media_player' && b.id.includes(srcSlug));
+        if (!playerBlock) break;
+        await strom.player.goto(doc.stromFlowId, playerBlock.id, { index: msg.index });
+      } catch (err) {
+        console.warn('[controller] MEDIAPLAYER_GOTO error:', err);
       }
       break;
     }

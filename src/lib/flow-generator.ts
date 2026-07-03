@@ -284,7 +284,7 @@ export async function activateStromFlow(
   // Strip ALL inputs wired to video_in_N pads on the mixer (dynamic blocks AND
   // static template placeholders like videotestsrc). We rebuild all video inputs
   // from production.sources, so the template's static elements must be removed.
-  const DYNAMIC_INPUT_BLOCK_DEFS = new Set(['builtin.mpegtssrt_input', 'builtin.efpsrt_input', 'builtin.whip_input', 'builtin.ndi_input', 'builtin.decklink_input']);
+  const DYNAMIC_INPUT_BLOCK_DEFS = new Set(['builtin.mpegtssrt_input', 'builtin.efpsrt_input', 'builtin.whip_input', 'builtin.ndi_input', 'builtin.decklink_input', 'builtin.media_player']);
   const strippedVideoInputIds = new Set<string>();
 
   // Collect dynamic block IDs (mpegtssrt_input, whip_input)
@@ -514,6 +514,25 @@ export async function activateStromFlow(
         block_definition_id: 'builtin.decklink_input',
         name: source.name || `SDI Input (V${padIndex})`,
         properties: { device_number: deviceNumber, stream_mode: 'audio_video' },
+        position: { x: COL_INPUT, y: yPos },
+      });
+      flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
+      flow.links.push({ from: `${inputId}:audio_out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      if (audioMixerBlock && audioMixerBlockId) {
+        flow.links.push({ from: `${inputId}:audio_out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
+        if (source.name) {
+          const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
+          props[`ch${audioChannel + 1}_label`] = source.name;
+          audioMixerBlock['properties'] = props;
+        }
+      }
+    } else if (source.streamType === 'mediaplayer') {
+      const audioChannel = audioChannelIndex++;
+      flow.blocks.push({
+        id: inputId,
+        block_definition_id: 'builtin.media_player',
+        name: source.name || `Media Player (V${padIndex})`,
+        properties: { decode: 'true', sync: 'true', loop_playlist: 'false' },
         position: { x: COL_INPUT, y: yPos },
       });
       flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
