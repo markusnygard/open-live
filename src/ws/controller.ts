@@ -826,7 +826,7 @@ async function handleMessage(
         // Track active state
         const key = `${productionId}:${msg.outputId}`;
         if (msg.active) {
-          recorderActiveSet.set(key, true);
+          recorderActiveSet.add(key);
         } else {
           recorderActiveSet.delete(key);
         }
