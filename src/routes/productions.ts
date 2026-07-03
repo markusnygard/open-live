@@ -109,6 +109,16 @@ async function runActivationFlow(
     audioMixerBlockId = activation.audioMixerBlockId ?? undefined;
     whepOutputEntries = activation.whepOutputEntries;
     pgmWhepEndpointId = activation.pgmWhepEndpointId;
+
+    // Set all recorders to stopped (write to /dev/null) initially — they start manually via REC button
+    if (signal.aborted) { await deactivateStromFlow(stromFlowId, strom).catch(() => undefined); return; }
+    try {
+      const { flow } = await strom.flows.get(stromFlowId);
+      const recorderBlocks = (flow.blocks ?? []).filter((b) => b.block_definition_id === 'builtin.recorder');
+      for (const rb of recorderBlocks) {
+        await strom.properties.updateElement(stromFlowId, `${rb.id}:splitmuxsink`, { property_name: 'location', value: '/dev/null' }).catch(() => {});
+      }
+    } catch { /* best effort — recorders will start recording if we can't stop them */ }
     // mixerBlockId/audioMixerBlockId come directly from the flow generator — they are the
     // randomised IDs actually used in the live Strom flow, not the static template IDs.
 
