@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
-import { getDb, getOutputsDb, getTemplatesDb } from '../db/index.js';
+import { getDb, getOutputsDb, getSourcesDb, getTemplatesDb } from '../db/index.js';
 import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc } from '../db/types.js';
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
@@ -112,7 +112,27 @@ async function runActivationFlow(
     // mixerBlockId/audioMixerBlockId come directly from the flow generator — they are the
     // randomised IDs actually used in the live Strom flow, not the static template IDs.
 
-    // Step 2: Persist stromFlowId + mixerBlockId + audioMixerBlockId
+    // Step 2: Set media player playlists on their blocks
+    if (signal.aborted) { await deactivateStromFlow(stromFlowId, strom).catch(() => undefined); return; }
+    try {
+      const { flow } = await strom.flows.get(stromFlowId);
+      const playerBlocks = (flow.blocks ?? []).filter((b) => b.block_definition_id === 'builtin.media_player');
+      for (const pb of playerBlocks) {
+        const srcSlug = pb.id.replace(/[^a-z0-9]/gi, '').slice(-8);
+        // Find the source with this slug in its assignment
+        const assignment = doc.sources?.find((s) => s.sourceId.replace(/[^a-z0-9]/gi, '').slice(-8) === srcSlug);
+        if (!assignment) continue;
+        const srcDoc = await getSourcesDb().get(assignment.sourceId).catch(() => null) as { playlist?: string[] } | null;
+        if (srcDoc?.playlist && srcDoc.playlist.length > 0) {
+          const mediaRoot = '/data/media';
+          const basePath = srcDoc.address?.replace(/^~\//, '/root/').replace(/^~\//, '') || '';
+          const files = srcDoc.playlist.map((f) => `file://${mediaRoot}/${basePath}/${f}`);
+          await strom.player.setPlaylist(stromFlowId, pb.id, { files }).catch(() => {});
+        }
+      }
+    } catch { /* best effort */ }
+
+    // Step 3: Persist stromFlowId + mixerBlockId + audioMixerBlockId
     if (signal.aborted) {
       await deactivateStromFlow(stromFlowId, strom).catch(() => undefined);
       return;

@@ -36,14 +36,20 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       const fs = await import('node:fs/promises');
       const nodePath = await import('node:path');
       const basePath = (req.query as Record<string, string>).path || '';
+      const showFiles = (req.query as Record<string, string>).files === '1';
       const resolved = nodePath.resolve('/', basePath);
-      if (!resolved.startsWith('/')) return reply.send({ dirs: [], path: basePath, parent: null, root: '/' });
+      if (!resolved.startsWith('/')) return reply.send({ dirs: [], files: [], path: basePath, parent: null, root: '/' });
       const entries = await fs.readdir(resolved, { withFileTypes: true });
       const dirs = entries.filter((e) => e.isDirectory() || e.isSymbolicLink()).map((e) => e.name).sort();
       const parent = basePath ? nodePath.dirname(basePath) : null;
-      return reply.send({ dirs, path: basePath, parent: parent === '.' ? '' : parent, root: '/' });
+      const result: any = { dirs, path: basePath, parent: parent === '.' ? '' : parent, root: '/' };
+      if (showFiles) {
+        const mediaExts = new Set(['.mp4','.mkv','.webm','.mov','.avi','.mxf','.mp3','.wav','.flac','.aac','.ogg','.png','.jpg','.jpeg','.webp','.gif','.bmp']);
+        result.files = entries.filter((e) => e.isFile() && mediaExts.has(nodePath.extname(e.name).toLowerCase())).map((e) => e.name).sort();
+      }
+      return reply.send(result);
     } catch (err: any) {
-      return reply.send({ dirs: [], path: (req.query as any)?.path || '', parent: null, root: '/', error: err?.code === 'EACCES' ? 'Permission denied' : undefined });
+      return reply.send({ dirs: [], files: [], path: (req.query as any)?.path || '', parent: null, root: '/', error: err?.code === 'EACCES' ? 'Permission denied' : undefined });
     }
   });
   fastify.get('/api/v1/outputs', async (_req, reply) => {

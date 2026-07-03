@@ -12,12 +12,14 @@ const SourceInput = z.object({
   status: z.enum(['active', 'inactive']).default('inactive'),
   liveCamera: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
+  playlist: z.array(z.string()).optional(),
 });
 
 const SourcePatch = z.object({
   name: z.string().min(1).optional(),
   address: z.string().optional(),
   streamType: z.enum(['srt', 'efp', 'whip', 'html', 'ndi', 'sdi', 'mediaplayer']).optional(),
+  playlist: z.array(z.string()).optional(),
   status: z.enum(['active', 'inactive']).optional(),
   liveCamera: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
@@ -49,6 +51,7 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       status: body.status,
       liveCamera: body.liveCamera,
       latency: body.latency,
+      playlist: body.playlist,
       createdAt: now,
       updatedAt: now,
     };

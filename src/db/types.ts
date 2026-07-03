@@ -46,6 +46,8 @@ export interface SourceDoc {
   liveCamera?: boolean;
   /** SRT receiver buffer latency in ms. Only applies to srt/efp stream types. Default 125. */
   latency?: number;
+  /** Media player playlist — array of file URIs */
+  playlist?: string[];
   createdAt: string;
   updatedAt: string;
 }
