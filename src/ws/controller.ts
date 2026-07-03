@@ -821,8 +821,8 @@ async function handleMessage(
           break;
         }
         // Open/close valves: drop=true blocks data, drop=false lets it through
-        await strom.properties.updateElement(doc.stromFlowId, valveVideoId, { property_name: 'drop', value: !msg.active });
-        await strom.properties.updateElement(doc.stromFlowId, valveAudioId, { property_name: 'drop', value: !msg.active });
+        await strom.properties.updateElement(doc.stromFlowId, valveVideoId, { property_name: 'drop', value: String(!msg.active) });
+        await strom.properties.updateElement(doc.stromFlowId, valveAudioId, { property_name: 'drop', value: String(!msg.active) });
         // Track active state
         const key = `${productionId}:${msg.outputId}`;
         if (msg.active) {
