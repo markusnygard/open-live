@@ -30,7 +30,8 @@ type InboundMessage =
   | { type: 'GRP_SEND_SET'; elementId: string; grpBus: number; level: number; enabled: boolean }
   | { type: 'GRP_MASTER_SET'; grpBus: number; volume: number; muted: boolean }
   | { type: 'SOURCE_OFFSET_SET'; mixerInput: string; offsetMs: number }
-  | { type: 'RECORDER_SPLIT'; outputId: string };
+  | { type: 'RECORDER_SPLIT'; outputId: string }
+  | { type: 'RECORDER_TOGGLE'; outputId: string; active: boolean };
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -786,15 +787,50 @@ async function handleMessage(
       try {
         const strom = await makeStromClient();
         const { flow } = await strom.flows.get(doc.stromFlowId);
-        // Find the recorder block — look for builtin.recorder
-        const recorderBlock = (flow.blocks ?? []).find((b) => b.block_definition_id === 'builtin.recorder');
+        const idSlug = msg.outputId.replace(/[^a-z0-9]/gi, '').slice(-8);
+        const recorderBlock = (flow.blocks ?? []).find((b) => b.block_definition_id === 'builtin.recorder' && b.id.includes(idSlug));
         if (!recorderBlock) {
-          ws.send(JSON.stringify({ type: 'ERROR', error: 'No recorder block found in flow' }));
+          ws.send(JSON.stringify({ type: 'ERROR', error: 'Recorder block not found for output' }));
           break;
         }
         await strom.recorder.splitNow(doc.stromFlowId, recorderBlock.id);
       } catch (err) {
         console.warn('[controller] RECORDER_SPLIT error:', err);
+        ws.send(JSON.stringify({ type: 'ERROR', error: String(err) }));
+      }
+      break;
+    }
+    case 'RECORDER_TOGGLE': {
+      if (!doc.stromFlowId) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Production not active' }));
+        break;
+      }
+      try {
+        const strom = await makeStromClient();
+        const { flow } = await strom.flows.get(doc.stromFlowId);
+        // Find the specific recorder block by matching the output ID slug
+        const idSlug = msg.outputId.replace(/[^a-z0-9]/gi, '').slice(-8);
+        const recorderBlock = (flow.blocks ?? []).find((b) => b.block_definition_id === 'builtin.recorder' && b.id.includes(idSlug));
+        if (!recorderBlock) {
+          ws.send(JSON.stringify({ type: 'ERROR', error: 'Recorder block not found for output' }));
+          break;
+        }
+        const outputDb = await import('../db/index.js').then((m) => m.getOutputsDb());
+        const outputDoc = await outputDb.get(msg.outputId) as { outputDir?: string; name?: string; container?: string };
+        const dir = outputDoc.outputDir || 'recordings';
+        const name = outputDoc.name || 'recording';
+        const ext = outputDoc.container || 'mp4';
+        const now = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
+        const location = `/data/media/${dir}/${name}_${now}_%05d.${ext}`;
+        const elementId = `${recorderBlock.id}:splitmuxsink`;
+        if (msg.active) {
+          await strom.properties.updateElement(doc.stromFlowId, elementId, { property_name: 'location', value: location });
+        } else {
+          await strom.properties.updateElement(doc.stromFlowId, elementId, { property_name: 'location', value: '/dev/null' });
+        }
+        await strom.recorder.splitNow(doc.stromFlowId, recorderBlock.id);
+      } catch (err) {
+        console.warn('[controller] RECORDER_TOGGLE error:', err);
         ws.send(JSON.stringify({ type: 'ERROR', error: String(err) }));
       }
       break;
