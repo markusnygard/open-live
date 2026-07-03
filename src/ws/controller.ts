@@ -123,6 +123,7 @@ const afvChannelsByProduction = new Map<string, Set<string>>()
  * commingled with AFV routing).
  */
 const mutedElementsByProduction = new Map<string, Set<string>>()
+const recorderActiveSet = new Set<string>()
 
 /**
  * Last-seen stromFlowId per production.
@@ -801,36 +802,38 @@ async function handleMessage(
       break;
     }
     case 'RECORDER_TOGGLE': {
+      // Store active state in registry — splitmuxsink location can't change at runtime.
+      // Recorders always write files while the flow runs; toggle controls whether
+      // SPLIT creates meaningful segments.
+      const key = `${productionId}:${msg.outputId}`;
+      if (msg.active) {
+        recorderActiveSet.set(key, true);
+      } else {
+        recorderActiveSet.delete(key);
+      }
+      broadcast(productionId, { type: 'RECORDER_STATE', outputId: msg.outputId, active: msg.active });
+      break;
+    }
+    case 'RECORDER_SPLIT': {
       if (!doc.stromFlowId) {
         ws.send(JSON.stringify({ type: 'ERROR', error: 'Production not active' }));
         break;
       }
+      // Only split if the recorder is active
+      const activeKey = `${productionId}:${msg.outputId}`;
+      if (!recorderActiveSet.has(activeKey)) break;
       try {
         const strom = await makeStromClient();
         const { flow } = await strom.flows.get(doc.stromFlowId);
-        // Find the specific recorder block by matching the output ID slug
         const idSlug = msg.outputId.replace(/[^a-z0-9]/gi, '').slice(-8);
         const recorderBlock = (flow.blocks ?? []).find((b) => b.block_definition_id === 'builtin.recorder' && b.id.includes(idSlug));
         if (!recorderBlock) {
           ws.send(JSON.stringify({ type: 'ERROR', error: 'Recorder block not found for output' }));
           break;
         }
-        const outputDb = await import('../db/index.js').then((m) => m.getOutputsDb());
-        const outputDoc = await outputDb.get(msg.outputId) as { outputDir?: string; name?: string; container?: string };
-        const dir = outputDoc.outputDir || 'recordings';
-        const name = outputDoc.name || 'recording';
-        const ext = outputDoc.container || 'mp4';
-        const now = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
-        const location = `/data/media/${dir}/${name}_${now}_%05d.${ext}`;
-        const elementId = `${recorderBlock.id}:splitmuxsink`;
-        if (msg.active) {
-          await strom.properties.updateElement(doc.stromFlowId, elementId, { property_name: 'location', value: location });
-        } else {
-          await strom.properties.updateElement(doc.stromFlowId, elementId, { property_name: 'location', value: '/dev/null' });
-        }
         await strom.recorder.splitNow(doc.stromFlowId, recorderBlock.id);
       } catch (err) {
-        console.warn('[controller] RECORDER_TOGGLE error:', err);
+        console.warn('[controller] RECORDER_SPLIT error:', err);
         ws.send(JSON.stringify({ type: 'ERROR', error: String(err) }));
       }
       break;
