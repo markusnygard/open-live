@@ -529,32 +529,14 @@ export async function activateStromFlow(
       }
     } else if (source.streamType === 'mediaplayer') {
       const audioChannel = audioChannelIndex++;
-      const fmtId = `b-fmt-${padIndex}-${endpointSuffix}`;
-      const gpuConvId = `e-gpuconv-${padIndex}-${endpointSuffix}`;
       flow.blocks.push({
         id: inputId,
         block_definition_id: 'builtin.media_player',
         name: source.name || `Media Player (V${padIndex})`,
-        properties: { decode: true, sync: true, loop_playlist: false },
+        properties: { decode: true, sync: true, loop_playlist: true },
         position: { x: COL_INPUT, y: yPos },
       });
-      flow.elements.push({
-        id: gpuConvId,
-        element_type: 'videoconvert',
-        position: [COL_INPUT - 75, yPos],
-      });
-      flow.blocks.push({
-        id: fmtId,
-        block_definition_id: 'builtin.videoformat',
-        name: `Format V${padIndex}`,
-        properties: { resolution: pgmResolution },
-        position: { x: -125, y: yPos },
-      });
-      flow.links.push(
-        { from: `${inputId}:video_out`, to: `${gpuConvId}:sink` },
-        { from: `${gpuConvId}:src`, to: `${fmtId}:video_in` },
-        { from: `${fmtId}:video_out`, to: `${offsetId}:in` },
-      );
+      flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
       flow.links.push({ from: `${inputId}:audio_out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${inputId}:audio_out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });

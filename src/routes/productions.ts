@@ -266,6 +266,17 @@ async function runActivationFlow(
           ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
         });
 
+        // Stop media players after activation — they auto-start when the flow
+        // reaches PLAYING, but the operator should start playback manually.
+        const { flow: activeFlow } = await strom.flows.get(stromFlowId);
+        const playerBlocks = (activeFlow.blocks ?? [])
+          .filter((b: { block_definition_id?: string }) => b.block_definition_id === 'builtin.media_player');
+        for (const pb of playerBlocks) {
+          try {
+            await strom.player.control(stromFlowId, pb.id as string, { action: 'stop' });
+          } catch { /* best-effort */ }
+        }
+
         log.info({ productionId, stromFlowId, whepEndpoint, initialTally, audioMixerBlockId }, 'Production activated — flow playing');
         return;
       }
