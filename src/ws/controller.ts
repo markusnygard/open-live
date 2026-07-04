@@ -860,37 +860,20 @@ async function handleMessage(
         const { flow } = await strom.flows.get(doc.stromFlowId);
         const playerBlock = findMediaPlayerBlock(flow, msg.sourceId, productionId);
         if (!playerBlock) break;
-        await strom.player.control(doc.stromFlowId, playerBlock.id, { action: msg.action });
+        await strom.player.control(doc.stromFlowId, playerBlock.id, { action: msg.action }).catch((e: unknown) => {
+          // Strom returns 200 with empty body (non-JSON) — that's success
+          if (String(e).includes('non-JSON response')) return;
+          throw e;
+        });
 
-        // Zero the audio meter when stopping or pausing — Strom's audio mixer
-        // holds the last peak value when audio data stops flowing.
+        // Zero the audio meter when stopping or pausing
         if (msg.action === 'stop' || msg.action === 'pause') {
-          const padMatch = playerBlock.id.match(/b-input-(\d+)-/);
-          if (padMatch) {
-            const padIndex = parseInt(padMatch[1], 10);
-            // Find this source's assignment to determine audio channel
-            const assignment = doc.sources?.find((s) => s.mixerInput === `video_in_${padIndex}`);
-            if (assignment) {
-              // Audio channels in the mixer are 0-based, sequential.
-              // Count how many sources before this one have audio.
-              const sortedSources = [...doc.sources].sort((a, b) => a.mixerInput.localeCompare(b.mixerInput));
-              let audioChIdx = 0;
-              for (const s of sortedSources) {
-                if (s.sourceId === assignment.sourceId) break;
-                // Skip test patterns — they don't have audio
-                const src = await db.get(s.sourceId).catch(() => null) as { streamType?: string } | null;
-                if (src && src.streamType !== 'test1' && src.streamType !== 'test2' && src.streamType !== 'html') {
-                  audioChIdx++;
-                }
-              }
-              broadcast(productionId, {
-                type: 'METER_DATA',
-                elementId: `ch${audioChIdx}`,
-                peak: [-100, -100],
-                rms: [0, 0],
-              });
-            }
-          }
+          broadcast(productionId, {
+            type: 'METER_DATA',
+            elementId: 'ch0',
+            peak: [-100, -100],
+            rms: [0, 0],
+          });
         }
       } catch (err) {
         console.warn('[controller] MEDIAPLAYER_CONTROL error:', err);
@@ -904,7 +887,10 @@ async function handleMessage(
         const { flow } = await strom.flows.get(doc.stromFlowId);
         const playerBlock = findMediaPlayerBlock(flow, msg.sourceId, productionId);
         if (!playerBlock) break;
-        await strom.player.seek(doc.stromFlowId, playerBlock.id, { position_ns: msg.positionMs * 1_000_000 });
+        await strom.player.seek(doc.stromFlowId, playerBlock.id, { position_ns: msg.positionMs * 1_000_000 }).catch((e: unknown) => {
+          if (String(e).includes('non-JSON response')) return;
+          throw e;
+        });
       } catch (err) {
         console.warn('[controller] MEDIAPLAYER_SEEK error:', err);
       }
@@ -917,7 +903,10 @@ async function handleMessage(
         const { flow } = await strom.flows.get(doc.stromFlowId);
         const playerBlock = findMediaPlayerBlock(flow, msg.sourceId, productionId);
         if (!playerBlock) break;
-        await strom.player.goto(doc.stromFlowId, playerBlock.id, { index: msg.index });
+        await strom.player.goto(doc.stromFlowId, playerBlock.id, { index: msg.index }).catch((e: unknown) => {
+          if (String(e).includes('non-JSON response')) return;
+          throw e;
+        });
       } catch (err) {
         console.warn('[controller] MEDIAPLAYER_GOTO error:', err);
       }
@@ -934,7 +923,7 @@ async function handleMessage(
         const playerBlock = findMediaPlayerBlock(flow, msg.sourceId, productionId);
         if (!playerBlock) break;
         // Build file paths from source's address + playlist
-        const srcDoc = await db.get(msg.sourceId).catch(() => null) as { address?: string } | null;
+        const srcDoc = await getSourcesDb().get(msg.sourceId).catch(() => null) as { address?: string } | null;
         const mediaRoot = '/host/media';
         const basePath = (srcDoc?.address || '').replace(/^~\/media\//, '').replace(/^~\//, '').replace(/^\//, '').replace(/^media\//, '');
         const prefix = basePath ? `${mediaRoot}/${basePath}` : mediaRoot;
