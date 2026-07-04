@@ -858,10 +858,40 @@ async function handleMessage(
       try {
         const strom = await makeStromClient();
         const { flow } = await strom.flows.get(doc.stromFlowId);
-        // Find the media player block for this source
         const playerBlock = findMediaPlayerBlock(flow, msg.sourceId, productionId);
         if (!playerBlock) break;
         await strom.player.control(doc.stromFlowId, playerBlock.id, { action: msg.action });
+
+        // Zero the audio meter when stopping or pausing — Strom's audio mixer
+        // holds the last peak value when audio data stops flowing.
+        if (msg.action === 'stop' || msg.action === 'pause') {
+          const padMatch = playerBlock.id.match(/b-input-(\d+)-/);
+          if (padMatch) {
+            const padIndex = parseInt(padMatch[1], 10);
+            // Find this source's assignment to determine audio channel
+            const assignment = doc.sources?.find((s) => s.mixerInput === `video_in_${padIndex}`);
+            if (assignment) {
+              // Audio channels in the mixer are 0-based, sequential.
+              // Count how many sources before this one have audio.
+              const sortedSources = [...doc.sources].sort((a, b) => a.mixerInput.localeCompare(b.mixerInput));
+              let audioChIdx = 0;
+              for (const s of sortedSources) {
+                if (s.sourceId === assignment.sourceId) break;
+                // Skip test patterns — they don't have audio
+                const src = await db.get(s.sourceId).catch(() => null) as { streamType?: string } | null;
+                if (src && src.streamType !== 'test1' && src.streamType !== 'test2' && src.streamType !== 'html') {
+                  audioChIdx++;
+                }
+              }
+              broadcast(productionId, {
+                type: 'METER_DATA',
+                elementId: `ch${audioChIdx}`,
+                peak: [-100, -100],
+                rms: [0, 0],
+              });
+            }
+          }
+        }
       } catch (err) {
         console.warn('[controller] MEDIAPLAYER_CONTROL error:', err);
       }

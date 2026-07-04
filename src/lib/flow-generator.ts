@@ -533,7 +533,7 @@ export async function activateStromFlow(
         id: inputId,
         block_definition_id: 'builtin.media_player',
         name: source.name || `Media Player (V${padIndex})`,
-        properties: { decode: true, sync: true, loop_playlist: true },
+        properties: { decode: true, sync: true, loop_playlist: false },
         position: { x: COL_INPUT, y: yPos },
       });
       flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
