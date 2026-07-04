@@ -127,10 +127,16 @@ async function runActivationFlow(
         if (!assignment) continue;
         const srcDoc = await getSourcesDb().get(assignment.sourceId).catch(() => null) as { playlist?: string[] } | null;
         if (srcDoc?.playlist && srcDoc.playlist.length > 0) {
-      const mediaRoot = '/host/media';
-      const basePath = (srcDoc.address || '').replace(/^~\/media\//, '').replace(/^~\//, '').replace(/^\//, '').replace(/^media\//, '');
-      const prefix = basePath ? `${mediaRoot}/${basePath}` : mediaRoot;
-      const files = srcDoc.playlist.map((f) => `file://${prefix}/${f}`);
+          const mediaRoot = '/host/media';
+          const basePath = (srcDoc.address || '').replace(/^~\/media\//, '').replace(/^~\//, '').replace(/^\//, '').replace(/^media\//, '');
+          const prefix = basePath ? `${mediaRoot}/${basePath}` : mediaRoot;
+          const files = srcDoc.playlist.map((f) => `file://${prefix}/${f}`);
+          console.log('[playlist] Setting playlist:', files.length, 'files, first:', files[0]?.substring(0, 80));
+          await strom.player.setPlaylist(stromFlowId, pb.id, { files }).catch((e) => {
+            // Strom returns 200 with empty body (non-JSON) — that's success
+            if (String(e).includes('non-JSON response')) return;
+            console.log('[playlist] setPlaylist error:', String(e));
+          });
         }
       }
     } catch { /* best effort */ }
