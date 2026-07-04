@@ -124,10 +124,15 @@ async function runActivationFlow(
         if (!assignment) continue;
         const srcDoc = await getSourcesDb().get(assignment.sourceId).catch(() => null) as { playlist?: string[] } | null;
         if (srcDoc?.playlist && srcDoc.playlist.length > 0) {
-          const mediaRoot = '/data/media';
-          const basePath = srcDoc.address?.replace(/^~\//, '/root/').replace(/^~\//, '') || '';
-          const files = srcDoc.playlist.map((f) => `file://${mediaRoot}/${basePath}/${f}`);
-          await strom.player.setPlaylist(stromFlowId, pb.id, { files }).catch(() => {});
+      const mediaRoot = '/data/media';
+      const basePath = srcDoc.address?.replace(/^~/, '').replace(/^\//, '') || '';
+      if (basePath) {
+        const files = srcDoc.playlist.map((f) => `file://${mediaRoot}/${basePath}/${f}`);
+        await strom.player.setPlaylist(stromFlowId, pb.id, { files }).catch(() => {});
+      } else {
+        const files = srcDoc.playlist.map((f) => `file://${mediaRoot}/${f}`);
+        await strom.player.setPlaylist(stromFlowId, pb.id, { files }).catch(() => {});
+      }
         }
       }
     } catch { /* best effort */ }

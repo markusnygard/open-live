@@ -34,7 +34,8 @@ type InboundMessage =
   | { type: 'RECORDER_TOGGLE'; outputId: string; active: boolean }
   | { type: 'MEDIAPLAYER_CONTROL'; sourceId: string; action: 'play' | 'pause' | 'stop' | 'next' | 'previous' }
   | { type: 'MEDIAPLAYER_SEEK'; sourceId: string; positionMs: number }
-  | { type: 'MEDIAPLAYER_GOTO'; sourceId: string; index: number };
+  | { type: 'MEDIAPLAYER_GOTO'; sourceId: string; index: number }
+  | { type: 'MEDIAPLAYER_TOGGLE_LOOP'; sourceId: string; active: boolean };
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -879,6 +880,19 @@ async function handleMessage(
       } catch (err) {
         console.warn('[controller] MEDIAPLAYER_GOTO error:', err);
       }
+      break;
+    }
+    case 'MEDIAPLAYER_TOGGLE_LOOP': {
+      if (!doc.stromFlowId) break;
+      try {
+        const strom = await makeStromClient();
+        const { flow } = await strom.flows.get(doc.stromFlowId);
+        const srcSlug = msg.sourceId.replace(/[^a-z0-9]/gi, '').slice(-8);
+        const playerBlock = (flow.blocks ?? []).find((b) => b.block_definition_id === 'builtin.media_player' && b.id.includes(srcSlug));
+        if (!playerBlock) break;
+        // Update block property via Strom API
+        await (strom as any).patch(`/api/flows/${doc.stromFlowId}/blocks/${playerBlock.id}/properties`, { properties: { loop_playlist: String(msg.active) } });
+      } catch (err) { console.warn('[controller] MEDIAPLAYER_TOGGLE_LOOP error:', err); }
       break;
     }
     default: {
