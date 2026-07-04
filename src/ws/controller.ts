@@ -35,7 +35,8 @@ type InboundMessage =
   | { type: 'MEDIAPLAYER_CONTROL'; sourceId: string; action: 'play' | 'pause' | 'stop' | 'next' | 'previous' }
   | { type: 'MEDIAPLAYER_SEEK'; sourceId: string; positionMs: number }
   | { type: 'MEDIAPLAYER_GOTO'; sourceId: string; index: number }
-  | { type: 'MEDIAPLAYER_TOGGLE_LOOP'; sourceId: string; active: boolean };
+  | { type: 'MEDIAPLAYER_TOGGLE_LOOP'; sourceId: string; active: boolean }
+  | { type: 'MEDIAPLAYER_SET_PLAYLIST'; sourceId: string; files: string[] };
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -892,16 +893,28 @@ async function handleMessage(
       }
       break;
     }
-    case 'MEDIAPLAYER_TOGGLE_LOOP': {
+    case 'MEDIAPLAYER_TOGGLE_LOOP':
+      // Non-live property — ignored at runtime. Deactivate/reactivate to apply.
+      break;
+    case 'MEDIAPLAYER_SET_PLAYLIST': {
       if (!doc.stromFlowId) break;
       try {
         const strom = await makeStromClient();
         const { flow } = await strom.flows.get(doc.stromFlowId);
         const playerBlock = findMediaPlayerBlock(flow, msg.sourceId, productionId);
         if (!playerBlock) break;
-        // Update block property via Strom API
-        await (strom as any).patch(`/api/flows/${doc.stromFlowId}/blocks/${playerBlock.id}/properties`, { properties: { loop_playlist: String(msg.active) } });
-      } catch (err) { console.warn('[controller] MEDIAPLAYER_TOGGLE_LOOP error:', err); }
+        // Build file paths from source's address + playlist
+        const srcDoc = await db.get(msg.sourceId).catch(() => null) as { address?: string } | null;
+        const mediaRoot = '/host/media';
+        const basePath = (srcDoc?.address || '').replace(/^~\/media\//, '').replace(/^~\//, '').replace(/^\//, '').replace(/^media\//, '');
+        const prefix = basePath ? `${mediaRoot}/${basePath}` : mediaRoot;
+        const files = msg.files.map((f: string) => `file://${prefix}/${f}`);
+        await strom.player.setPlaylist(doc.stromFlowId, playerBlock.id, { files }).catch((e: unknown) => {
+          if (String(e).includes('non-JSON response')) return;
+          console.warn('[controller] MEDIAPLAYER_SET_PLAYLIST error:', String(e));
+        });
+        ws.send(JSON.stringify({ type: 'MEDIAPLAYER_PLAYLIST_SET', sourceId: msg.sourceId, files: msg.files }));
+      } catch (err) { console.warn('[controller] MEDIAPLAYER_SET_PLAYLIST error:', err); }
       break;
     }
     default: {

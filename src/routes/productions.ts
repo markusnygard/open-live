@@ -101,9 +101,36 @@ async function runActivationFlow(
     const stromToken = await getStromToken(config.stromToken);
     const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
 
-    // Step 1: Start the Strom flow
+    // Step 1: Create the Strom flow, set media player playlists, then start
     if (signal.aborted) return;
-    const activation = await activateStromFlow(doc, strom, config.stromUrl, outputDocs.length > 0 ? outputDocs : undefined);
+    const onBeforeStart = async (flowId: string) => {
+      try {
+        const { flow } = await strom.flows.get(flowId);
+        const endpointSuffix = productionId.replace(/^prod-/, '').slice(0, 8);
+        const playerBlocks = (flow.blocks ?? []).filter((b) => b.block_definition_id === 'builtin.media_player');
+        for (const pb of playerBlocks) {
+          const padMatch = pb.id.match(/b-input-(\d+)-/);
+          if (!padMatch) continue;
+          const padIndex = parseInt(padMatch[1], 10);
+          const assignment = doc.sources?.find((s) => s.mixerInput === `video_in_${padIndex}`);
+          if (!assignment) continue;
+          const srcDoc = await getSourcesDb().get(assignment.sourceId).catch(() => null) as { playlist?: string[] } | null;
+          if (srcDoc?.playlist && srcDoc.playlist.length > 0) {
+            const mediaRoot = '/host/media';
+            const basePath = (srcDoc.address || '').replace(/^~\/media\//, '').replace(/^~\//, '').replace(/^\//, '').replace(/^media\//, '');
+            const prefix = basePath ? `${mediaRoot}/${basePath}` : mediaRoot;
+            const files = srcDoc.playlist.map((f) => `file://${prefix}/${f}`);
+            console.log('[playlist] Setting playlist:', files.length, 'files, first:', files[0]?.substring(0, 80));
+            await strom.player.setPlaylist(flowId, pb.id, { files }).catch((e) => {
+              if (String(e).includes('non-JSON response')) return;
+              console.log('[playlist] setPlaylist error:', String(e));
+            });
+          }
+        }
+      } catch { /* best effort */ }
+    };
+
+    const activation = await activateStromFlow(doc, strom, config.stromUrl, outputDocs.length > 0 ? outputDocs : undefined, onBeforeStart);
     stromFlowId = activation.flowId;
     mixerBlockId = activation.mixerBlockId ?? undefined;
     audioMixerBlockId = activation.audioMixerBlockId ?? undefined;
@@ -111,35 +138,6 @@ async function runActivationFlow(
     pgmWhepEndpointId = activation.pgmWhepEndpointId;
     // mixerBlockId/audioMixerBlockId come directly from the flow generator — they are the
     // randomised IDs actually used in the live Strom flow, not the static template IDs.
-
-    // Step 2: Set media player playlists on their blocks
-    if (signal.aborted) { await deactivateStromFlow(stromFlowId, strom).catch(() => undefined); return; }
-    try {
-      const { flow } = await strom.flows.get(stromFlowId);
-      const endpointSuffix = productionId.replace(/^prod-/, '').slice(0, 8);
-      const playerBlocks = (flow.blocks ?? []).filter((b) => b.block_definition_id === 'builtin.media_player');
-      for (const pb of playerBlocks) {
-        // Extract pad index from block ID: b-input-{pad}-{suffix}
-        const padMatch = pb.id.match(/b-input-(\d+)-/);
-        if (!padMatch) continue;
-        const padIndex = parseInt(padMatch[1], 10);
-        const assignment = doc.sources?.find((s) => s.mixerInput === `video_in_${padIndex}`);
-        if (!assignment) continue;
-        const srcDoc = await getSourcesDb().get(assignment.sourceId).catch(() => null) as { playlist?: string[] } | null;
-        if (srcDoc?.playlist && srcDoc.playlist.length > 0) {
-          const mediaRoot = '/host/media';
-          const basePath = (srcDoc.address || '').replace(/^~\/media\//, '').replace(/^~\//, '').replace(/^\//, '').replace(/^media\//, '');
-          const prefix = basePath ? `${mediaRoot}/${basePath}` : mediaRoot;
-          const files = srcDoc.playlist.map((f) => `file://${prefix}/${f}`);
-          console.log('[playlist] Setting playlist:', files.length, 'files, first:', files[0]?.substring(0, 80));
-          await strom.player.setPlaylist(stromFlowId, pb.id, { files }).catch((e) => {
-            // Strom returns 200 with empty body (non-JSON) — that's success
-            if (String(e).includes('non-JSON response')) return;
-            console.log('[playlist] setPlaylist error:', String(e));
-          });
-        }
-      }
-    } catch { /* best effort */ }
 
     // Step 3: Persist stromFlowId + mixerBlockId + audioMixerBlockId
     if (signal.aborted) {
@@ -680,6 +678,39 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         return reply.status(204).send();
       } catch {
         return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+      }
+    }
+  );
+  // Proxy player state from Strom for a media player source in an active production
+  fastify.get<{ Params: { id: string; sourceId: string } }>(
+    '/api/v1/productions/:id/player-state/:sourceId',
+    async (req, reply) => {
+      try {
+        const doc = await getDb().get(req.params.id) as ProductionDoc;
+        if (!doc.stromFlowId || doc.status !== 'active') {
+          return reply.status(404).send({ error: 'Production not active', statusCode: 404 });
+        }
+        const stromToken = await getStromToken(config.stromToken);
+        const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
+        const { flow } = await strom.flows.get(doc.stromFlowId);
+        const playerBlocks = (flow.blocks ?? []).filter((b: { block_definition_id?: string }) =>
+          b.block_definition_id === 'builtin.media_player'
+        );
+        const endpointSuffix = doc._id.replace(/^prod-/, '').slice(0, 8);
+        for (const pb of playerBlocks) {
+          const padMatch = (pb.id as string).match(/b-input-(\d+)-/);
+          if (!padMatch) continue;
+          const padIndex = parseInt(padMatch[1], 10);
+          const assignment = doc.sources?.find((s) => s.mixerInput === `video_in_${padIndex}`);
+          if (assignment?.sourceId === req.params.sourceId) {
+            const state = await strom.player.getState(doc.stromFlowId, pb.id);
+            return reply.send(state);
+          }
+        }
+        return reply.status(404).send({ error: 'No media player found for this source', statusCode: 404 });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return reply.status(500).send({ error: message, statusCode: 500 });
       }
     }
   );

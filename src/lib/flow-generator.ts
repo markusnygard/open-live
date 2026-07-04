@@ -94,6 +94,7 @@ export async function activateStromFlow(
   strom: StromClient,
   stromUrl?: string,
   outputDocs?: OutputDoc[],
+  onBeforeStart?: (flowId: string) => Promise<void>,
 ): Promise<ActivationResult> {
   if (!production.templateId) {
     // Fall back to the default vision mixer template.
@@ -528,14 +529,32 @@ export async function activateStromFlow(
       }
     } else if (source.streamType === 'mediaplayer') {
       const audioChannel = audioChannelIndex++;
+      const fmtId = `b-fmt-${padIndex}-${endpointSuffix}`;
+      const gpuConvId = `e-gpuconv-${padIndex}-${endpointSuffix}`;
       flow.blocks.push({
         id: inputId,
         block_definition_id: 'builtin.media_player',
         name: source.name || `Media Player (V${padIndex})`,
-        properties: { decode: 'true', sync: 'true', loop_playlist: 'false' },
+        properties: { decode: true, sync: true, loop_playlist: false },
         position: { x: COL_INPUT, y: yPos },
       });
-      flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
+      flow.elements.push({
+        id: gpuConvId,
+        element_type: 'videoconvert',
+        position: [COL_INPUT - 75, yPos],
+      });
+      flow.blocks.push({
+        id: fmtId,
+        block_definition_id: 'builtin.videoformat',
+        name: `Format V${padIndex}`,
+        properties: { resolution: pgmResolution },
+        position: { x: -125, y: yPos },
+      });
+      flow.links.push(
+        { from: `${inputId}:video_out`, to: `${gpuConvId}:sink` },
+        { from: `${gpuConvId}:src`, to: `${fmtId}:video_in` },
+        { from: `${fmtId}:video_out`, to: `${offsetId}:in` },
+      );
       flow.links.push({ from: `${inputId}:audio_out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${inputId}:audio_out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
@@ -787,6 +806,8 @@ export async function activateStromFlow(
   });
 
   const flowId = created.flow.id;
+
+  if (onBeforeStart) await onBeforeStart(flowId);
 
   try {
     await strom.flows.start(flowId);
