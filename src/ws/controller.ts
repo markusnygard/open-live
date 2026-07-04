@@ -129,6 +129,19 @@ const afvChannelsByProduction = new Map<string, Set<string>>()
 const mutedElementsByProduction = new Map<string, Set<string>>()
 const recorderActiveSet = new Set<string>()
 
+function findMediaPlayerBlock(flow: any, sourceId: string, productionId: string) {
+  const pads = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+  const endpointSuffix = productionId.replace(/^prod-/, '').slice(0, 8)
+  for (const pad of pads) {
+    const inputId = `b-input-${pad}-${endpointSuffix}`
+    const block = (flow.blocks ?? []).find((b: any) => b.block_definition_id === 'builtin.media_player' && b.id === inputId)
+    if (block) return block
+  }
+  // Fallback: try 8-char slug match
+  const srcSlug = sourceId.replace(/[^a-z0-9]/gi, '').slice(-8)
+  return (flow.blocks ?? []).find((b: any) => b.block_definition_id === 'builtin.media_player' && b.id.includes(srcSlug)) ?? null
+}
+
 /**
  * Last-seen stromFlowId per production.
  * A changed flowId means the pipeline was rebuilt (sources remapped, etc.) so
@@ -845,8 +858,7 @@ async function handleMessage(
         const strom = await makeStromClient();
         const { flow } = await strom.flows.get(doc.stromFlowId);
         // Find the media player block for this source
-        const srcSlug = msg.sourceId.replace(/[^a-z0-9]/gi, '').slice(-8);
-        const playerBlock = (flow.blocks ?? []).find((b) => b.block_definition_id === 'builtin.media_player' && b.id.includes(srcSlug));
+        const playerBlock = findMediaPlayerBlock(flow, msg.sourceId, productionId);
         if (!playerBlock) break;
         await strom.player.control(doc.stromFlowId, playerBlock.id, { action: msg.action });
       } catch (err) {
@@ -859,8 +871,7 @@ async function handleMessage(
       try {
         const strom = await makeStromClient();
         const { flow } = await strom.flows.get(doc.stromFlowId);
-        const srcSlug = msg.sourceId.replace(/[^a-z0-9]/gi, '').slice(-8);
-        const playerBlock = (flow.blocks ?? []).find((b) => b.block_definition_id === 'builtin.media_player' && b.id.includes(srcSlug));
+        const playerBlock = findMediaPlayerBlock(flow, msg.sourceId, productionId);
         if (!playerBlock) break;
         await strom.player.seek(doc.stromFlowId, playerBlock.id, { position_ns: msg.positionMs * 1_000_000 });
       } catch (err) {
@@ -873,8 +884,7 @@ async function handleMessage(
       try {
         const strom = await makeStromClient();
         const { flow } = await strom.flows.get(doc.stromFlowId);
-        const srcSlug = msg.sourceId.replace(/[^a-z0-9]/gi, '').slice(-8);
-        const playerBlock = (flow.blocks ?? []).find((b) => b.block_definition_id === 'builtin.media_player' && b.id.includes(srcSlug));
+        const playerBlock = findMediaPlayerBlock(flow, msg.sourceId, productionId);
         if (!playerBlock) break;
         await strom.player.goto(doc.stromFlowId, playerBlock.id, { index: msg.index });
       } catch (err) {
@@ -887,8 +897,7 @@ async function handleMessage(
       try {
         const strom = await makeStromClient();
         const { flow } = await strom.flows.get(doc.stromFlowId);
-        const srcSlug = msg.sourceId.replace(/[^a-z0-9]/gi, '').slice(-8);
-        const playerBlock = (flow.blocks ?? []).find((b) => b.block_definition_id === 'builtin.media_player' && b.id.includes(srcSlug));
+        const playerBlock = findMediaPlayerBlock(flow, msg.sourceId, productionId);
         if (!playerBlock) break;
         // Update block property via Strom API
         await (strom as any).patch(`/api/flows/${doc.stromFlowId}/blocks/${playerBlock.id}/properties`, { properties: { loop_playlist: String(msg.active) } });

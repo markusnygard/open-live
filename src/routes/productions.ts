@@ -116,23 +116,21 @@ async function runActivationFlow(
     if (signal.aborted) { await deactivateStromFlow(stromFlowId, strom).catch(() => undefined); return; }
     try {
       const { flow } = await strom.flows.get(stromFlowId);
+      const endpointSuffix = productionId.replace(/^prod-/, '').slice(0, 8);
       const playerBlocks = (flow.blocks ?? []).filter((b) => b.block_definition_id === 'builtin.media_player');
       for (const pb of playerBlocks) {
-        const srcSlug = pb.id.replace(/[^a-z0-9]/gi, '').slice(-8);
-        // Find the source with this slug in its assignment
-        const assignment = doc.sources?.find((s) => s.sourceId.replace(/[^a-z0-9]/gi, '').slice(-8) === srcSlug);
+        // Extract pad index from block ID: b-input-{pad}-{suffix}
+        const padMatch = pb.id.match(/b-input-(\d+)-/);
+        if (!padMatch) continue;
+        const padIndex = parseInt(padMatch[1], 10);
+        const assignment = doc.sources?.find((s) => s.mixerInput === `video_in_${padIndex}`);
         if (!assignment) continue;
         const srcDoc = await getSourcesDb().get(assignment.sourceId).catch(() => null) as { playlist?: string[] } | null;
         if (srcDoc?.playlist && srcDoc.playlist.length > 0) {
-      const mediaRoot = '/data/media';
-      const basePath = srcDoc.address?.replace(/^~/, '').replace(/^\//, '') || '';
-      if (basePath) {
-        const files = srcDoc.playlist.map((f) => `file://${mediaRoot}/${basePath}/${f}`);
-        await strom.player.setPlaylist(stromFlowId, pb.id, { files }).catch(() => {});
-      } else {
-        const files = srcDoc.playlist.map((f) => `file://${mediaRoot}/${f}`);
-        await strom.player.setPlaylist(stromFlowId, pb.id, { files }).catch(() => {});
-      }
+      const mediaRoot = '/host/media';
+      const basePath = (srcDoc.address || '').replace(/^~\/media\//, '').replace(/^~\//, '').replace(/^\//, '').replace(/^media\//, '');
+      const prefix = basePath ? `${mediaRoot}/${basePath}` : mediaRoot;
+      const files = srcDoc.playlist.map((f) => `file://${prefix}/${f}`);
         }
       }
     } catch { /* best effort */ }
