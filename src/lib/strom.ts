@@ -644,6 +644,11 @@ export class StromClient {
   // Flow — block operations
   // -------------------------------------------------------------------------
 
+  /** PATCH /api/flows/{flowId}/blocks/{blockId}/properties — update live block properties */
+  async updateBlockProperties(flowId: string, blockId: string, properties: Record<string, unknown>) {
+    return this.patch<Record<string, unknown>>(`/api/flows/${flowId}/blocks/${blockId}/properties`, { properties })
+  }
+
   mixer = {
     transition: (flowId: string, blockId: string, body: TriggerTransitionRequest) =>
       this.post<TransitionResponse>(`/api/flows/${flowId}/blocks/${blockId}/transition`, body),

@@ -36,7 +36,8 @@ type InboundMessage =
   | { type: 'MEDIAPLAYER_SEEK'; sourceId: string; positionMs: number }
   | { type: 'MEDIAPLAYER_GOTO'; sourceId: string; index: number }
   | { type: 'MEDIAPLAYER_TOGGLE_LOOP'; sourceId: string; active: boolean }
-  | { type: 'MEDIAPLAYER_SET_PLAYLIST'; sourceId: string; files: string[] };
+  | { type: 'MEDIAPLAYER_SET_PLAYLIST'; sourceId: string; files: string[] }
+  | { type: 'AUDIO_DYNAMICS_SET'; channel: number; property: string; value: number | boolean };
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -934,6 +935,74 @@ async function handleMessage(
         });
         ws.send(JSON.stringify({ type: 'MEDIAPLAYER_PLAYLIST_SET', sourceId: msg.sourceId, files: msg.files }));
       } catch (err) { console.warn('[controller] MEDIAPLAYER_SET_PLAYLIST error:', err); }
+      break;
+    }
+    case 'AUDIO_DYNAMICS_SET': {
+      if (!doc.stromFlowId) break;
+      try {
+        const strom = await makeStromClient();
+        if (!ctx.audioBlockId) {
+          const { flow } = await strom.flows.get(doc.stromFlowId);
+          const audioBlock = (flow.blocks ?? []).find((b) => b.block_definition_id === 'builtin.mixer');
+          if (audioBlock) ctx.audioBlockId = audioBlock.id;
+        }
+        if (!ctx.audioBlockId) break;
+
+        // Map channel dynamics property names to Strom element & property names
+        // Element IDs are indexed from 0 (channel 1 → gain_0, hpf_0, etc.)
+        const chIdx = msg.channel - 1;
+        const elem = (suffix: string) => `${ctx.audioBlockId}:${suffix}_${chIdx}`;
+
+        const DYNAMICS_MAP: Record<string, [string, string]> = {
+          gain:       ['gain', 'volume'],
+          pan:        ['pan', 'panorama'],
+          hpf_enabled: ['_block', `ch${msg.channel}_hpf_enabled`],
+          hpf_freq:   ['hpf', 'cutoff'],
+          gate_enabled:    ['gate', 'enabled'],
+          gate_threshold:  ['gate', 'gt'],
+          gate_attack:     ['gate', 'at'],
+          gate_release:    ['gate', 'rt'],
+          comp_enabled:    ['comp', 'enabled'],
+          comp_threshold:  ['comp', 'al'],
+          comp_ratio:      ['comp', 'cr'],
+          comp_attack:     ['comp', 'at'],
+          comp_release:    ['comp', 'rt'],
+          comp_makeup:     ['comp', 'mk'],
+          comp_knee:       ['comp', 'kn'],
+          eq_enabled:  ['eq', 'enabled'],
+          eq1_freq:    ['eq', 'f-0'],
+          eq1_gain:    ['eq', 'g-0'],
+          eq1_q:       ['eq', 'q-0'],
+          eq2_freq:    ['eq', 'f-1'],
+          eq2_gain:    ['eq', 'g-1'],
+          eq2_q:       ['eq', 'q-1'],
+          eq3_freq:    ['eq', 'f-2'],
+          eq3_gain:    ['eq', 'g-2'],
+          eq3_q:       ['eq', 'q-2'],
+          eq4_freq:    ['eq', 'f-3'],
+          eq4_gain:    ['eq', 'g-3'],
+          eq4_q:       ['eq', 'q-3'],
+        };
+
+        const mapping = DYNAMICS_MAP[msg.property];
+        if (!mapping) { console.warn('[controller] AUDIO_DYNAMICS_SET: unknown property', msg.property); break; }
+        const [elemSuffix, propName] = mapping;
+
+        if (elemSuffix === '_block') {
+          // Block-level property (e.g. hpf_enabled)
+          await strom.updateBlockProperties(doc.stromFlowId, ctx.audioBlockId, { [propName]: msg.value });
+        } else {
+          // Element-level property
+          await strom.properties.updateElement(doc.stromFlowId, elem(elemSuffix), {
+            property_name: propName,
+            value: msg.value,
+          });
+        }
+
+        broadcast(productionId, { type: 'AUDIO_DYNAMICS_STATE', channel: msg.channel, property: msg.property, value: msg.value });
+      } catch (err) {
+        console.warn('[controller] AUDIO_DYNAMICS_SET error:', err);
+      }
       break;
     }
     default: {
