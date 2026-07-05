@@ -30,37 +30,38 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
       if (stopped) return;
 
       const strom = new StromClient({ baseUrl: config.stromUrl, token });
+      console.log(`[meter-relay] Connecting to Strom WS for production ${productionId}, flow ${flowId}`);
 
       const closeCleanup = strom.connectWebSocket(
         (event) => {
-          if (event.type !== 'MeterData') return;
-          const { flow_id, element_id, rms, peak } = event.data;
-          if (flow_id !== flowId) return;
-          if (!element_id.startsWith(meterPrefix)) return;
-          const suffix = element_id.slice(meterPrefix.length);
-          if (suffix === 'main') {
-            broadcast(productionId, { type: 'METER_DATA', elementId: 'main', peak, rms });
-            return;
-          }
-          // AUX bus master meters: Strom emits "meter:aux1", "meter:aux2" (1-indexed)
-          if (suffix.startsWith('aux')) {
-            const auxNum = parseInt(suffix.slice(3), 10);
-            if (Number.isFinite(auxNum)) {
-              broadcast(productionId, { type: 'METER_DATA', elementId: `aux${auxNum}`, peak, rms });
+          if (event.type === 'MeterData') {
+            const { flow_id, element_id, rms, peak } = event.data;
+            if (flow_id !== flowId) return;
+            if (!element_id.startsWith(meterPrefix)) return;
+            const suffix = element_id.slice(meterPrefix.length);
+            if (suffix === 'main') {
+              broadcast(productionId, { type: 'METER_DATA', elementId: 'main', peak, rms });
               return;
             }
-          }
-          // GROUP bus master meters: Strom emits "meter:group1", "meter:group2" (1-indexed)
-          if (suffix.startsWith('group')) {
-            const grpNum = parseInt(suffix.slice(5), 10);
-            if (Number.isFinite(grpNum)) {
-              broadcast(productionId, { type: 'METER_DATA', elementId: `grp${grpNum}`, peak, rms });
+            if (suffix.startsWith('aux')) {
+              const auxNum = parseInt(suffix.slice(3), 10);
+              if (Number.isFinite(auxNum)) {
+                broadcast(productionId, { type: 'METER_DATA', elementId: `aux${auxNum}`, peak, rms });
+              }
               return;
             }
+            if (suffix.startsWith('group')) {
+              const grpNum = parseInt(suffix.slice(5), 10);
+              if (Number.isFinite(grpNum)) {
+                broadcast(productionId, { type: 'METER_DATA', elementId: `grp${grpNum}`, peak, rms });
+              }
+              return;
+            }
+            const chNum = parseInt(suffix, 10);
+            if (Number.isFinite(chNum)) {
+              broadcast(productionId, { type: 'METER_DATA', elementId: `ch${chNum}`, peak, rms });
+            }
           }
-          const chNum = parseInt(suffix, 10);
-          if (!Number.isFinite(chNum)) return;
-          broadcast(productionId, { type: 'METER_DATA', elementId: `ch${chNum}`, peak, rms });
         },
         () => {
           if (!stopped) {

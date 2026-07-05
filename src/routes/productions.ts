@@ -206,7 +206,7 @@ async function runActivationFlow(
             await deactivateStromFlow(stromFlowId, strom).catch(() => {});
             return;
           }
-          if (resp?.endpoint) whepEndpoint = `${config.stromPublicUrl}${resp.endpoint}`;
+          if (resp?.endpoint) whepEndpoint = `${config.stromPublicUrl}/api${resp.endpoint}`;
         }
 
         if (signal.aborted) {
@@ -250,14 +250,14 @@ async function runActivationFlow(
           whepOutputEntries && whepOutputEntries.length > 0
             ? whepOutputEntries.map(({ outputId, endpointId }) => ({
                 outputId,
-                url: `${config.stromPublicUrl}/whep/${endpointId}`,
+                url: `${config.stromPublicUrl}/api/whep/${endpointId}`,
               }))
             : undefined;
 
         await updateProductionDoc(productionId, {
           status: 'active',
           whepEndpoint,
-          pgmWhepEndpoint: pgmWhepEndpointId ? `${config.stromPublicUrl}/whep/${pgmWhepEndpointId}` : undefined,
+          pgmWhepEndpoint: pgmWhepEndpointId ? `${config.stromPublicUrl}/api/whep/${pgmWhepEndpointId}` : undefined,
           whipEndpoints: whipEndpoints.length > 0 ? whipEndpoints : undefined,
           srtOutputUri: undefined,
           whepOutputUrls: whepOutputUrls && whepOutputUrls.length > 0 ? whepOutputUrls : undefined,
