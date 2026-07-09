@@ -75,10 +75,11 @@ export interface OutputDoc {
   name: string;
   outputType: OutputType;
   url?: string;          // SRT URI for mpegtssrt/efpsrt; undefined for whep/ndi/sdi
+  latency?: number;      // SRT latency in ms (default: 125)
+  videoSource?: string;  // "pgm", "pgm_clean", or a sourceId — for all output types
+  audioSource?: string;  // "pgm" or a sourceId — for all output types
   outputDir?: string;    // recorders: subdirectory within media folder
   container?: string;    // recorders: mp4, mkv, mpegts (default: mp4)
-  audioSource?: string;  // recorders: "pgm" or mixerInput (e.g. "video_in_0") for pre-fader
-  videoSource?: string;  // recorders: "pgm" or sourceId to record from
   createdAt: string;
   updatedAt: string;
 }

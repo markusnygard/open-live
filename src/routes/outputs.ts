@@ -9,19 +9,21 @@ const OutputInput = z.object({
   name: z.string().min(1),
   outputType: z.enum(['mpegtssrt', 'efpsrt', 'whep', 'ndi', 'sdi', 'recorder']),
   url: z.string().optional(),
+  latency: z.number().int().min(20).max(8000).optional(),
+  videoSource: z.string().optional(),
+  audioSource: z.string().optional(),
   outputDir: z.string().optional(),
   container: z.string().optional(),
-  audioSource: z.string().optional(),
-  videoSource: z.string().optional(),
 });
 
 const OutputPatch = z.object({
   name: z.string().min(1).optional(),
   url: z.string().optional(),
+  latency: z.number().int().min(20).max(8000).optional(),
+  videoSource: z.string().optional(),
+  audioSource: z.string().optional(),
   outputDir: z.string().optional(),
   container: z.string().optional(),
-  audioSource: z.string().optional(),
-  videoSource: z.string().optional(),
 });
 
 function toApi(doc: OutputDoc) {
@@ -67,6 +69,7 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       name: body.name,
       outputType: body.outputType,
       url: body.url,
+      latency: body.latency,
       outputDir: body.outputDir,
       container: body.container,
       audioSource: body.audioSource,
@@ -140,6 +143,29 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       throw err;
     }
   });
+  // SRT connection health check — called by host-level monitoring script
+  fastify.post<{ Params: { id: string }; Body: { connected: boolean } }>(
+    '/api/v1/outputs/:id/srt-check',
+    async (req, reply) => {
+      try {
+        const { connected } = req.body;
+        await getOutputsDb().get(req.params.id); // verify exists
+        const key = `srtcheck_${req.params.id}`;
+        const now = new Date().toISOString();
+        try {
+          const existing = await getDb().get(key) as any;
+          await getDb().insert({ ...existing, connected, updatedAt: now } as any);
+        } catch {
+          await getDb().insert({ _id: key, connected, updatedAt: now } as any);
+        }
+        return reply.send({ ok: true });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        fastify.log.error({ err }, 'Failed srt check');
+        return reply.status(500).send({ error: message, statusCode: 500 });
+      }
+    },
+  );
 };
 
 export default outputsRoutes;

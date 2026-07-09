@@ -18,6 +18,8 @@ export interface ActivationResult {
   pgmWhepEndpointId?: string;
   /** Maps mixerInput (e.g. 'video_in_1') → time_offset block ID — so the WS layer can apply live offset changes */
   sourceOffsetBlockIds: Record<string, string>;
+  /** Maps outputId → stromFlowId for output flows created during activation */
+  outputFlowIds?: Record<string, string>;
 }
 
 function findPgmFeedPad(flow: StromFlowTemplate['flow']): string | null {
@@ -670,6 +672,97 @@ export async function activateStromFlow(
     }
   }
 
+  // Add inter_outputs for video (Format PGM) and audio (main mix).
+  // Independent output flows subscribe to these via inter_input.
+  // Strom auto-tees when the same pad feeds multiple consumers.
+  const pgmFmtBlock = flow.blocks.find(
+    (b) => (b as Record<string, unknown>)['block_definition_id'] === 'builtin.videoformat' &&
+           ((b as Record<string, unknown>)['name'] as string || '').includes('PGM'),
+  ) as Record<string, unknown> | undefined;
+  let interOutCount = 0
+  if (pgmFmtBlock && audioMixerBlockId) {
+    // Video inter_output
+    const videoInterId = `b-inter-pgm-${endpointSuffix}`;
+    flow.blocks.push({
+      id: videoInterId,
+      block_definition_id: 'builtin.inter_output',
+      name: 'PGM Video Inter',
+      properties: {},
+      position: { x: COL_OUTPUT, y: ROW_START - ROW_H },
+    });
+    flow.links.push({ from: `${pgmFmtBlock['id'] as string}:video_out`, to: `${videoInterId}:sink` });
+    interOutCount++
+
+    // Audio inter_output
+    const audioInterId = `b-inter-audio-${endpointSuffix}`;
+    flow.blocks.push({
+      id: audioInterId,
+      block_definition_id: 'builtin.inter_output',
+      name: 'PGM Audio Inter',
+      properties: {},
+      position: { x: COL_OUTPUT, y: ROW_START },
+    });
+    flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${audioInterId}:sink` });
+    interOutCount++
+  }
+
+  // Per-source inter_outputs for outputs that reference a specific input
+  // (not PGM). Scans assigned output docs for videoSource references.
+  if (outputDocs) {
+    const seenSources = new Set<string>()
+    for (const od of outputDocs) {
+      const vs = (od as any).videoSource as string | undefined
+      if (vs && vs !== 'pgm' && vs !== 'pgm_clean' && !seenSources.has(vs)) {
+        seenSources.add(vs)
+      }
+    }
+    for (const sourceId of seenSources) {
+      const idx = sortedAssignments.findIndex(a => a.sourceId === sourceId)
+      if (idx === -1) continue
+      const offsetId = `b-offset-${idx}-${endpointSuffix}`
+      const srcInterId = `b-inter-src-${sourceId.replace(/[^a-z0-9]/gi, '').slice(-8)}-${endpointSuffix}`
+      flow.blocks.push({
+        id: srcInterId,
+        block_definition_id: 'builtin.inter_output',
+        name: `Source ${sourceId} Inter`,
+        properties: {},
+        position: { x: COL_OUTPUT, y: ROW_START + interOutCount * ROW_H },
+      })
+      flow.links.push({ from: `${offsetId}:out`, to: `${srcInterId}:sink` })
+      interOutCount++
+    }
+
+    // Per-source audio inter_outputs for outputs with audioSource set to a specific source.
+    const seenAudioSources = new Set<string>()
+    for (const od of outputDocs) {
+      const as = (od as any).audioSource as string | undefined
+      if (as && as !== 'pgm' && !seenAudioSources.has(as)) {
+        seenAudioSources.add(as)
+      }
+    }
+    for (const sourceId of seenAudioSources) {
+      const idx = sortedAssignments.findIndex(a => a.sourceId === sourceId)
+      if (idx === -1) continue
+      const inputId = `b-input-${idx}-${endpointSuffix}`
+      // Determine audio pad from source stream type.
+      const src = sourceMap.get(sourceId) ?? (VIRTUAL_SOURCES[sourceId] as SourceDoc | undefined)
+      const audioPad = src?.streamType === 'srt' || src?.streamType === 'efp' ? 'audio_out_0'
+        : src?.streamType === 'whip' || src?.streamType === 'ndi' || src?.streamType === 'sdi' || src?.streamType === 'mediaplayer' ? 'audio_out'
+        : null
+      if (!audioPad) continue
+      const srcAudioInterId = `b-inter-audio-src-${sourceId.replace(/[^a-z0-9]/gi, '').slice(-8)}-${endpointSuffix}`
+      flow.blocks.push({
+        id: srcAudioInterId,
+        block_definition_id: 'builtin.inter_output',
+        name: `Source ${sourceId} Audio Inter`,
+        properties: {},
+        position: { x: COL_OUTPUT, y: ROW_START + interOutCount * ROW_H },
+      })
+      flow.links.push({ from: `${inputId}:${audioPad}`, to: `${srcAudioInterId}:sink` })
+      interOutCount++
+    }
+  }
+
   // Inject output blocks for each assigned OutputDoc
   const whepOutputEntries: Array<{ outputId: string; endpointId: string }> = [];
   let outputBlockIndex = 0;
@@ -752,20 +845,9 @@ export async function activateStromFlow(
         if (videoPad) flow.links.push({ from: videoPad, to: `${blockId}:video_in_0` });
         if (audioPad) flow.links.push(audioPad);
       } else {
-        // mpegtssrt or efpsrt — both use the MPEG-TS/SRT output block.
-        // Skip if no URL — an empty srt_uri fails at GStreamer READY state.
-        if (!outputDoc.url) continue;
-        flow.blocks.push({
-          id: blockId,
-          block_definition_id: 'builtin.mpegtssrt_output',
-          name: outputDoc.name,
-          properties: { srt_uri: outputDoc.url },
-          position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
-        });
-        outputBlockIndex++;
-        if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
-        // Wire audio from the audio mixer main_out
-        if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in_0` });
+        // mpegtssrt or efpsrt — use independent output flows (started via the
+        // Outputs panel), not inline blocks. This prevents auto-start.
+        continue;
       }
     }
   }
@@ -808,7 +890,16 @@ export async function activateStromFlow(
     throw err;
   }
 
-  return { flowId, mixerBlockId, audioMixerBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined, pgmWhepEndpointId, sourceOffsetBlockIds };
+  // Create (but don't start) independent output flows for SRT/EFP outputs.
+  // They'll be started by the operator via the output start endpoint.
+  let outputFlowIds: Record<string, string> | undefined;
+  if (outputDocs && outputDocs.length > 0) {
+    outputFlowIds = await createOutputFlows(
+      production._id, flowId, strom, outputDocs, sortedAssignments,
+    );
+  }
+
+  return { flowId, mixerBlockId, audioMixerBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined, pgmWhepEndpointId, sourceOffsetBlockIds, outputFlowIds };
 }
 
 // ---------------------------------------------------------------------------
@@ -827,6 +918,8 @@ export interface OutputFlowConfig {
   destination?: string;
   /** Target encoder bitrate in kbps */
   bitrate?: number;
+  /** SRT latency in ms */
+  latency?: number;
   /** DeckLink device number for sdi outputs */
   deviceNumber?: number;
   /** NDI stream name for ndi outputs */
@@ -865,6 +958,7 @@ export function buildOutputFlow(
   productionId: string,
   outputId: string,
   interChannel: string,
+  audioInterChannel: string | null,
   config: OutputFlowConfig,
 ): CreateFlowRequest {
   const flowId = randomUUID();
@@ -872,7 +966,9 @@ export function buildOutputFlow(
   const slug = outputId.replace(/[^a-z0-9]/gi, '').slice(-8) || 'out';
 
   const inputId = `b-in-${slug}-${suffix}`;
+  const audioInputId = `b-in-audio-${slug}-${suffix}`;
   const encId = `b-enc-${slug}-${suffix}`;
+  const fmtBlockId = `b-fmt-${slug}-${suffix}`;
   const sinkId = `b-out-${slug}-${suffix}`;
 
   const blocks: Array<Record<string, unknown>> = [];
@@ -887,10 +983,31 @@ export function buildOutputFlow(
     position: { x: 0, y: 100 },
   });
 
+  // Audio inter input for SRT/EFP output types
+  if (audioInterChannel && (config.type === 'srt' || config.type === 'efp')) {
+    blocks.push({
+      id: audioInputId,
+      block_definition_id: 'builtin.inter_input',
+      name: 'Audio Feed',
+      properties: { channel: audioInterChannel, max_time: '500' },
+      position: { x: 0, y: 200 },
+    });
+  }
+
+  // Videoformat: normalizes caps from inter stream for the encoder.
+  blocks.push({
+    id: fmtBlockId,
+    block_definition_id: 'builtin.videoformat',
+    name: 'Format',
+    properties: { resolution: '1280x720' },
+    position: { x: 150, y: 100 },
+  });
+  links.push({ from: `${inputId}:src`, to: `${fmtBlockId}:video_in` });
+
   // Recording and pass-through sinks (ndi/sdi) don't need a video encoder.
   const needsEncoder = config.type === 'srt' || config.type === 'efp';
 
-  let videoSourcePad = `${inputId}:src`;
+  let videoSourcePad = `${fmtBlockId}:video_out`;
   if (needsEncoder) {
     blocks.push({
       id: encId,
@@ -899,19 +1016,26 @@ export function buildOutputFlow(
       properties: config.bitrate !== undefined ? { bitrate: config.bitrate } : {},
       position: { x: 300, y: 100 },
     });
-    links.push({ from: `${inputId}:src`, to: `${encId}:video_in` });
-    videoSourcePad = `${encId}:video_out`;
+    links.push({ from: `${fmtBlockId}:video_out`, to: `${encId}:video_in` });
+    videoSourcePad = `${encId}:encoded_out`;
   }
 
   if (config.type === 'srt' || config.type === 'efp') {
+    const srtProps: Record<string, unknown> = { srt_uri: config.destination || 'srt://127.0.0.1:5006?mode=listener' }
+    if (config.latency !== undefined) srtProps['latency'] = config.latency
     blocks.push({
       id: sinkId,
       block_definition_id: config.type === 'efp' ? 'builtin.efpsrt_output' : 'builtin.mpegtssrt_output',
       name: config.type === 'efp' ? 'EFP Output' : 'SRT Output',
-      properties: { srt_uri: config.destination || 'srt://127.0.0.1:5006?mode=listener' },
+      properties: srtProps,
       position: { x: 600, y: 100 },
     });
     links.push({ from: videoSourcePad, to: `${sinkId}:video_in` });
+    // Audio: use the dedicated audio inter_input, which carries raw audio
+    // from the main flow's audio mixer. The srtsink encodes internally.
+    if (audioInterChannel) {
+      links.push({ from: `${audioInputId}:src`, to: `${sinkId}:audio_in_0` });
+    }
   } else if (config.type === 'ndi') {
     blocks.push({
       id: sinkId,
@@ -965,6 +1089,59 @@ export function buildOutputFlow(
 }
 
 /**
+ * Creates (but does NOT start) independent output flows for all SRT/EFP
+ * outputs assigned to a production. Called during activation so every output
+ * flow exists before the operator touches the start/stop buttons.
+ *
+ * Returns a map of outputId → stromFlowId.
+ */
+export async function createOutputFlows(
+  productionId: string,
+  mainFlowId: string,
+  strom: StromClient,
+  outputDocs: OutputDoc[],
+  sortedAssignments: Array<{ sourceId: string; mixerInput: string }>,
+): Promise<Record<string, string>> {
+  const result: Record<string, string> = {};
+  const suffix = productionId.replace(/^prod-/, '').slice(0, 8);
+
+  for (const od of outputDocs) {
+    if (od.outputType !== 'mpegtssrt' && od.outputType !== 'efpsrt') continue;
+
+    let videoChannel: string | null = null;
+    const vidSrc = (od as any).videoSource as string | undefined;
+    if (vidSrc && vidSrc !== 'pgm' && vidSrc !== 'pgm_clean') {
+      videoChannel = await findSourceInterChannel(mainFlowId, strom, vidSrc);
+    }
+    if (!videoChannel) {
+      videoChannel = await findMainFlowInterChannel(mainFlowId, strom);
+    }
+    if (!videoChannel) continue;
+
+    let audioChannel: string | null = null;
+    const audSrc = (od as any).audioSource as string | undefined;
+    if (audSrc && audSrc !== 'pgm') {
+      audioChannel = await findSourceAudioInterChannel(mainFlowId, strom, audSrc);
+    }
+    if (!audioChannel && (od.outputType === 'mpegtssrt' || od.outputType === 'efpsrt')) {
+      audioChannel = await findMainFlowAudioInterChannel(mainFlowId, strom);
+    }
+
+    const config: OutputFlowConfig = {
+      type: od.outputType === 'efpsrt' ? 'efp' : 'srt',
+      destination: od.url,
+      latency: od.latency,
+    };
+
+    const flowBody = buildOutputFlow(productionId, od._id, videoChannel, audioChannel, config);
+    const created = await strom.flows.create(flowBody);
+    result[od._id] = created.flow.id;
+  }
+
+  return result;
+}
+
+/**
  * Locates the main production flow's PGM inter_output block and returns the
  * auto-generated inter channel name to subscribe to. Returns null if the flow
  * has no inter_output block.
@@ -976,6 +1153,58 @@ export async function findMainFlowInterChannel(
   const { flow } = await strom.flows.get(mainFlowId);
   const interOutput = (flow.blocks ?? []).find(
     (b) => (b as { block_definition_id?: string }).block_definition_id === 'builtin.inter_output',
+  );
+  if (!interOutput?.id) return null;
+  return interChannelName(mainFlowId, interOutput.id);
+}
+
+/**
+ * Locates the main production flow's audio inter_output block.
+ */
+export async function findMainFlowAudioInterChannel(
+  mainFlowId: string,
+  strom: StromClient,
+): Promise<string | null> {
+  const { flow } = await strom.flows.get(mainFlowId);
+  const interOutput = (flow.blocks ?? []).find(
+    (b) => (b as { block_definition_id?: string; name?: string }).block_definition_id === 'builtin.inter_output'
+        && (b as { name?: string }).name === 'PGM Audio Inter',
+  );
+  if (!interOutput?.id) return null;
+  return interChannelName(mainFlowId, interOutput.id);
+}
+
+/**
+ * Find an inter_output block for a specific input source.
+ */
+export async function findSourceInterChannel(
+  mainFlowId: string,
+  strom: StromClient,
+  sourceId: string,
+): Promise<string | null> {
+  const slug = sourceId.replace(/[^a-z0-9]/gi, '').slice(-8);
+  const { flow } = await strom.flows.get(mainFlowId);
+  const interOutput = (flow.blocks ?? []).find(
+    (b: any) => b.block_definition_id === 'builtin.inter_output'
+      && (b.id || '').includes(`-src-${slug}`),
+  );
+  if (!interOutput?.id) return null;
+  return interChannelName(mainFlowId, interOutput.id);
+}
+
+/**
+ * Find a per-source audio inter_output block.
+ */
+export async function findSourceAudioInterChannel(
+  mainFlowId: string,
+  strom: StromClient,
+  sourceId: string,
+): Promise<string | null> {
+  const slug = sourceId.replace(/[^a-z0-9]/gi, '').slice(-8);
+  const { flow } = await strom.flows.get(mainFlowId);
+  const interOutput = (flow.blocks ?? []).find(
+    (b: any) => b.block_definition_id === 'builtin.inter_output'
+      && (b.id || '').includes(`-audio-src-${slug}`),
   );
   if (!interOutput?.id) return null;
   return interChannelName(mainFlowId, interOutput.id);
@@ -998,5 +1227,29 @@ export async function deactivateStromFlow(
     await strom.flows.delete(stromFlowId);
   } catch {
     // ignore — flow may not exist
+  }
+}
+
+/**
+ * Deletes all output flows belonging to a production (flows whose name matches
+ * the pattern `{name}_{suffix}`). Called as part of production deactivation.
+ */
+export async function deactivateStromOutputFlows(
+  productionId: string,
+  strom: StromClient,
+): Promise<void> {
+  try {
+    const data = await strom.flows.list()
+    const suffix = productionId.replace(/^prod-/, '').slice(0, 8)
+    for (const f of data.flows) {
+      const name = f.name ?? ''
+      if (name.endsWith(`_${suffix}`)) {
+        const fid = f.id as string
+        try { await strom.flows.stop(fid) } catch {}
+        try { await strom.flows.delete(fid) } catch {}
+      }
+    }
+  } catch {
+    // ignore — listing may fail
   }
 }

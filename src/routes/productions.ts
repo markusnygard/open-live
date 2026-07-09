@@ -5,7 +5,7 @@ import { getDb, getOutputsDb, getSourcesDb, getTemplatesDb } from '../db/index.j
 import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc } from '../db/types.js';
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
-import { activateStromFlow, deactivateStromFlow } from '../lib/flow-generator.js';
+import { activateStromFlow, deactivateStromFlow, deactivateStromOutputFlows } from '../lib/flow-generator.js';
 import { setTally } from '../services/tally.service.js';
 import { config } from '../config.js';
 
@@ -142,6 +142,7 @@ async function runActivationFlow(
     // Step 3: Persist stromFlowId + mixerBlockId + audioMixerBlockId
     if (signal.aborted) {
       await deactivateStromFlow(stromFlowId, strom).catch(() => undefined);
+      await deactivateStromOutputFlows(productionId, strom).catch(() => {});
       return;
     }
     await updateProductionDoc(productionId, {
@@ -157,6 +158,7 @@ async function runActivationFlow(
     while (Date.now() < deadline) {
       if (signal.aborted) {
         await deactivateStromFlow(stromFlowId, strom).catch(() => undefined);
+        await deactivateStromOutputFlows(productionId, strom).catch(() => {});
         return;
       }
 
@@ -204,6 +206,7 @@ async function runActivationFlow(
           // deactivate has already written status:'inactive'.
           if (signal.aborted) {
             await deactivateStromFlow(stromFlowId, strom).catch(() => {});
+            await deactivateStromOutputFlows(productionId, strom).catch(() => {});
             return;
           }
           if (resp?.endpoint) whepEndpoint = `${config.stromPublicUrl}${resp.endpoint}`;
@@ -211,6 +214,7 @@ async function runActivationFlow(
 
         if (signal.aborted) {
           await deactivateStromFlow(stromFlowId, strom).catch(() => {});
+          await deactivateStromOutputFlows(productionId, strom).catch(() => {});
           return;
         }
 
@@ -300,6 +304,7 @@ async function runActivationFlow(
       const stromToken = await getStromToken(config.stromToken).catch((err) => { log.error({ err }, "SAT exchange failed — proceeding without auth"); return undefined; });
       const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
       await deactivateStromFlow(stromFlowId, strom).catch(() => undefined);
+      await deactivateStromOutputFlows(productionId, strom).catch(() => {});
     }
 
     // Reset production to inactive, clearing all flow-related fields
@@ -441,6 +446,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         const stromToken = await getStromToken(config.stromToken).catch(() => undefined);
         const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
         await deactivateStromFlow(doc.stromFlowId, strom).catch(() => undefined);
+        await deactivateStromOutputFlows(doc._id, strom).catch(() => {});
       }
 
       await getDb().destroy(doc._id, doc._rev!);
@@ -548,6 +554,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         const stromToken = await getStromToken(config.stromToken).catch((err) => { req.log.error({ err }, "SAT exchange failed — proceeding without auth"); return undefined; });
         const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
         await deactivateStromFlow(doc.stromFlowId, strom);
+        await deactivateStromOutputFlows(doc._id, strom).catch(() => {});
       }
 
       const updated: ProductionDoc = {
