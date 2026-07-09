@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import type { ProductionDoc, SourceDoc, GraphicDoc, StromFlowTemplate, OutputDoc } from '../db/types.js';
 import { getSourcesDb, getTemplatesDb, getGraphicsDb } from '../db/index.js';
-import { StromClient } from './strom.js';
+import { StromClient, type CreateFlowRequest } from './strom.js';
 
 /**
  * Generates a Strom flow from a template + source assignments,
@@ -173,6 +173,7 @@ export async function activateStromFlow(
   const pgmFramerate = typeof production.values?.pgm_framerate === 'string' ? production.values.pgm_framerate : undefined;
   const multiviewResolution = typeof production.values?.multiview_resolution === 'string' ? production.values.multiview_resolution : undefined;
   const multiviewFramerate = typeof production.values?.multiview_framerate === 'string' ? production.values.multiview_framerate : undefined;
+  const numPips = production.values?.num_pips !== undefined ? String(production.values.num_pips) : undefined;
 
   for (const block of flow.blocks) {
     const b = block as Record<string, unknown>;
@@ -183,6 +184,7 @@ export async function activateStromFlow(
       if (pgmFramerate !== undefined) props['pgm_framerate'] = pgmFramerate;
       if (multiviewResolution !== undefined) props['multiview_resolution'] = multiviewResolution;
       if (multiviewFramerate !== undefined) props['multiview_framerate'] = multiviewFramerate;
+      if (numPips !== undefined) props['num_pips'] = numPips;
       b['properties'] = props;
     }
 
@@ -807,6 +809,176 @@ export async function activateStromFlow(
   }
 
   return { flowId, mixerBlockId, audioMixerBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined, pgmWhepEndpointId, sourceOffsetBlockIds };
+}
+
+// ---------------------------------------------------------------------------
+// Independent output flows
+//
+// An output flow is a standalone Strom flow that subscribes to the main
+// production flow's inter_output (shared PGM feed) via an inter_input block,
+// then encodes and delivers it to a single destination (SRT / EFP / recording
+// / NDI / SDI). Running each output in its own flow lets the operator start and
+// stop individual outputs without disturbing the live program pipeline.
+// ---------------------------------------------------------------------------
+
+export interface OutputFlowConfig {
+  type: 'srt' | 'efp' | 'recording' | 'ndi' | 'sdi';
+  /** SRT/EFP destination URI (e.g. srt://host:port?mode=caller) */
+  destination?: string;
+  /** Target encoder bitrate in kbps */
+  bitrate?: number;
+  /** DeckLink device number for sdi outputs */
+  deviceNumber?: number;
+  /** NDI stream name for ndi outputs */
+  ndiName?: string;
+  /** Recording output directory (recording outputs) */
+  outputDir?: string;
+  /** Recording container format (recording outputs, default mp4) */
+  container?: string;
+}
+
+/**
+ * Deterministic flow name for a production output. Kept stable so the status
+ * endpoint can locate the running flow by name without persisting a flow ID.
+ */
+export function outputFlowName(productionId: string, outputId: string): string {
+  const suffix = productionId.replace(/^prod-/, '').slice(0, 8);
+  return `${outputId}_${suffix}`;
+}
+
+/**
+ * The inter channel name Strom auto-generates for an inter_output block:
+ * `strom_{flowId}_{blockId}` (see strom/backend/src/state.rs).
+ */
+export function interChannelName(mainFlowId: string, interOutputBlockId: string): string {
+  return `strom_${mainFlowId}_${interOutputBlockId}`;
+}
+
+/**
+ * Builds (but does not start) an independent output flow. The flow consists of:
+ *   inter_input(channel) → videoenc → output-block(sink)
+ *
+ * The inter_input subscribes to the main production flow's inter_output channel.
+ * Returns the constructed CreateFlowRequest body; the caller creates + starts it.
+ */
+export function buildOutputFlow(
+  productionId: string,
+  outputId: string,
+  interChannel: string,
+  config: OutputFlowConfig,
+): CreateFlowRequest {
+  const flowId = randomUUID();
+  const suffix = productionId.replace(/^prod-/, '').slice(0, 8);
+  const slug = outputId.replace(/[^a-z0-9]/gi, '').slice(-8) || 'out';
+
+  const inputId = `b-in-${slug}-${suffix}`;
+  const encId = `b-enc-${slug}-${suffix}`;
+  const sinkId = `b-out-${slug}-${suffix}`;
+
+  const blocks: Array<Record<string, unknown>> = [];
+  const links: Array<Record<string, unknown>> = [];
+
+  // Inter input: subscribes to the main flow's PGM inter_output channel.
+  blocks.push({
+    id: inputId,
+    block_definition_id: 'builtin.inter_input',
+    name: 'PGM Feed',
+    properties: { channel: interChannel, max_time: '500' },
+    position: { x: 0, y: 100 },
+  });
+
+  // Recording and pass-through sinks (ndi/sdi) don't need a video encoder.
+  const needsEncoder = config.type === 'srt' || config.type === 'efp';
+
+  let videoSourcePad = `${inputId}:src`;
+  if (needsEncoder) {
+    blocks.push({
+      id: encId,
+      block_definition_id: 'builtin.videoenc',
+      name: 'Encoder',
+      properties: config.bitrate !== undefined ? { bitrate: config.bitrate } : {},
+      position: { x: 300, y: 100 },
+    });
+    links.push({ from: `${inputId}:src`, to: `${encId}:video_in` });
+    videoSourcePad = `${encId}:video_out`;
+  }
+
+  if (config.type === 'srt' || config.type === 'efp') {
+    blocks.push({
+      id: sinkId,
+      block_definition_id: config.type === 'efp' ? 'builtin.efpsrt_output' : 'builtin.mpegtssrt_output',
+      name: config.type === 'efp' ? 'EFP Output' : 'SRT Output',
+      properties: { srt_uri: config.destination || 'srt://127.0.0.1:5006?mode=listener' },
+      position: { x: 600, y: 100 },
+    });
+    links.push({ from: videoSourcePad, to: `${sinkId}:video_in` });
+  } else if (config.type === 'ndi') {
+    blocks.push({
+      id: sinkId,
+      block_definition_id: 'builtin.ndi_output',
+      name: 'NDI Output',
+      properties: { ndi_name: config.ndiName || 'Open Live NDI', mode: 'combined' },
+      position: { x: 600, y: 100 },
+    });
+    links.push({ from: videoSourcePad, to: `${sinkId}:video_in` });
+  } else if (config.type === 'sdi') {
+    blocks.push({
+      id: sinkId,
+      block_definition_id: 'builtin.decklink_output',
+      name: 'SDI Output',
+      properties: { device_number: String(config.deviceNumber ?? 0), stream_mode: 'audio_video' },
+      position: { x: 600, y: 100 },
+    });
+    links.push({ from: videoSourcePad, to: `${sinkId}:video_in` });
+  } else {
+    // recording
+    blocks.push({
+      id: sinkId,
+      block_definition_id: 'builtin.recorder',
+      name: 'Recorder',
+      properties: {
+        container: config.container || 'mp4',
+        output_dir: config.outputDir || 'recordings',
+        filename_prefix: outputId,
+        num_video_tracks: 1,
+        num_audio_tracks: 0,
+      },
+      position: { x: 600, y: 100 },
+    });
+    links.push({ from: videoSourcePad, to: `${sinkId}:video_in_0` });
+  }
+
+  return {
+    id: flowId,
+    name: outputFlowName(productionId, outputId),
+    properties: {
+      description: `output:${productionId}:${outputId}`,
+      ephemeral: true,
+    },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    elements: [] as any,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    blocks: blocks as any,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    links: links as any,
+  };
+}
+
+/**
+ * Locates the main production flow's PGM inter_output block and returns the
+ * auto-generated inter channel name to subscribe to. Returns null if the flow
+ * has no inter_output block.
+ */
+export async function findMainFlowInterChannel(
+  mainFlowId: string,
+  strom: StromClient,
+): Promise<string | null> {
+  const { flow } = await strom.flows.get(mainFlowId);
+  const interOutput = (flow.blocks ?? []).find(
+    (b) => (b as { block_definition_id?: string }).block_definition_id === 'builtin.inter_output',
+  );
+  if (!interOutput?.id) return null;
+  return interChannelName(mainFlowId, interOutput.id);
 }
 
 /**

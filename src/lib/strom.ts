@@ -293,7 +293,7 @@ export interface SetPlaylistRequest {
 }
 
 export interface SeekRequest {
-  position_ms: number
+  position_ns: number
 }
 
 export interface GotoRequest {
@@ -676,6 +676,15 @@ export class StromClient {
 
     multiviewEndpoint: (flowId: string, blockId: string) =>
       this.get<MultiviewEndpointResponse>(`/api/flows/${flowId}/blocks/${blockId}/multiview-endpoint`),
+
+    getState: (flowId: string, blockId: string) =>
+      this.get<Record<string, unknown>>(`/api/flows/${flowId}/blocks/${blockId}/state`),
+
+    updatePip: (flowId: string, blockId: string, pipIdx: number, body: Record<string, unknown>) =>
+      this.put<Record<string, unknown>>(`/api/flows/${flowId}/blocks/${blockId}/pip/${pipIdx}`, body),
+
+    selectPreviewPip: (flowId: string, blockId: string, pip: number) =>
+      this.put<Record<string, unknown>>(`/api/flows/${flowId}/blocks/${blockId}/preview`, { source: { pip } }),
   }
 
   // -------------------------------------------------------------------------
@@ -720,6 +729,9 @@ export class StromClient {
 
     goto: (flowId: string, blockId: string, body: GotoRequest) =>
       this.post<void>(`/api/flows/${flowId}/blocks/${blockId}/player/goto`, body),
+
+    setLoop: (flowId: string, blockId: string, body: { enabled: boolean }) =>
+      this.post<void>(`/api/flows/${flowId}/blocks/${blockId}/player/loop`, body),
   }
 
   // -------------------------------------------------------------------------

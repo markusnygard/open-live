@@ -12,8 +12,10 @@ import { config } from '../config.js';
 type InboundMessage =
   | { type: 'CUT'; mixerInput: string; afvRampMs?: number }
   | { type: 'TRANSITION'; mixerInput: string; transitionType: string; durationMs?: number; afvRampMs?: number }
-  | { type: 'TAKE'; afvRampMs?: number }
+  | { type: 'TAKE'; pip?: number; afvRampMs?: number }
   | { type: 'SET_PVW'; mixerInput: string }
+  | { type: 'SET_PIP'; pip: number; bg: number | null; zones: unknown[]; transforms: Record<string, unknown> }
+  | { type: 'SELECT_PVW_PIP'; pip: number }
   | { type: 'FTB'; active?: boolean; durationMs?: number }
   | { type: 'SET_OVL'; alpha: number }
   | { type: 'GO_LIVE' }
@@ -48,8 +50,13 @@ type InboundMessage =
  * Returns null if the pad name doesn't match the expected format.
  */
 function padToIndex(mixerInput: string): number | null {
+  // Regular video input: "video_in_2" → 2
   const match = /video_in_(\d+)$/.exec(mixerInput);
-  return match ? parseInt(match[1], 10) : null;
+  if (match) return parseInt(match[1], 10);
+  // PiP virtual input: "pip:0" → 0 (negative to distinguish from video inputs)
+  const pipMatch = /^pip:(\d+)$/.exec(mixerInput);
+  if (pipMatch) return -1 - parseInt(pipMatch[1], 10);  // negative: -1 = pip:0, -2 = pip:1
+  return null;
 }
 
 const VALID_STROM_TRANSITIONS = new Set<StromTransitionType>(['cut', 'fade', 'slide_left', 'slide_right', 'slide_up', 'slide_down']);
@@ -312,7 +319,7 @@ async function handleMessage(
     }
     case 'TAKE': {
       const tally = getTally(productionId);
-      const newTally = { pgm: tally.pvw, pvw: tally.pgm };
+      const newTally = { pgm: tally.pvw, pvw: tally.pgm, pgmPip: (tally as any).pvwPip ?? null, pvwPip: (tally as any).pgmPip ?? null };
       setTally(productionId, newTally);
       const updated: ProductionDoc = { ...doc, tally: newTally, updatedAt: new Date().toISOString() };
       await db.insert(updated);
@@ -340,6 +347,34 @@ async function handleMessage(
             console.warn('[controller] Strom selectPreview error:', err);
           }
         }
+      }
+      break;
+    }
+    case 'SELECT_PVW_PIP': {
+      if (!doc.stromFlowId || !doc.mixerBlockId) break;
+      try {
+        const strom = await makeStromClient();
+        await strom.mixer.selectPreviewPip(doc.stromFlowId, doc.mixerBlockId, msg.pip);
+        const tally = getTally(productionId);
+        const newTally = { ...tally, pvw: null, pvwPip: msg.pip };
+        setTally(productionId, newTally);
+        broadcast(productionId, { type: 'TALLY', ...newTally });
+      } catch (err) {
+        console.warn('[controller] Strom selectPreviewPip error:', err);
+      }
+      break;
+    }
+    case 'SET_PIP': {
+      if (!doc.stromFlowId || !doc.mixerBlockId) break;
+      try {
+        const strom = await makeStromClient();
+        await strom.mixer.updatePip(doc.stromFlowId, doc.mixerBlockId, msg.pip, {
+          bg: msg.bg,
+          zones: msg.zones,
+          transforms: msg.transforms,
+        });
+      } catch (err) {
+        console.warn('[controller] Strom updatePip error:', err);
       }
       break;
     }
@@ -867,15 +902,9 @@ async function handleMessage(
           throw e;
         });
 
-        // Zero the audio meter when stopping or pausing
-        if (msg.action === 'stop' || msg.action === 'pause') {
-          broadcast(productionId, {
-            type: 'METER_DATA',
-            elementId: 'ch0',
-            peak: [-100, -100],
-            rms: [0, 0],
-          });
-        }
+        // Meter zeroing on stop/pause/EOS is handled generically by the
+        // meter watchdog in meter-relay.ts (channel meters go stale when
+        // buffers stop flowing).
       } catch (err) {
         console.warn('[controller] MEDIAPLAYER_CONTROL error:', err);
       }
@@ -913,9 +942,22 @@ async function handleMessage(
       }
       break;
     }
-    case 'MEDIAPLAYER_TOGGLE_LOOP':
-      // Non-live property — ignored at runtime. Deactivate/reactivate to apply.
+    case 'MEDIAPLAYER_TOGGLE_LOOP': {
+      if (!doc.stromFlowId) break;
+      try {
+        const strom = await makeStromClient();
+        const { flow } = await strom.flows.get(doc.stromFlowId);
+        const playerBlock = findMediaPlayerBlock(flow, msg.sourceId, productionId);
+        if (!playerBlock) break;
+        await strom.player.setLoop(doc.stromFlowId, playerBlock.id, { enabled: msg.active }).catch((e: unknown) => {
+          if (String(e).includes('non-JSON response')) return;
+          throw e;
+        });
+      } catch (err) {
+        console.warn('[controller] MEDIAPLAYER_TOGGLE_LOOP error:', err);
+      }
       break;
+    }
     case 'MEDIAPLAYER_SET_PLAYLIST': {
       if (!doc.stromFlowId) break;
       try {
@@ -1085,6 +1127,21 @@ const controllerWs: FastifyPluginAsync = async (fastify) => {
         for (const [layer, visible] of Object.entries(connectDoc.dskLayers)) {
           socket.send(JSON.stringify({ type: 'DSK_STATE', layer: Number(layer), visible }));
         }
+      }
+
+      // Sync PiP state from Strom when the flow is active
+      if (connectDoc?.stromFlowId && connectDoc?.mixerBlockId) {
+        try {
+          const strom = await makeStromClient();
+          const state = await strom.mixer.getState(connectDoc.stromFlowId, connectDoc.mixerBlockId);
+          const pips = Array.isArray(state['pips']) ? state['pips'] : [];
+          socket.send(JSON.stringify({
+            type: 'PIP_STATE',
+            pgmPip: state['pgm_pip'] ?? null,
+            pvwPip: state['pvw_pip'] ?? null,
+            pips,
+          }));
+        } catch { /* Strom might not be reachable yet — PiP state loads later */ }
       }
 
       // Sync audio channel state and start meter relay using the audio mixer block

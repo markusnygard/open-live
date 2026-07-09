@@ -6,6 +6,8 @@ import { broadcast } from './tally.service.js';
 interface RelayEntry {
   stop: () => void;
   refCount: number;
+  flowId: string;
+  mixerBlockId: string;
 }
 
 const relays = new Map<string, RelayEntry>();
@@ -14,14 +16,48 @@ const RECONNECT_DELAY_MS = 5000;
 export function startMeterRelay(productionId: string, flowId: string, mixerBlockId: string): void {
   const existing = relays.get(productionId);
   if (existing) {
-    existing.refCount++;
-    return;
+    if (existing.flowId !== flowId || existing.mixerBlockId !== mixerBlockId) {
+      // Flow or mixer changed (e.g. production reactivation). Stop the
+      // stale relay and create a new one below. The refCount carries
+      // over from controller WS connections.
+      existing.stop();
+      relays.delete(productionId);
+      // Fall through to create a new relay
+    } else {
+      existing.refCount++;
+      return;
+    }
   }
 
   const meterPrefix = `${mixerBlockId}:meter:`;
   let stopped = false;
   let wsCleanup: (() => void) | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // --- Channel meter watchdog ---
+  // GStreamer level elements only post messages while buffers flow. When a
+  // source stops (clip ended, player stopped/paused, SDI unplugged), channel
+  // meters simply go silent and the UI would freeze at the last value.
+  // Bus meters (main/aux/group/monitor) emit continuously (the audiomixer
+  // generates silence), so only channel meters need this.
+  const WATCHDOG_STALE_MS = 500;
+  const WATCHDOG_TICK_MS = 300;
+  const chLastSeen = new Map<string, number>();   // 'ch1' → Date.now()
+  const chZeroed = new Set<string>();
+  const watchdogTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [chId, last] of chLastSeen) {
+      if (now - last > WATCHDOG_STALE_MS && !chZeroed.has(chId)) {
+        chZeroed.add(chId);
+        broadcast(productionId, {
+          type: 'METER_DATA',
+          elementId: chId,
+          peak: [-100, -100],
+          rms: [-100, -100],
+        });
+      }
+    }
+  }, WATCHDOG_TICK_MS);
 
   function connect() {
     if (stopped) return;
@@ -59,7 +95,10 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
             }
             const chNum = parseInt(suffix, 10);
             if (Number.isFinite(chNum)) {
-              broadcast(productionId, { type: 'METER_DATA', elementId: `ch${chNum}`, peak, rms });
+              const chId = `ch${chNum}`;
+              chLastSeen.set(chId, Date.now());
+              chZeroed.delete(chId);
+              broadcast(productionId, { type: 'METER_DATA', elementId: chId, peak, rms });
             }
           }
         },
@@ -82,9 +121,12 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
   connect();
 
   relays.set(productionId, {
+    flowId,
+    mixerBlockId,
     refCount: 1,
     stop: () => {
       stopped = true;
+      clearInterval(watchdogTimer);
       if (reconnectTimer) clearTimeout(reconnectTimer);
       wsCleanup?.();
     },
