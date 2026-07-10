@@ -687,7 +687,7 @@ export async function activateStromFlow(
       id: videoInterId,
       block_definition_id: 'builtin.inter_output',
       name: 'PGM Video Inter',
-      properties: {},
+      properties: { media_type: 'Video' },
       position: { x: COL_OUTPUT, y: ROW_START - ROW_H },
     });
     flow.links.push({ from: `${pgmFmtBlock['id'] as string}:video_out`, to: `${videoInterId}:sink` });
@@ -725,7 +725,7 @@ export async function activateStromFlow(
         id: srcInterId,
         block_definition_id: 'builtin.inter_output',
         name: `Source ${sourceId} Inter`,
-        properties: {},
+        properties: { media_type: 'Video' },
         position: { x: COL_OUTPUT, y: ROW_START + interOutCount * ROW_H },
       })
       flow.links.push({ from: `${offsetId}:out`, to: `${srcInterId}:sink` })
@@ -798,18 +798,6 @@ export async function activateStromFlow(
         outputBlockIndex++;
         if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
         if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in` });
-      } else if (outputDoc.outputType === 'sdi') {
-        const dev = outputDoc.url && /^\d+$/.test(outputDoc.url) ? outputDoc.url : '0';
-        flow.blocks.push({
-          id: blockId,
-          block_definition_id: 'builtin.decklink_output',
-          name: outputDoc.name || 'SDI Output',
-          properties: { device_number: dev, stream_mode: 'audio_video' },
-          position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
-        });
-        outputBlockIndex++;
-        if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
-        if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in` });
       } else if (outputDoc.outputType === 'recorder') {
         const container = outputDoc.container || 'mp4';
         const audioPad = (!outputDoc.audioSource || outputDoc.audioSource === 'pgm')
@@ -845,8 +833,8 @@ export async function activateStromFlow(
         if (videoPad) flow.links.push({ from: videoPad, to: `${blockId}:video_in_0` });
         if (audioPad) flow.links.push(audioPad);
       } else {
-        // mpegtssrt or efpsrt — use independent output flows (started via the
-        // Outputs panel), not inline blocks. This prevents auto-start.
+        // mpegtssrt, efpsrt, sdi — use independent output flows (started via
+        // the Outputs panel), not inline blocks. This prevents auto-start.
         continue;
       }
     }
@@ -994,7 +982,7 @@ export function buildOutputFlow(
     });
   }
 
-  // Videoformat: normalizes caps from inter stream for the encoder.
+  // Videoformat: normalizes caps from inter stream.
   blocks.push({
     id: fmtBlockId,
     block_definition_id: 'builtin.videoformat',
@@ -1050,12 +1038,11 @@ export function buildOutputFlow(
       id: sinkId,
       block_definition_id: 'builtin.decklink_output',
       name: 'SDI Output',
-      properties: { device_number: String(config.deviceNumber ?? 0), stream_mode: 'audio_video' },
+      properties: { device_number: String(config.deviceNumber ?? 0), stream_mode: 'video' },
       position: { x: 600, y: 100 },
     });
     links.push({ from: videoSourcePad, to: `${sinkId}:video_in` });
   } else {
-    // recording
     blocks.push({
       id: sinkId,
       block_definition_id: 'builtin.recorder',
@@ -1106,7 +1093,7 @@ export async function createOutputFlows(
   const suffix = productionId.replace(/^prod-/, '').slice(0, 8);
 
   for (const od of outputDocs) {
-    if (od.outputType !== 'mpegtssrt' && od.outputType !== 'efpsrt') continue;
+    if (od.outputType !== 'mpegtssrt' && od.outputType !== 'efpsrt' && od.outputType !== 'sdi') continue;
 
     let videoChannel: string | null = null;
     const vidSrc = (od as any).videoSource as string | undefined;
@@ -1127,10 +1114,12 @@ export async function createOutputFlows(
       audioChannel = await findMainFlowAudioInterChannel(mainFlowId, strom);
     }
 
+    const isSdi = od.outputType === 'sdi';
     const config: OutputFlowConfig = {
-      type: od.outputType === 'efpsrt' ? 'efp' : 'srt',
-      destination: od.url,
-      latency: od.latency,
+      type: isSdi ? 'sdi' : od.outputType === 'efpsrt' ? 'efp' : 'srt',
+      destination: isSdi ? undefined : od.url,
+      latency: isSdi ? undefined : od.latency,
+      deviceNumber: isSdi ? parseInt(od.url ?? '0', 10) : undefined,
     };
 
     const flowBody = buildOutputFlow(productionId, od._id, videoChannel, audioChannel, config);

@@ -9,6 +9,13 @@ import { activateStromFlow, deactivateStromFlow, deactivateStromOutputFlows } fr
 import { setTally } from '../services/tally.service.js';
 import { config } from '../config.js';
 
+/** Extract device number from SDI address/url (handles "0", "sdi://decklink/1", etc.) */
+function normalizeSdiDevice(raw: string | undefined): string | null {
+  if (!raw) return null;
+  const match = raw.match(/(\d+)$/);
+  return match ? match[1] : null;
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -588,6 +595,26 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     const body = SourceAssignmentInput.parse(req.body);
     try {
       const doc = await getDb().get(req.params.id);
+
+      // Prevent using the same DeckLink device as both source and output
+      try {
+        const srcDoc = await getSourcesDb().get(body.sourceId) as any;
+        if (srcDoc.streamType === 'sdi' && srcDoc.address) {
+          const srcDev = normalizeSdiDevice(srcDoc.address);
+          for (const out of (doc.outputAssignments ?? [])) {
+            try {
+              const outDoc = await getOutputsDb().get(out.outputId) as any;
+              if (outDoc.outputType === 'sdi' && normalizeSdiDevice(outDoc.url) === srcDev) {
+                return reply.status(409).send({
+                  error: `DeckLink device ${srcDev} is already used as an output`,
+                  statusCode: 409,
+                });
+              }
+            } catch { /* output may not exist */ }
+          }
+        }
+      } catch { /* source may not exist */ }
+
       // Replace existing assignment for the same mixerInput, or add new
       const existing = doc.sources.findIndex((s) => s.mixerInput === body.mixerInput);
       const assignment: ProductionSourceAssignment = { sourceId: body.sourceId, mixerInput: body.mixerInput };
@@ -669,6 +696,26 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       const doc = await getDb().get(req.params.id);
       const already = (doc.outputAssignments ?? []).some((o) => o.outputId === body.outputId);
       if (already) return reply.status(409).send({ error: 'Output already assigned', statusCode: 409 });
+
+      // Prevent using the same DeckLink device as both source and output
+      try {
+        const outputDoc = await getOutputsDb().get(body.outputId) as any;
+        if (outputDoc.outputType === 'sdi' && outputDoc.url) {
+          const outDev = normalizeSdiDevice(outputDoc.url);
+          for (const src of doc.sources) {
+            try {
+              const srcDoc = await getSourcesDb().get(src.sourceId) as any;
+              if (srcDoc.streamType === 'sdi' && normalizeSdiDevice(srcDoc.address) === outDev) {
+                return reply.status(409).send({
+                  error: `DeckLink device ${outDev} is already used as an input source`,
+                  statusCode: 409,
+                });
+              }
+            } catch { /* source may not exist anymore */ }
+          }
+        }
+      } catch { /* output may not exist */ }
+
       const assignment: ProductionOutputAssignment = { outputId: body.outputId };
       const outputAssignments = [...(doc.outputAssignments ?? []), assignment];
       const updated: ProductionDoc = { ...doc, outputAssignments, updatedAt: new Date().toISOString() };
