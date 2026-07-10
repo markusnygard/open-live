@@ -815,6 +815,17 @@ export async function activateStromFlow(
         if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in` });
         whepOutputEntries.push({ outputId: outputDoc._id, endpointId });
         outputBlockIndex++;
+      } else if (outputDoc.outputType === 'ndi') {
+        flow.blocks.push({
+          id: blockId,
+          block_definition_id: 'builtin.ndi_output',
+          name: outputDoc.name || 'NDI Output',
+          properties: { ndi_name: outputDoc.name || 'Open Live NDI', mode: 'combined' },
+          position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
+        });
+        outputBlockIndex++;
+        if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
+        if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in` });
       } else if (outputDoc.outputType === 'sdi') {
         const dev = outputDoc.url && /^\d+$/.test(outputDoc.url) ? outputDoc.url : '0';
         flow.blocks.push({
@@ -828,8 +839,8 @@ export async function activateStromFlow(
         if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
         if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in` });
       } else {
-        // mpegtssrt, efpsrt, recorder, ndi — use independent output flows
-        // (ndi is independent flow because inline ndisink blocks production activation)
+        // mpegtssrt, efpsrt, recorder — use independent output flows
+        // (started via the Outputs panel), not inline blocks.
         continue;
       }
     }
@@ -1034,15 +1045,6 @@ export function buildOutputFlow(
     if (audioInterChannel) {
       links.push({ from: `${audioInputId}:src`, to: `${sinkId}:audio_in_0` });
     }
-  } else if (config.type === 'ndi') {
-    blocks.push({
-      id: sinkId,
-      block_definition_id: 'builtin.ndi_output',
-      name: 'NDI Output',
-      properties: { ndi_name: config.ndiName || 'Open Live NDI', mode: 'video' },
-      position: { x: 600, y: 100 },
-    });
-    links.push({ from: videoSourcePad, to: `${sinkId}:video_in` });
   } else if (config.type === 'recording') {
     const preset = config.preset || 'mp4_h264_nvenc';
     const presetInfo = RECORDER_PRESETS[preset] || RECORDER_PRESETS['mp4_h264_nvenc'];
@@ -1108,7 +1110,7 @@ export async function createOutputFlows(
   const suffix = productionId.replace(/^prod-/, '').slice(0, 8);
 
   for (const od of outputDocs) {
-    if (od.outputType !== 'mpegtssrt' && od.outputType !== 'efpsrt' && od.outputType !== 'recorder' && od.outputType !== 'ndi') continue;
+    if (od.outputType !== 'mpegtssrt' && od.outputType !== 'efpsrt' && od.outputType !== 'recorder') continue;
 
     let videoChannel: string | null = null;
     const vidSrc = (od as any).videoSource as string | undefined;
@@ -1130,15 +1132,13 @@ export async function createOutputFlows(
     }
 
     const isRecorder = od.outputType === 'recorder';
-    const isNdi = od.outputType === 'ndi';
     const config: OutputFlowConfig = {
-      type: isRecorder ? 'recording' : isNdi ? 'ndi' : od.outputType === 'efpsrt' ? 'efp' : 'srt',
-      destination: (isRecorder || isNdi) ? undefined : od.url,
-      latency: (isRecorder || isNdi) ? undefined : od.latency,
+      type: isRecorder ? 'recording' : od.outputType === 'efpsrt' ? 'efp' : 'srt',
+      destination: isRecorder ? undefined : od.url,
+      latency: isRecorder ? undefined : od.latency,
       outputDir: isRecorder ? (od as any).outputDir : undefined,
       container: isRecorder ? (od.container || 'mp4') : undefined,
       preset: isRecorder ? ((od as any).preset || 'mp4_h264_nvenc') : undefined,
-      ndiName: isNdi ? (od.name || 'Open Live NDI') : undefined,
     };
 
     const flowBody = buildOutputFlow(productionId, od._id, videoChannel, audioChannel, config);
