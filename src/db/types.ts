@@ -79,7 +79,8 @@ export interface OutputDoc {
   videoSource?: string;  // "pgm", "pgm_clean", or a sourceId — for all output types
   audioSource?: string;  // "pgm" or a sourceId — for all output types
   outputDir?: string;    // recorders: subdirectory within media folder
-  container?: string;    // recorders: mp4, mkv, mpegts (default: mp4)
+  container?: string;    // recorders: mp4, mkv, mpegts, mov (default: mp4)
+  preset?: string;       // recorders: encoder preset (see RecorderPresets)
   createdAt: string;
   updatedAt: string;
 }

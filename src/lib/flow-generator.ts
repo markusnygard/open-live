@@ -810,43 +810,9 @@ export async function activateStromFlow(
         outputBlockIndex++;
         if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
         if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in` });
-      } else if (outputDoc.outputType === 'recorder') {
-        const container = outputDoc.container || 'mp4';
-        const audioPad = (!outputDoc.audioSource || outputDoc.audioSource === 'pgm')
-          ? { from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in_0` }
-          : null;
-        // Determine video source: "pgm" (default) or a specific source ID
-        let videoPad = pgmFeedPad;
-        const vidSrc = outputDoc.videoSource;
-        if (vidSrc && vidSrc !== 'pgm' && vidSrc !== 'pgm_clean') {
-          // Find this source's index in the sorted assignments
-          const srcIdx = sortedAssignments.findIndex((a) => a.sourceId === vidSrc);
-          if (srcIdx !== -1) {
-            const offsetId = `b-offset-${srcIdx}-${endpointSuffix}`;
-            videoPad = `${offsetId}:out`;
-          } else {
-            console.warn('[flow-generator] recorder videoSource not found:', vidSrc);
-          }
-        }
-        flow.blocks.push({
-          id: blockId,
-          block_definition_id: 'builtin.recorder',
-          name: outputDoc.name || 'Recorder',
-          properties: {
-            container,
-            output_dir: outputDoc.outputDir || 'recordings',
-            filename_prefix: outputDoc.name || 'recording',
-            num_video_tracks: 1,
-            num_audio_tracks: 1,
-          },
-          position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
-        });
-        outputBlockIndex++;
-        if (videoPad) flow.links.push({ from: videoPad, to: `${blockId}:video_in_0` });
-        if (audioPad) flow.links.push(audioPad);
       } else {
-        // mpegtssrt or efpsrt — use independent output flows (started via the
-        // Outputs panel), not inline blocks. This prevents auto-start.
+        // mpegtssrt, efpsrt, recorder — use independent output flows (started via
+        // the Outputs panel), not inline blocks. This prevents auto-start.
         continue;
       }
     }
@@ -928,7 +894,18 @@ export interface OutputFlowConfig {
   outputDir?: string;
   /** Recording container format (recording outputs, default mp4) */
   container?: string;
+  /** Recording encoder preset (e.g. 'mp4_h264_nvenc', 'prores_422_hq', 'mpegts_h264') */
+  preset?: string;
 }
+
+/** Available recording presets */
+export const RECORDER_PRESETS: Record<string, { container: string; label: string }> = {
+  'mp4_h264_nvenc':   { container: 'mp4',    label: 'MP4 (H.264 NVENC, AAC) — Streaming' },
+  'mp4_h264_x264':    { container: 'mp4',    label: 'MP4 (H.264 software, AAC) — Fallback' },
+  'prores_422_hq':    { container: 'mov',    label: 'ProRes 422 HQ (MOV) — Premiere / Resolve' },
+  'prores_422_lt':    { container: 'mov',    label: 'ProRes 422 LT (MOV) — Media Composer' },
+  'mpegts_h264':      { container: 'mpegts', label: 'MPEG-TS (H.264, AAC) — Watch while record' },
+};
 
 /**
  * Deterministic flow name for a production output. Kept stable so the status
@@ -973,6 +950,7 @@ export function buildOutputFlow(
 
   const blocks: Array<Record<string, unknown>> = [];
   const links: Array<Record<string, unknown>> = [];
+  const elements: Array<Record<string, unknown>> = [];
 
   // Inter input: subscribes to the main flow's PGM inter_output channel.
   blocks.push({
@@ -984,7 +962,7 @@ export function buildOutputFlow(
   });
 
   // Audio inter input for SRT/EFP output types
-  if (audioInterChannel && (config.type === 'srt' || config.type === 'efp')) {
+  if (audioInterChannel && (config.type === 'srt' || config.type === 'efp' || config.type === 'recording')) {
     blocks.push({
       id: audioInputId,
       block_definition_id: 'builtin.inter_input',
@@ -1008,7 +986,7 @@ export function buildOutputFlow(
   }
 
   // Recording and pass-through sinks (ndi/sdi) don't need a video encoder.
-  const needsEncoder = config.type === 'srt' || config.type === 'efp';
+  const needsEncoder = config.type === 'srt' || config.type === 'efp' || config.type === 'recording';
 
   let videoSourcePad = `${fmtBlockId}:video_out`;
   if (needsEncoder) {
@@ -1048,21 +1026,35 @@ export function buildOutputFlow(
       position: { x: 600, y: 100 },
     });
     links.push({ from: videoSourcePad, to: `${sinkId}:video_in` });
-  } else {
+  } else if (config.type === 'recording') {
+    const preset = config.preset || 'mp4_h264_nvenc';
+    const presetInfo = RECORDER_PRESETS[preset] || RECORDER_PRESETS['mp4_h264_nvenc'];
+    const audioEncId = `e-aenc-${slug}-${suffix}`;
     blocks.push({
       id: sinkId,
       block_definition_id: 'builtin.recorder',
       name: 'Recorder',
       properties: {
-        container: config.container || 'mp4',
+        container: config.container || presetInfo.container,
         output_dir: config.outputDir || 'recordings',
         filename_prefix: outputId,
         num_video_tracks: 1,
-        num_audio_tracks: 0,
+        num_audio_tracks: audioInterChannel ? 1 : 0,
       },
-      position: { x: 600, y: 100 },
+      position: { x: 700, y: 100 },
     });
     links.push({ from: videoSourcePad, to: `${sinkId}:video_in_0` });
+    if (audioInterChannel) {
+      // Recorder expects encoded audio — add AAC encoder
+      elements.push({
+        id: audioEncId,
+        element_type: 'avenc_aac',
+        properties: { bitrate: 192000 },
+        position: [500, 200],
+      });
+      links.push({ from: `${audioInputId}:src`, to: `${audioEncId}:sink` });
+      links.push({ from: `${audioEncId}:src`, to: `${sinkId}:audio_in_0` });
+    }
   }
 
   return {
@@ -1073,7 +1065,7 @@ export function buildOutputFlow(
       ephemeral: true,
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    elements: [] as any,
+    elements: elements as any,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     blocks: blocks as any,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1099,7 +1091,7 @@ export async function createOutputFlows(
   const suffix = productionId.replace(/^prod-/, '').slice(0, 8);
 
   for (const od of outputDocs) {
-    if (od.outputType !== 'mpegtssrt' && od.outputType !== 'efpsrt') continue;
+    if (od.outputType !== 'mpegtssrt' && od.outputType !== 'efpsrt' && od.outputType !== 'recorder') continue;
 
     let videoChannel: string | null = null;
     const vidSrc = (od as any).videoSource as string | undefined;
@@ -1116,14 +1108,18 @@ export async function createOutputFlows(
     if (audSrc && audSrc !== 'pgm') {
       audioChannel = await findSourceAudioInterChannel(mainFlowId, strom, audSrc);
     }
-    if (!audioChannel && (od.outputType === 'mpegtssrt' || od.outputType === 'efpsrt')) {
+    if (!audioChannel && (od.outputType === 'mpegtssrt' || od.outputType === 'efpsrt' || od.outputType === 'recorder')) {
       audioChannel = await findMainFlowAudioInterChannel(mainFlowId, strom);
     }
 
+    const isRecorder = od.outputType === 'recorder';
     const config: OutputFlowConfig = {
-      type: od.outputType === 'efpsrt' ? 'efp' : 'srt',
-      destination: od.url,
-      latency: od.latency,
+      type: isRecorder ? 'recording' : od.outputType === 'efpsrt' ? 'efp' : 'srt',
+      destination: isRecorder ? undefined : od.url,
+      latency: isRecorder ? undefined : od.latency,
+      outputDir: isRecorder ? (od as any).outputDir : undefined,
+      container: isRecorder ? (od.container || 'mp4') : undefined,
+      preset: isRecorder ? ((od as any).preset || 'mp4_h264_nvenc') : undefined,
     };
 
     const flowBody = buildOutputFlow(productionId, od._id, videoChannel, audioChannel, config);

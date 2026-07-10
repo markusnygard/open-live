@@ -14,6 +14,7 @@ const OutputInput = z.object({
   audioSource: z.string().optional(),
   outputDir: z.string().optional(),
   container: z.string().optional(),
+  preset: z.string().optional(),
 });
 
 const OutputPatch = z.object({
@@ -24,6 +25,7 @@ const OutputPatch = z.object({
   audioSource: z.string().optional(),
   outputDir: z.string().optional(),
   container: z.string().optional(),
+  preset: z.string().optional(),
 });
 
 function toApi(doc: OutputDoc) {
