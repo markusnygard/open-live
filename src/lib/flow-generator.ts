@@ -501,7 +501,18 @@ export async function activateStromFlow(
         properties: props,
         position: { x: COL_INPUT, y: yPos },
       });
-      flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
+      // Normalize NDI input to a standard format — NDI sources can output
+      // any resolution that the downstream mixer may not handle.
+      const fmtId = `b-fmt-${padIndex}-${endpointSuffix}`;
+      flow.blocks.push({
+        id: fmtId,
+        block_definition_id: 'builtin.videoformat',
+        name: `Format V${padIndex}`,
+        properties: { resolution: '1920x1080', format: 'NV12' },
+        position: { x: COL_INPUT + 100, y: yPos },
+      });
+      flow.links.push({ from: `${inputId}:video_out`, to: `${fmtId}:video_in` });
+      flow.links.push({ from: `${fmtId}:video_out`, to: `${offsetId}:in` });
       flow.links.push({ from: `${inputId}:audio_out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${inputId}:audio_out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
