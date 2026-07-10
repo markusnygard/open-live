@@ -39,6 +39,7 @@ type InboundMessage =
   | { type: 'MEDIAPLAYER_GOTO'; sourceId: string; index: number }
   | { type: 'MEDIAPLAYER_TOGGLE_LOOP'; sourceId: string; active: boolean }
   | { type: 'MEDIAPLAYER_SET_PLAYLIST'; sourceId: string; files: string[] }
+  | { type: 'MEDIAPLAYER_SET_MARKS'; sourceId: string; clipIndex: number; markIn?: number; markOut?: number }
   | { type: 'AUDIO_DYNAMICS_SET'; channel: number; property: string; value: number | boolean };
 
 // ---------------------------------------------------------------------------
@@ -937,6 +938,14 @@ async function handleMessage(
           if (String(e).includes('non-JSON response')) return;
           throw e;
         });
+        // Seek to clip markIn if set
+        try {
+          const srcDoc = await getSourcesDb().get(msg.sourceId) as any;
+          const marks = srcDoc?.clipMarks?.[msg.index];
+          if (marks?.markIn != null) {
+            await strom.player.seek(doc.stromFlowId, playerBlock.id, { position_ns: Math.round(marks.markIn * 1_000_000_000) });
+          }
+        } catch { /* marks may not exist */ }
       } catch (err) {
         console.warn('[controller] MEDIAPLAYER_GOTO error:', err);
       }
@@ -977,6 +986,25 @@ async function handleMessage(
         });
         ws.send(JSON.stringify({ type: 'MEDIAPLAYER_PLAYLIST_SET', sourceId: msg.sourceId, files: msg.files }));
       } catch (err) { console.warn('[controller] MEDIAPLAYER_SET_PLAYLIST error:', err); }
+      break;
+    }
+    case 'MEDIAPLAYER_SET_MARKS': {
+      try {
+        const srcDoc = await getSourcesDb().get(msg.sourceId) as any;
+        const marks = srcDoc.clipMarks ? [...srcDoc.clipMarks] : [];
+        while (marks.length <= msg.clipIndex) marks.push(null);
+        const existing = marks[msg.clipIndex] || {};
+        if (msg.markIn !== undefined) existing.markIn = msg.markIn;
+        if (msg.markOut !== undefined) existing.markOut = msg.markOut;
+        // Remove both undefined = clear marks for this clip
+        if (msg.markIn === undefined && msg.markOut === undefined) {
+          marks[msg.clipIndex] = null;
+        } else {
+          marks[msg.clipIndex] = existing;
+        }
+        await getSourcesDb().insert({ ...srcDoc, clipMarks: marks } as any);
+        ws.send(JSON.stringify({ type: 'MEDIAPLAYER_MARKS_SET', sourceId: msg.sourceId, clipIndex: msg.clipIndex, marks: marks[msg.clipIndex] }));
+      } catch (err) { console.warn('[controller] MEDIAPLAYER_SET_MARKS error:', err); }
       break;
     }
     case 'AUDIO_DYNAMICS_SET': {

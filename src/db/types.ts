@@ -48,6 +48,8 @@ export interface SourceDoc {
   latency?: number;
   /** Media player playlist — array of file URIs */
   playlist?: string[];
+  /** Per-clip mark-in/mark-out (seconds). Index matches playlist array. */
+  clipMarks?: Array<{ markIn?: number; markOut?: number } | null>;
   createdAt: string;
   updatedAt: string;
 }

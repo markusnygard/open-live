@@ -769,6 +769,14 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
           const assignment = doc.sources?.find((s) => s.mixerInput === `video_in_${padIndex}`);
           if (assignment?.sourceId === req.params.sourceId) {
             const state = await strom.player.getState(doc.stromFlowId, pb.id);
+            // Attach clip marks from the source doc for the current clip
+            try {
+              const srcDoc = await getSourcesDb().get(assignment.sourceId) as any;
+              const idx = state.current_file_index;
+              const marks = srcDoc?.clipMarks?.[idx];
+              if (marks) (state as any).clipMarks = marks;
+              (state as any).allClipMarks = srcDoc?.clipMarks ?? [];
+            } catch { /* source may not exist */ }
             return reply.send(state);
           }
         }

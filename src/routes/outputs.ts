@@ -168,6 +168,44 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       }
     },
   );
+  // Serve growing recorder files with Range header support (for media player seeking)
+  fastify.get('/api/v1/recorder/file', async (req, reply) => {
+    try {
+      const fs = await import('node:fs');
+      const nodePath = await import('node:path');
+      const folder = (req.query as Record<string, string>).folder || '';
+      const file = (req.query as Record<string, string>).file || '';
+      const resolved = nodePath.resolve('/host/media', folder, file);
+      if (!resolved.startsWith('/host/media')) {
+        return reply.status(403).send({ error: 'Access denied' });
+      }
+      const stat = fs.statSync(resolved);
+      const fileSize = stat.size;
+      const range = (req.headers as any).range;
+      if (range) {
+        const parts = range.replace(/bytes=/, '').split('-');
+        const start = parseInt(parts[0], 10);
+        const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+        const chunkSize = end - start + 1;
+        const buf = Buffer.alloc(chunkSize);
+        const fd = fs.openSync(resolved, 'r');
+        fs.readSync(fd, buf, 0, chunkSize, start);
+        fs.closeSync(fd);
+        reply.header('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+        reply.header('Accept-Ranges', 'bytes');
+        reply.header('Content-Length', chunkSize);
+        reply.header('Content-Type', 'video/mp2t');
+        return reply.status(206).send(buf);
+      }
+      const stream = fs.createReadStream(resolved);
+      reply.header('Content-Length', fileSize);
+      reply.header('Content-Type', 'video/mp2t');
+      reply.header('Accept-Ranges', 'bytes');
+      return reply.send(stream);
+    } catch (err: any) {
+      return reply.status(404).send({ error: err?.code === 'ENOENT' ? 'File not found' : String(err) });
+    }
+  });
 };
 
 export default outputsRoutes;
