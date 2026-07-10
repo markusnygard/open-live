@@ -501,8 +501,8 @@ export async function activateStromFlow(
         properties: props,
         position: { x: COL_INPUT, y: yPos },
       });
-      // Normalize NDI input to a standard format — NDI sources can output
-      // any resolution that the downstream mixer may not handle.
+      // Normalize NDI input: ndisrc outputs BGRA which the vision mixer rejects.
+      // Convert to NV12 1920x1080 (same as SDI normalization).
       const fmtId = `b-fmt-${padIndex}-${endpointSuffix}`;
       flow.blocks.push({
         id: fmtId,
