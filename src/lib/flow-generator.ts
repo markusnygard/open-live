@@ -23,6 +23,17 @@ export interface ActivationResult {
 }
 
 function findPgmFeedPad(flow: StromFlowTemplate['flow']): string | null {
+  // Find the format block that feeds the PGM encoder.
+  // This block outputs raw NV12 video at PGM resolution, suitable for
+  // raw video sinks (SDI/NDI outputs).
+  const pgmFmt = flow.blocks.find(
+    (b) =>
+      (b as Record<string, unknown>)['block_definition_id'] === 'builtin.videoformat' &&
+      ((b as Record<string, unknown>)['name'] as string || '').includes('PGM'),
+  ) as Record<string, unknown> | undefined;
+  if (pgmFmt) return `${pgmFmt['id'] as string}:video_out`;
+
+  // Fallback: find the feed to the first mpegtssrt_output block.
   const existingOutput = flow.blocks.find(
     (b) => (b as Record<string, unknown>)['block_definition_id'] === 'builtin.mpegtssrt_output',
   ) as Record<string, unknown> | undefined;
@@ -34,12 +45,6 @@ function findPgmFeedPad(flow: StromFlowTemplate['flow']): string | null {
     }) as Record<string, unknown> | undefined;
     if (feedLink) return feedLink['from'] as string;
   }
-  const encPgm = flow.blocks.find(
-    (b) =>
-      (b as Record<string, unknown>)['block_definition_id'] === 'builtin.videoenc' &&
-      (b as Record<string, unknown>)['name'] === 'Enc PGM',
-  ) as Record<string, unknown> | undefined;
-  if (encPgm) return `${encPgm['id'] as string}:video_out`;
   return null;
 }
 
