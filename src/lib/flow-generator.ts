@@ -1053,7 +1053,7 @@ export function buildOutputFlow(
       name: 'Recorder',
       properties: {
         container: config.container || presetInfo.container,
-        output_dir: config.outputDir || 'recordings',
+        output_dir: '/host/media/' + (config.outputDir || 'recordings'),
         filename_prefix: outputId,
         num_video_tracks: 1,
         num_audio_tracks: audioInterChannel ? 1 : 0,
