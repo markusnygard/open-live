@@ -820,24 +820,22 @@ export async function activateStromFlow(
           id: blockId,
           block_definition_id: 'builtin.ndi_output',
           name: outputDoc.name || 'NDI Output',
-          properties: { ndi_name: outputDoc.name || 'Open Live NDI', mode: 'combined' },
+          properties: { ndi_name: outputDoc.name || 'Open Live NDI', mode: 'video' },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
         outputBlockIndex++;
         if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
-        if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in` });
       } else if (outputDoc.outputType === 'sdi') {
         const dev = outputDoc.url && /^\d+$/.test(outputDoc.url) ? outputDoc.url : '0';
         flow.blocks.push({
           id: blockId,
           block_definition_id: 'builtin.decklink_output',
           name: outputDoc.name || 'SDI Output',
-          properties: { device_number: dev, stream_mode: 'audio_video' },
+          properties: { device_number: dev, stream_mode: 'video' },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
         outputBlockIndex++;
         if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
-        if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in` });
       } else {
         // mpegtssrt, efpsrt, recorder — use independent output flows
         // (started via the Outputs panel), not inline blocks.
