@@ -394,12 +394,12 @@ async function handleMessage(
       break;
     }
     case 'MEDIAPLAYER_HOLD': {
+      console.log('[hold] SET', msg.sourceId, msg.active);
       if (msg.active) {
         holdStates.set(msg.sourceId, { sourceId: msg.sourceId, armed: true, fadeMs: 500, holdMs: 500 })
         startHoldMonitor(productionId, ws)
       } else {
         holdStates.delete(msg.sourceId)
-        // If no more hold-armed sources, stop the monitor
         if (![...holdStates.values()].some(h => h.armed)) stopHoldMonitor(productionId)
       }
       ws.send(JSON.stringify({ type: 'MEDIAPLAYER_HOLD_STATE', sourceId: msg.sourceId, active: msg.active }))
@@ -419,6 +419,7 @@ async function handleMessage(
       // Check if new PGM has hold armed
       const newPgmSource = doc.sources?.find(s => s.mixerInput === newTally.pgm)
       const hold = newPgmSource ? holdStates.get(newPgmSource.sourceId) : undefined
+      console.log('[hold] TAKE: newPgm=', newTally.pgm, 'sourceId=', newPgmSource?.sourceId, 'holdArmed=', !!hold?.armed);
       if (hold?.armed && doc.stromFlowId) {
         const strom = await makeStromClient()
         const { flow } = await strom.flows.get(doc.stromFlowId)
