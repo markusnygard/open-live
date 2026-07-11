@@ -339,6 +339,9 @@ export async function activateStromFlow(
     a.mixerInput.localeCompare(b.mixerInput),
   );
 
+  // Collect WHEP output entries (from inline output blocks + per-source WHEP blocks).
+  const whepOutputEntries: Array<{ outputId: string; endpointId: string }> = [];
+
   // Set num_inputs on the vision mixer based solely on the number of dynamic sources.
   // All static template video inputs are stripped above, so no static pad count needed.
   // Allowed values: 2, 4, 6, 8, 10 (non-live property — must be set at creation).
@@ -804,7 +807,6 @@ export async function activateStromFlow(
   }
 
   // Inject output blocks for each assigned OutputDoc
-  const whepOutputEntries: Array<{ outputId: string; endpointId: string }> = [];
   let outputBlockIndex = 0;
   if (outputDocs && outputDocs.length > 0) {
     for (const outputDoc of outputDocs) {
