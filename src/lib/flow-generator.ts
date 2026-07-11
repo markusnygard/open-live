@@ -581,18 +581,6 @@ export async function activateStromFlow(
           audioMixerBlock['properties'] = props;
         }
       }
-      // Per-media-player WHEP endpoint for popup preview
-      const mpWhepId = `b-whep-mp-${padIndex}-${endpointSuffix}`;
-      const mpWhepEndpointId = `whep-mp-${padIndex}-${endpointSuffix}`;
-      flow.blocks.push({
-        id: mpWhepId,
-        block_definition_id: 'builtin.whep_output',
-        name: `${source.name || `MP ${padIndex}`} Preview`,
-        properties: { endpoint_id: mpWhepEndpointId, mode: 'video' },
-        position: { x: COL_INPUT - 100, y: yPos },
-      });
-      flow.links.push({ from: `${inputId}:video_out`, to: `${mpWhepId}:video_in` });
-      whepOutputEntries.push({ outputId: `__mpwhep__${assignment.sourceId}`, endpointId: mpWhepEndpointId });
     } else {
       // srt → builtin.mpegtssrt_input, efp → builtin.efpsrt_input
       const audioChannel = audioChannelIndex++;
