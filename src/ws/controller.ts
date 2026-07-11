@@ -439,6 +439,7 @@ async function handleMessage(
       break
     }
     case 'TAKE': {
+      console.log('[controller] TAKE received!');
       const tally = getTally(productionId);
       const newTally = { pgm: tally.pvw, pvw: tally.pgm, pgmPip: (tally as any).pvwPip ?? null, pvwPip: (tally as any).pgmPip ?? null };
       setTally(productionId, newTally);
@@ -605,6 +606,7 @@ async function handleMessage(
             broadcast(productionId, { type: 'TALLY', ...newTally, transitionType: action.transitionType, durationMs: action.durationMs });
             await stromTransition(currentDoc, tally.pgm, mixerInput, toStromTransition(action.transitionType ?? 'cut'), action.durationMs);
           } else if (action.type === 'TAKE') {
+            console.log('[controller] TAKE received (multi)!');
             const tally = getTally(productionId);
             const newTally = { pgm: tally.pvw, pvw: tally.pgm };
             setTally(productionId, newTally);
