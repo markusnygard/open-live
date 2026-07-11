@@ -40,115 +40,7 @@ type InboundMessage =
   | { type: 'MEDIAPLAYER_TOGGLE_LOOP'; sourceId: string; active: boolean }
   | { type: 'MEDIAPLAYER_SET_PLAYLIST'; sourceId: string; files: string[] }
   | { type: 'MEDIAPLAYER_SET_MARKS'; sourceId: string; clipIndex: number; markIn?: number; markOut?: number }
-  | { type: 'MEDIAPLAYER_HOLD'; sourceId: string; active: boolean }
   | { type: 'AUDIO_DYNAMICS_SET'; channel: number; property: string; value: number | boolean };
-
-// ---------------------------------------------------------------------------
-// Media Player Hold (auto-play on PGM, auto-fade back at end)
-// ---------------------------------------------------------------------------
-
-interface HoldState {
-  sourceId: string
-  armed: boolean
-  fadeMs: number    // transition duration
-  holdMs: number    // delay before fade-in
-}
-
-const holdStates = new Map<string, HoldState>()
-const holdIntervals = new Map<string, ReturnType<typeof setInterval>>()
-
-function stopHoldMonitor(productionId: string) {
-  const id = holdIntervals.get(productionId)
-  if (id) { clearInterval(id); holdIntervals.delete(productionId) }
-}
-
-function startHoldMonitor(productionId: string, ws: import('ws').WebSocket) {
-  stopHoldMonitor(productionId)
-  const id = setInterval(async () => {
-    try {
-      const doc = await getDb().get(productionId) as ProductionDoc
-      if (!doc.stromFlowId || !doc.mixerBlockId) return
-      const strom = await makeStromClient()
-      const tally = getTally(productionId)
-      for (const [sourceId, hold] of holdStates) {
-        if (!hold.armed) continue
-        // Check if this source is currently on PGM
-        const assignment = doc.sources?.find(s => s.sourceId === sourceId)
-        if (!assignment || assignment.mixerInput !== tally.pgm) continue
-
-        // Find the media player block
-        const { flow } = await strom.flows.get(doc.stromFlowId)
-        const mpBlock = findMediaPlayerBlock(flow, sourceId, productionId)
-        if (!mpBlock) continue
-
-        // Poll player state to check near-end condition
-        try {
-          const state = await strom.player.getState(doc.stromFlowId, mpBlock.id)
-          const posSec = (state.position_ns || 0) / 1_000_000_000
-          const durSec = (state.duration_ns || 0) / 1_000_000_000
-          // Check clip marks too
-          const srcDoc = await getSourcesDb().get(sourceId).catch(() => null) as any
-          const clipMarks = srcDoc?.clipMarks?.[state.current_file_index ?? 0]
-          const endSec = clipMarks?.markOut ?? durSec
-          const nearEnd = posSec >= endSec - 1.0
-
-          if (nearEnd && state.state === 'playing') {
-            // Auto-fade to PVW: use 500ms fade back to whatever is on preview
-            const pvwInput = tally.pvw
-            if (pvwInput) {
-              const pvwIdx = padToIndex(pvwInput)
-              if (pvwIdx !== null) {
-                await strom.mixer.selectPreview(doc.stromFlowId, doc.mixerBlockId, { source: { input: pvwIdx } })
-                await strom.mixer.transition(doc.stromFlowId, doc.mixerBlockId, {
-                  from_input: padToIndex(assignment.mixerInput) ?? 0,
-                  to_input: pvwIdx,
-                  transition_type: 'mix',
-                  duration_ms: hold.fadeMs,
-                })
-              }
-            }
-            // Stop the clip
-            await strom.player.control(doc.stromFlowId, mpBlock.id, { action: 'stop' }).catch(() => {})
-          }
-        } catch { /* polling error */ }
-      }
-    } catch { /* monitor error */ }
-  }, 500)
-  holdIntervals.set(productionId, id)
-}
-
-async function triggerHoldAutoPlay(productionId: string, newPgmMixerInput: string, oldPgmMixerInput: string) {
-  const doc = await getDb().get(productionId) as ProductionDoc
-  if (!doc.stromFlowId || !doc.mixerBlockId) return
-  const newPgmSource = doc.sources?.find(s => s.mixerInput === newPgmMixerInput)
-  const hold = newPgmSource ? holdStates.get(newPgmSource.sourceId) : undefined
-  console.log('[hold] TRIGGER: newPgm=', newPgmMixerInput, 'sourceId=', newPgmSource?.sourceId, 'holdArmed=', !!hold?.armed)
-  if (!hold?.armed) return
-  const strom = await makeStromClient()
-  const { flow } = await strom.flows.get(doc.stromFlowId)
-  const mpBlock = findMediaPlayerBlock(flow, newPgmSource.sourceId, productionId)
-  if (!mpBlock) return console.log('[hold] No media player block found')
-  // Auto-play the clip
-  await strom.player.control(doc.stromFlowId, mpBlock.id, { action: 'play' }).catch(() => {})
-  console.log('[hold] PLAY sent to', mpBlock.id)
-  // After holdMs delay, do a fade transition to the new PGM
-  setTimeout(async () => {
-    try {
-      const strom2 = await makeStromClient()
-      const doc2 = await getDb().get(productionId) as ProductionDoc
-      if (!doc2.stromFlowId || !doc2.mixerBlockId) return
-      const newIdx = padToIndex(newPgmMixerInput)
-      const oldIdx = padToIndex(oldPgmMixerInput)
-      if (newIdx === null || oldIdx === null) return
-      await strom2.mixer.selectPreview(doc2.stromFlowId, doc2.mixerBlockId, { source: { input: newIdx } })
-      await strom2.mixer.transition(doc2.stromFlowId, doc2.mixerBlockId, {
-        from_input: oldIdx, to_input: newIdx,
-        transition_type: 'mix', duration_ms: hold.fadeMs,
-      })
-      console.log('[hold] Fade-in complete')
-    } catch (e) { console.warn('[controller] Hold fade-in error:', e) }
-  }, hold.holdMs)
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -426,20 +318,7 @@ async function handleMessage(
       }
       break;
     }
-    case 'MEDIAPLAYER_HOLD': {
-      console.log('[hold] SET', msg.sourceId, msg.active);
-      if (msg.active) {
-        holdStates.set(msg.sourceId, { sourceId: msg.sourceId, armed: true, fadeMs: 500, holdMs: 500 })
-        startHoldMonitor(productionId, ws)
-      } else {
-        holdStates.delete(msg.sourceId)
-        if (![...holdStates.values()].some(h => h.armed)) stopHoldMonitor(productionId)
-      }
-      ws.send(JSON.stringify({ type: 'MEDIAPLAYER_HOLD_STATE', sourceId: msg.sourceId, active: msg.active }))
-      break
-    }
     case 'TAKE': {
-      console.log('[controller] TAKE received!');
       const tally = getTally(productionId);
       const newTally = { pgm: tally.pvw, pvw: tally.pgm, pgmPip: (tally as any).pvwPip ?? null, pvwPip: (tally as any).pgmPip ?? null };
       setTally(productionId, newTally);
@@ -450,7 +329,6 @@ async function handleMessage(
       if (doc.stromFlowId && ctx.audioBlockId) {
         void applyAudioFollow(productionId, doc, tally.pvw, doc.stromFlowId, ctx.audioBlockId, await makeStromClient(), msg.afvRampMs);
       }
-      void triggerHoldAutoPlay(productionId, newTally.pgm, tally.pgm);
       break;
     }
     case 'SET_PVW': {
@@ -606,7 +484,6 @@ async function handleMessage(
             broadcast(productionId, { type: 'TALLY', ...newTally, transitionType: action.transitionType, durationMs: action.durationMs });
             await stromTransition(currentDoc, tally.pgm, mixerInput, toStromTransition(action.transitionType ?? 'cut'), action.durationMs);
           } else if (action.type === 'TAKE') {
-            console.log('[controller] TAKE received (multi)!');
             const tally = getTally(productionId);
             const newTally = { pgm: tally.pvw, pvw: tally.pgm };
             setTally(productionId, newTally);
@@ -614,7 +491,6 @@ async function handleMessage(
             await getDb().insert(updated);
             broadcast(productionId, { type: 'TALLY', ...newTally });
             await stromTransition(currentDoc, tally.pgm, tally.pvw, 'cut');
-            void triggerHoldAutoPlay(productionId, newTally.pgm, tally.pgm);
           } else if (action.type === 'GRAPHIC_ON' && action.overlayId) {
             const updated: ProductionDoc = {
               ...currentDoc,
