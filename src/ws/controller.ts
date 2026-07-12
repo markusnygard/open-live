@@ -952,11 +952,12 @@ async function handleMessage(
           if (String(e).includes('non-JSON response')) return;
           throw e;
         });
-        // Seek to clip markIn if set
+        // Seek to clip markIn after pipeline loads (400ms delay)
         try {
           const srcDoc = await getSourcesDb().get(msg.sourceId) as any;
           const marks = srcDoc?.clipMarks?.[msg.index];
           if (marks?.markIn != null) {
+            await new Promise(r => setTimeout(r, 400));
             await strom.player.seek(doc.stromFlowId, playerBlock.id, { position_ns: Math.round(marks.markIn * 1_000_000_000) });
           }
         } catch { /* marks may not exist */ }
