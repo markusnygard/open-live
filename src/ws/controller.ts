@@ -321,7 +321,7 @@ async function handleMessage(
     }
     case 'MEDIAPLAYER_HOLD': {
       if (msg.active) {
-        holdStates.set(msg.sourceId, { sourceId: msg.sourceId, armed: true, fadeMs: 500, holdMs: 1000 })
+        holdStates.set(msg.sourceId, { sourceId: msg.sourceId, armed: true, fadeMs: 500, holdMs: 1000, pendingPlay: false, markInSought: false })
         startHoldMonitor(productionId)
       } else {
         holdStates.delete(msg.sourceId)
@@ -1306,6 +1306,8 @@ interface HoldState {
   armed: boolean
   fadeMs: number    // transition duration
   holdMs: number    // delay before fade-in (clip buffering)
+  pendingPlay: boolean  // GOTO sent, waiting for pipeline
+  markInSought: boolean // markIn seek sent
 }
 
 const holdStates = new Map<string, HoldState>()
@@ -1333,6 +1335,26 @@ function startHoldMonitor(productionId: string) {
         if (!mpBlock) continue
         try {
           const state = await strom.player.getState(doc.stromFlowId, mpBlock.id)
+
+          // Poll-based state machine: GOTO→seek(markIn)→play→fade-back
+          if (hold.pendingPlay) {
+            const srcDoc = await getSourcesDb().get(sourceId).catch(() => null) as any
+            const clipMarks = srcDoc?.clipMarks?.[state.current_file_index ?? 0]
+            if (clipMarks?.markIn != null && !hold.markInSought && state.duration_ns > 0) {
+              // Pipeline loaded, seek to markIn
+              await strom.player.seek(doc.stromFlowId, mpBlock.id, {
+                position_ns: Math.round(clipMarks.markIn * 1_000_000_000)
+              }).catch(() => {})
+              hold.markInSought = true
+            } else if (state.duration_ns > 0) {
+              // Seek complete (or no markIn), start playing
+              await strom.player.control(doc.stromFlowId, mpBlock.id, { action: 'play' }).catch(() => {})
+              hold.pendingPlay = false
+              hold.markInSought = false
+            }
+            continue // Don't check near-end while still sequencing
+          }
+
           if (state.state !== 'playing') continue
           const posSec = (state.position_ns || 0) / 1_000_000_000
           const srcDoc = await getSourcesDb().get(sourceId).catch(() => null) as any
@@ -1374,12 +1396,12 @@ async function triggerHoldAutoPlay(productionId: string, newPgmMixerInput: strin
     const { flow } = await strom.flows.get(doc.stromFlowId)
     const mpBlock = findMediaPlayerBlock(flow, newPgmSource.sourceId, productionId)
     if (!mpBlock) return
-    // GOTO(0) loads pipeline + seeks to markIn (handler does it synchronously).
-    // Then PLAY fires after 300ms for the pipeline to stabilize.
+    // Just load the clip via GOTO. The hold monitor (polling every 500ms)
+    // will sequence: detect pipeline ready → seek to markIn → play.
+    // This avoids setTimeout races — the poll loop knows the exact state.
     await strom.player.goto(doc.stromFlowId, mpBlock.id, { index: 0 }).catch(() => {})
-    setTimeout(async () => {
-      await strom.player.control(doc.stromFlowId, mpBlock.id, { action: 'play' }).catch(() => {})
-    }, 300)
+    hold.pendingPlay = true
+    hold.markInSought = false
     // After holdMs delay, do a fade-in transition to the new PGM
     setTimeout(async () => {
       try {
