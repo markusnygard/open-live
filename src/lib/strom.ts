@@ -732,6 +732,9 @@ export class StromClient {
 
     setLoop: (flowId: string, blockId: string, body: { enabled: boolean }) =>
       this.post<void>(`/api/flows/${flowId}/blocks/${blockId}/player/loop`, body),
+
+    setStartPosition: (flowId: string, blockId: string, body: { position_ns: number }) =>
+      this.post<void>(`/api/flows/${flowId}/blocks/${blockId}/player/start-position`, body),
   }
 
   // -------------------------------------------------------------------------

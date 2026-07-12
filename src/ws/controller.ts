@@ -948,6 +948,18 @@ async function handleMessage(
         const { flow } = await strom.flows.get(doc.stromFlowId);
         const playerBlock = findMediaPlayerBlock(flow, msg.sourceId, productionId);
         if (!playerBlock) break;
+        // Set start_position on player state before goto — Strom bridge
+        // seeks to this position during pipeline initialization.
+        try {
+          const srcDoc = await getSourcesDb().get(msg.sourceId) as any;
+          const marks = srcDoc?.clipMarks?.[msg.index];
+          const startNs = marks?.markIn != null
+            ? Math.round(marks.markIn * 1_000_000_000)
+            : -1;
+          if (startNs >= 0) {
+            await strom.player.setStartPosition(doc.stromFlowId, playerBlock.id, { position_ns: startNs });
+          }
+        } catch { /* may fail */ }
         await strom.player.goto(doc.stromFlowId, playerBlock.id, { index: msg.index }).catch((e: unknown) => {
           if (String(e).includes('non-JSON response')) return;
           throw e;
@@ -1388,9 +1400,17 @@ async function triggerHoldAutoPlay(productionId: string, newPgmMixerInput: strin
     const { flow } = await strom.flows.get(doc.stromFlowId)
     const mpBlock = findMediaPlayerBlock(flow, newPgmSource.sourceId, productionId)
     if (!mpBlock) return
-    // Just load the clip via GOTO. The hold monitor (polling every 500ms)
-    // will sequence: detect pipeline ready → seek to markIn → play.
-    // This avoids setTimeout races — the poll loop knows the exact state.
+    // Set start_position on player state — Strom bridge seeks during init.
+    try {
+      const srcDoc = await getSourcesDb().get(newPgmSource.sourceId).catch(() => null) as any
+      const marks = srcDoc?.clipMarks?.[0]
+      const startNs = marks?.markIn != null
+        ? Math.round(marks.markIn * 1_000_000_000)
+        : -1
+      if (startNs >= 0) {
+        await strom.player.setStartPosition(doc.stromFlowId, mpBlock.id, { position_ns: startNs });
+      }
+    } catch {}
     await strom.player.goto(doc.stromFlowId, mpBlock.id, { index: 0 }).catch(() => {})
     hold.pendingPlay = true
     hold.markInSought = false
