@@ -952,14 +952,6 @@ async function handleMessage(
           if (String(e).includes('non-JSON response')) return;
           throw e;
         });
-        // Seek to clip markIn if set (pipeline is loaded after goto)
-        try {
-          const srcDoc = await getSourcesDb().get(msg.sourceId) as any;
-          const marks = srcDoc?.clipMarks?.[msg.index];
-          if (marks?.markIn != null) {
-            await strom.player.seek(doc.stromFlowId, playerBlock.id, { position_ns: Math.round(marks.markIn * 1_000_000_000) });
-          }
-        } catch { /* marks may not exist */ }
       } catch (err) {
         console.warn('[controller] MEDIAPLAYER_GOTO error:', err);
       }
