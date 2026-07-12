@@ -1374,20 +1374,16 @@ async function triggerHoldAutoPlay(productionId: string, newPgmMixerInput: strin
     const { flow } = await strom.flows.get(doc.stromFlowId)
     const mpBlock = findMediaPlayerBlock(flow, newPgmSource.sourceId, productionId)
     if (!mpBlock) return
-    await strom.player.control(doc.stromFlowId, mpBlock.id, { action: 'play' })
-    // Seek to markIn after pipeline starts (300ms delay)
+    // Seek to markIn while stopped, then play after brief delay
+    const srcDoc = await getSourcesDb().get(newPgmSource.sourceId).catch(() => null) as any
+    const clipMarks = srcDoc?.clipMarks?.[0]
+    if (clipMarks?.markIn != null) {
+      await strom.player.seek(doc.stromFlowId, mpBlock.id, {
+        position_ns: Math.round(clipMarks.markIn * 1_000_000_000)
+      }).catch(() => {})
+    }
     setTimeout(async () => {
-      try {
-        const srcDoc = await getSourcesDb().get(newPgmSource.sourceId).catch(() => null) as any
-        const idx = 0 // current clip is always index 0 after playlist reload
-        const marks = srcDoc?.clipMarks?.[idx]
-        if (marks?.markIn != null) {
-          const strom3 = await makeStromClient()
-          await strom3.player.seek(doc.stromFlowId, mpBlock.id, {
-            position_ns: Math.round(marks.markIn * 1_000_000_000)
-          }).catch(() => {})
-        }
-      } catch {}
+      await strom.player.control(doc.stromFlowId, mpBlock.id, { action: 'play' }).catch(() => {})
     }, 300)
     // After holdMs delay, do a fade-in transition to the new PGM
     setTimeout(async () => {
