@@ -952,12 +952,11 @@ async function handleMessage(
           if (String(e).includes('non-JSON response')) return;
           throw e;
         });
-        // Seek to clip markIn after pipeline loads (400ms delay)
+        // Seek to clip markIn if set (pipeline is loaded after goto)
         try {
           const srcDoc = await getSourcesDb().get(msg.sourceId) as any;
           const marks = srcDoc?.clipMarks?.[msg.index];
           if (marks?.markIn != null) {
-            await new Promise(r => setTimeout(r, 400));
             await strom.player.seek(doc.stromFlowId, playerBlock.id, { position_ns: Math.round(marks.markIn * 1_000_000_000) });
           }
         } catch { /* marks may not exist */ }
@@ -1375,12 +1374,12 @@ async function triggerHoldAutoPlay(productionId: string, newPgmMixerInput: strin
     const { flow } = await strom.flows.get(doc.stromFlowId)
     const mpBlock = findMediaPlayerBlock(flow, newPgmSource.sourceId, productionId)
     if (!mpBlock) return
-    // GOTO(0) loads the clip pipeline, backend GOTO handler seeks to markIn.
-    // Then PLAY fires after a delay long enough for GOTO + markIn seek to complete.
+    // GOTO(0) loads pipeline + seeks to markIn (handler does it synchronously).
+    // Then PLAY fires after 300ms for the pipeline to stabilize.
     await strom.player.goto(doc.stromFlowId, mpBlock.id, { index: 0 }).catch(() => {})
     setTimeout(async () => {
       await strom.player.control(doc.stromFlowId, mpBlock.id, { action: 'play' }).catch(() => {})
-    }, 600)
+    }, 300)
     // After holdMs delay, do a fade-in transition to the new PGM
     setTimeout(async () => {
       try {
