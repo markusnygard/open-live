@@ -48,7 +48,7 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       const parent = basePath ? nodePath.dirname(basePath) : null;
       const result: any = { dirs, path: basePath, parent: parent === '.' ? '' : parent, root: '/' };
       if (showFiles) {
-        const mediaExts = new Set(['.mp4','.mkv','.webm','.mov','.avi','.mxf','.mp3','.wav','.flac','.aac','.ogg','.png','.jpg','.jpeg','.webp','.gif','.bmp']);
+        const mediaExts = new Set(['.mp4','.mkv','.webm','.mov','.avi','.mxf','.mp3','.wav','.flac','.aac','.ogg','.png','.jpg','.jpeg','.webp','.gif','.bmp','.ts','.mpegts']);
         result.files = entries.filter((e) => e.isFile() && mediaExts.has(nodePath.extname(e.name).toLowerCase())).map((e) => e.name).sort();
       }
       return reply.send(result);
@@ -74,6 +74,7 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       latency: body.latency,
       outputDir: body.outputDir,
       container: body.container,
+      preset: body.preset,
       audioSource: body.audioSource,
       videoSource: body.videoSource,
       createdAt: now,
@@ -204,6 +205,46 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.send(stream);
     } catch (err: any) {
       return reply.status(404).send({ error: err?.code === 'ENOENT' ? 'File not found' : String(err) });
+    }
+  });
+
+  // Transcode a segment of a recorder file to MP4 via ffmpeg
+  fastify.get('/api/v1/recorder/transcode', async (req, reply) => {
+    try {
+      const { spawn } = await import('node:child_process');
+      const nodePath = await import('node:path');
+      const q = req.query as Record<string, string>;
+      const folder = q.folder || '';
+      const file = q.file || '';
+      const markIn = parseFloat(q.markIn || '0');
+      const markOut = parseFloat(q.markOut || '0');
+      const codec = q.codec || 'h264';
+      const bitrate = q.bitrate || '6M';
+      const resolved = nodePath.resolve('/host/media', folder, file);
+      if (!resolved.startsWith('/host/media')) {
+        return reply.status(403).send({ error: 'Access denied' });
+      }
+      const duration = markOut - markIn;
+      if (duration <= 0) return reply.status(400).send({ error: 'Invalid mark range' });
+
+      reply.header('Content-Type', 'video/mp4');
+      reply.header('Content-Disposition', `attachment; filename="clip_${Date.now()}.mp4"`);
+
+      const args = [
+        '-ss', String(markIn), '-i', resolved, '-t', String(duration),
+        '-c:v', codec === 'h265' ? 'libx265' : 'libx264',
+        '-b:v', bitrate,
+        '-c:a', 'aac', '-b:a', '192k',
+        '-movflags', 'faststart',
+        '-f', 'mp4', 'pipe:1',
+      ];
+
+      const ffmpeg = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      reply.raw.on('close', () => { ffmpeg.kill(); });
+      ffmpeg.stderr?.on('data', () => {});
+      return reply.send(ffmpeg.stdout!);
+    } catch (err: any) {
+      return reply.status(500).send({ error: String(err) });
     }
   });
 };
