@@ -1,7 +1,7 @@
 services:
   # 1. STROM (The Engine)
   strom:
-    image: eyevinntechnology/strom-full:0.5.1
+    image: open-live-strom-ndi:0.6.12
     container_name: strom-service
     privileged: true
     deploy:
@@ -23,7 +23,7 @@ services:
 
   # 2. COUCHDB (The Database)
   couchdb:
-    image: couchdb:3.3
+    image: couchdb:3.5.2.1
     container_name: open-live-db
     environment:
       - COUCHDB_USER=admin
@@ -34,7 +34,7 @@ services:
 
   # 3. OPEN-LIVE (Middleware Backend)
   open-live:
-    image: node:23-slim
+    image: node:lts-slim
     container_name: open-live-backend
     working_dir: /app
     volumes:
@@ -52,7 +52,7 @@ services:
 
   # 4. OPEN-LIVE-STUDIO (Frontend UI)
   studio:
-    image: node:23-slim
+    image: node:lts-slim
     container_name: open-live-studio-ui
     working_dir: /app
     volumes:
