@@ -1,6 +1,15 @@
 import type { FastifyPluginAsync } from 'fastify'
 import { getStromToken } from '../lib/strom-token.js'
+import { assertSameStromOrigin } from '../lib/url-validation.js'
 import { config } from '../config.js'
+
+/**
+ * Validates that a session URL belongs to the configured Strom host.
+ * Prevents SSRF / SAT token exfiltration to an attacker-controlled host.
+ */
+function validateSessionUrl(sessionUrl: string): void {
+  assertSameStromOrigin(sessionUrl, config.stromUrl, 'Session URL');
+}
 
 /**
  * WHIP signaling proxy — forwards SDP offer/answer, ICE trickle, and teardown
@@ -36,6 +45,7 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
   // POST — initial WHIP offer/answer
   fastify.post<{ Params: { id: string; mixerInput: string } }>(
     '/api/v1/productions/:id/whip/:mixerInput',
+    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
     async (req, reply) => {
       const { id: productionId, mixerInput } = req.params
       const stromTarget = resolveStromWhipUrl(productionId, mixerInput)
@@ -80,9 +90,18 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
   }>(
     '/api/v1/productions/:id/whip/:mixerInput',
     async (req, reply) => {
-      const target = req.query.session
-        ? decodeURIComponent(req.query.session)
-        : resolveStromWhipUrl(req.params.id, req.params.mixerInput)
+      let target: string;
+      if (req.query.session) {
+        const decoded = decodeURIComponent(req.query.session);
+        try {
+          validateSessionUrl(decoded);
+        } catch (err) {
+          return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid session URL' });
+        }
+        target = decoded;
+      } else {
+        target = resolveStromWhipUrl(req.params.id, req.params.mixerInput);
+      }
 
       const token = await getStromToken(config.stromToken).catch(() => undefined)
       const headers: Record<string, string> = {
@@ -102,9 +121,18 @@ const whipRoutes: FastifyPluginAsync = async (fastify) => {
   }>(
     '/api/v1/productions/:id/whip/:mixerInput',
     async (req, reply) => {
-      const target = req.query.session
-        ? decodeURIComponent(req.query.session)
-        : resolveStromWhipUrl(req.params.id, req.params.mixerInput)
+      let target: string;
+      if (req.query.session) {
+        const decoded = decodeURIComponent(req.query.session);
+        try {
+          validateSessionUrl(decoded);
+        } catch (err) {
+          return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid session URL' });
+        }
+        target = decoded;
+      } else {
+        target = resolveStromWhipUrl(req.params.id, req.params.mixerInput);
+      }
 
       const token = await getStromToken(config.stromToken).catch(() => undefined)
       const headers: Record<string, string> = {}

@@ -5,14 +5,13 @@ import { getConfigsDb } from '../db/index.js';
 import type { ProductionConfigDoc } from '../db/types.js';
 
 const ConfigInput = z.object({
-  name: z.string().min(1),
-  templateId: z.string().min(1),
-  values: z.record(z.union([z.string(), z.number()])),
+  name: z.string().min(1).max(256),
+  values: z.record(z.union([z.string(), z.number(), z.boolean()])),
 });
 
 const ConfigPatch = z.object({
-  name: z.string().min(1).optional(),
-  values: z.record(z.union([z.string(), z.number()])).optional(),
+  name: z.string().min(1).max(256).optional(),
+  values: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
 });
 
 function toApi(doc: ProductionConfigDoc) {
@@ -22,15 +21,18 @@ function toApi(doc: ProductionConfigDoc) {
 }
 
 const productionConfigsRoutes: FastifyPluginAsync = async (fastify) => {
-  // List configs, optionally filtered by templateId
-  fastify.get<{ Querystring: { templateId?: string } }>('/api/v1/production-configs', async (req, reply) => {
+  // List all configs
+  fastify.get('/api/v1/production-configs', async (_req, reply) => {
     const db = getConfigsDb();
-    const baseSelector = { type: 'production-config' as const };
-    const result = await db.find({
+    let result: Awaited<ReturnType<typeof db.find>>;
+    try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      selector: req.query.templateId ? { ...baseSelector, templateId: req.query.templateId } as any : baseSelector as any,
-    });
-    return reply.send((result.docs as unknown as ProductionConfigDoc[]).map(toApi));
+      result = await db.find({ selector: { type: 'production-config' } as any });
+    } catch (err) {
+      fastify.log.warn({ err }, 'GET /api/v1/production-configs — DB query failed');
+      return reply.status(503).send({ error: 'Database unavailable' });
+    }
+    return reply.send((Array.isArray(result?.docs) ? (result.docs as unknown as ProductionConfigDoc[]) : []).map(toApi));
   });
 
   // Create a config
@@ -41,7 +43,6 @@ const productionConfigsRoutes: FastifyPluginAsync = async (fastify) => {
       _id: `cfg-${randomUUID()}`,
       type: 'production-config',
       name: body.name,
-      templateId: body.templateId,
       values: body.values,
       createdAt: now,
       updatedAt: now,
@@ -59,7 +60,7 @@ const productionConfigsRoutes: FastifyPluginAsync = async (fastify) => {
       const updated: ProductionConfigDoc = {
         ...doc,
         ...(body.name !== undefined && { name: body.name }),
-        ...(body.values !== undefined && { values: body.values }),
+        ...(body.values !== undefined && { values: { ...(doc.values ?? {}), ...body.values } }),
         updatedAt: new Date().toISOString(),
       };
       const response = await getConfigsDb().insert(updated as never);

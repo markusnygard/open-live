@@ -25,7 +25,7 @@ async function makeStromClient(): Promise<StromClient> {
 // In-memory tracking of output flow health state
 // ---------------------------------------------------------------------------
 
-type FlowHealth = 'stopped' | 'healthy' | 'error'
+type FlowHealth = 'stopped' | 'healthy' | 'error' | 'no_clients'
 
 const healthMap = new Map<string, { state: FlowHealth; since: number }>()
 

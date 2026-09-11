@@ -180,7 +180,7 @@ export interface UpdateFlowPropertiesRequest {
 
 // --- Flow operations ---
 
-export type TransitionType = 'cut' | 'fade' | 'slide_left' | 'slide_right' | 'slide_up' | 'slide_down'
+export type TransitionType = string
 
 export interface TriggerTransitionRequest {
   from_input: number
@@ -193,18 +193,160 @@ export interface TransitionResponse {
   success: boolean
 }
 
+/**
+ * Strom Source union — externally-tagged JSON: { "input": N } or { "pip": N }.
+ * Confirmed from origin/main:types/src/vision_mixer.rs — #[serde(rename_all = "lowercase")].
+ */
+export type StromSource = { input: number } | { pip: number }
+
+/**
+ * Strom SelectPreviewRequest (Strom 0.5+): { source: StromSource }
+ * Changed from { input: N, multi?: bool } in Strom 0.4.x.
+ * Route also changed from POST to PUT — confirmed origin/main:backend/src/lib.rs.
+ */
 export interface SelectPreviewRequest {
-  source: { input: number }
+  source: StromSource
+}
+
+/**
+ * A rectangular zone in normalised [0,1] coordinates within the PiP area.
+ * Our own concept — not a Strom API type.
+ */
+export interface PipZone {
+  rect: { x: number; y: number; w: number; h: number } | null
+  capacity: number | null
+  sources: number[]
+  border?: { color: string; width: number } | null   // PR #625: ZoneBorder
+}
+
+/**
+ * Normalized per-source crop: fraction of the source hidden from each edge.
+ * All components 0.0–1.0; all zero = no crop.
+ * Strom 0.6.2+: PUT /pip/{idx} accepts transforms keyed by input index.
+ */
+export interface SourceCrop {
+  left: number
+  top: number
+  right: number
+  bottom: number
+}
+
+/** Per-source crop map for a PiP slot: input index → SourceCrop. */
+export type PipTransforms = Record<number, SourceCrop>
+
+/** Negotiated resolution of a video input (from VisionMixerState.input_resolutions). */
+export interface InputResolution {
+  width: number
+  height: number
+}
+
+/**
+ * Layout config for one PiP slot (background + overlay zones + per-source crops).
+ * Our own concept — mirrors Strom's PipState.
+ */
+export interface PipConfig {
+  bg: number | null
+  zones: PipZone[]
+  transforms: PipTransforms
+}
+
+/**
+ * Body for PUT /api/flows/{id}/blocks/{bid}/pip/{pip_idx}.
+ * Strom 0.6.2+: transforms field added (serde(default) — safe to omit on older Strom).
+ */
+export interface UpdatePipConfigRequest {
+  bg?: number | null
+  zones: PipZone[]
+  transforms?: PipTransforms
+}
+
+export interface UpdatePipConfigResponse {
+  bg: number | null
+  zones: PipZone[]
+  transforms: PipTransforms
+}
+
+/** Runtime PiP state returned by GET state and included in VisionMixerStateResponse. */
+export interface StromPipState {
+  bg: number | null
+  zones: PipZone[]
+  transforms: PipTransforms
 }
 
 export interface SelectPreviewResponse {
-  input: number
+  preview_input: number
+  program_input: number
+  preview_inputs: number[]
+  program_inputs: number[]
+}
+
+// ---------------------------------------------------------------------------
+// Video Effects (PR #626 + #639)
+// ---------------------------------------------------------------------------
+
+// #[serde(tag = "type", rename_all = "snake_case")]
+export type VideoEffect =
+  | { type: 'none' }
+  | { type: 'chroma_key'; key_color?: string; similarity?: number; smoothness?: number; spill?: number }
+  | { type: 'pixelate'; block_size?: number }
+  | { type: 'blur'; radius?: number }
+  | { type: 'duotone'; low?: string; high?: string; mix?: number }
+  | { type: 'vignette'; amount?: number; softness?: number }
+  | { type: 'vhs'; intensity?: number }
+  | { type: 'old_film'; intensity?: number }
+  | { type: 'edge_glow'; color?: string; intensity?: number }
+  | { type: 'crt'; intensity?: number }
+  | { type: 'halftone'; dot_size?: number }
+  | { type: 'thermal'; intensity?: number }
+  | { type: 'night_vision'; intensity?: number }
+  | { type: 'posterize'; levels?: number }
+  | { type: 'underwater'; intensity?: number }
+  | { type: 'color_correct'; brightness?: number; contrast?: number; saturation?: number; hue?: number; gamma?: number; temperature?: number; tint?: number }
+
+// EffectTarget — exact serde from tests:
+// EffectTarget::Input(2) → {"input": 2}
+// EffectTarget::Master  → "master"
+export type EffectTarget = { input: number } | 'master'
+
+export interface SetVideoEffectRequest {
+  target: EffectTarget
+  effect: VideoEffect
+}
+
+export interface SetVideoEffectResponse {
+  message: string
+  effect: VideoEffect
+}
+
+export interface VisionMixerStateResponse {
+  /** First input in PGM group (0-based, backward compat) */
+  program_input: number
+  /** First input in PVW group (0-based, backward compat) */
+  preview_input: number
+  program_inputs: number[]
+  preview_inputs: number[]
+  num_inputs: number
+  input_labels: string[]
+  ftb_active: boolean
+  dsk_enabled: boolean[]
+  overlay_alpha: number
+  /** Per-PiP runtime state (Strom 0.6.2+, serde(default) → [] on older Strom). */
+  pips: StromPipState[]
+  /** Negotiated resolution per input (Strom 0.6.2+, serde(default) → [] on older Strom). */
+  input_resolutions: Array<InputResolution | null>
+  /** Whether the FX engine is available (false on CPU backend or enable_fx=false). PR #626. */
+  fx_available?: boolean
+  /** Per-input video effect (length = num_inputs, serde(default) → [] on older Strom). PR #626. */
+  input_effects?: VideoEffect[]
+  /** Master output video effect (serde(default) → none on older Strom). PR #626. */
+  master_effect?: VideoEffect
 }
 
 export interface AnimateInputRequest {
-  input: string
-  x?: number
-  y?: number
+  /** 0-based input index */
+  input: number
+  xpos?: number
+  ypos?: number
   width?: number
   height?: number
   duration_ms?: number
@@ -244,6 +386,20 @@ export interface OverlayAlphaRequest {
 
 export interface OverlayAlphaResponse {
   alpha: number
+}
+
+// --- Block properties ---
+
+export interface UpdateBlockPropertiesRequest {
+  properties: Record<string, unknown>
+  ramp_ms?: number
+  ramp_ms_overrides?: Record<string, number>
+}
+
+export interface BlockPropertiesResponse {
+  block_id: string
+  properties: Record<string, unknown>
+  rejected: Record<string, string>
 }
 
 // --- Element/pad properties ---
@@ -474,6 +630,7 @@ export type FlowEvent =
   | { type: 'flow_started'; flow_id: string }
   | { type: 'flow_stopped'; flow_id: string }
   | { type: 'MeterData'; data: { flow_id: string; element_id: string; rms: number[]; peak: number[]; decay: number[] } }
+  | { type: 'LoudnessData'; data: { flow_id: string; element_id: string; momentary: number; shortterm: number | null; integrated: number | null; loudness_range: number | null; true_peak: number[] } }
   | { type: 'ping' }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +795,10 @@ export class StromClient {
       const q = index !== undefined ? `?index=${index}` : ''
       return `${this.baseUrl}/api/flows/${id}/blocks/${blockId}/thumbnail${q}`
     },
+    getBlockProperties: (flowId: string, blockId: string) =>
+      this.get<BlockPropertiesResponse>(`/api/flows/${flowId}/blocks/${blockId}/properties`),
+    updateBlockProperties: (flowId: string, blockId: string, body: UpdateBlockPropertiesRequest) =>
+      this.patch<BlockPropertiesResponse>(`/api/flows/${flowId}/blocks/${blockId}/properties`, body),
   }
 
   // -------------------------------------------------------------------------
@@ -653,6 +814,11 @@ export class StromClient {
     transition: (flowId: string, blockId: string, body: TriggerTransitionRequest) =>
       this.post<TransitionResponse>(`/api/flows/${flowId}/blocks/${blockId}/transition`, body),
 
+    /**
+     * Select a preview source on the vision mixer.
+     * PUT (confirmed against origin/main lib.rs — changed from POST in 0.4.x).
+     * Body: { input: 0-based index, multi?: boolean }
+     */
     selectPreview: (flowId: string, blockId: string, body: SelectPreviewRequest) =>
       this.put<SelectPreviewResponse>(`/api/flows/${flowId}/blocks/${blockId}/preview`, body),
 
@@ -668,23 +834,35 @@ export class StromClient {
     animateInput: (flowId: string, blockId: string, body: AnimateInputRequest) =>
       this.post<void>(`/api/flows/${flowId}/blocks/${blockId}/animate`, body),
 
-    getOverlayAlpha: (flowId: string, blockId: string) =>
-      this.get<OverlayAlphaResponse>(`/api/flows/${flowId}/blocks/${blockId}/overlay-alpha`),
-
     setOverlayAlpha: (flowId: string, blockId: string, body: OverlayAlphaRequest) =>
-      this.post<OverlayAlphaResponse>(`/api/flows/${flowId}/blocks/${blockId}/overlay-alpha`, body),
+      this.put<OverlayAlphaResponse>(`/api/flows/${flowId}/blocks/${blockId}/overlay-alpha`, body),
+
+    updatePipConfig: (flowId: string, blockId: string, pipIdx: number, body: UpdatePipConfigRequest) =>
+      this.put<UpdatePipConfigResponse>(`/api/flows/${flowId}/blocks/${blockId}/pip/${pipIdx}`, body),
 
     multiviewEndpoint: (flowId: string, blockId: string) =>
       this.get<MultiviewEndpointResponse>(`/api/flows/${flowId}/blocks/${blockId}/multiview-endpoint`),
 
+    /**
+     * GET the vision-mixer runtime state. Returned type is upstream's
+     * VisionMixerStateResponse (typed `pips`, `input_resolutions`, FX fields)
+     * intersected with an index signature so fork callers that read
+     * unmodelled keys via bracket notation (e.g. `pgm_pip`/`pvw_pip`) still compile.
+     */
     getState: (flowId: string, blockId: string) =>
-      this.get<Record<string, unknown>>(`/api/flows/${flowId}/blocks/${blockId}/state`),
+      this.get<VisionMixerStateResponse & Record<string, unknown>>(`/api/flows/${flowId}/blocks/${blockId}/state`),
 
     updatePip: (flowId: string, blockId: string, pipIdx: number, body: Record<string, unknown>) =>
       this.put<Record<string, unknown>>(`/api/flows/${flowId}/blocks/${blockId}/pip/${pipIdx}`, body),
 
     selectPreviewPip: (flowId: string, blockId: string, pip: number) =>
       this.put<Record<string, unknown>>(`/api/flows/${flowId}/blocks/${blockId}/preview`, { source: { pip } }),
+
+    setVideoEffect: (flowId: string, blockId: string, body: SetVideoEffectRequest) =>
+      this.post<SetVideoEffectResponse>(`/api/flows/${flowId}/blocks/${blockId}/effect`, body),
+
+    getPipState: (flowId: string, blockId: string, pipIdx: number) =>
+      this.get<StromPipState>(`/api/flows/${flowId}/blocks/${blockId}/pip/${pipIdx}`),
   }
 
   // -------------------------------------------------------------------------

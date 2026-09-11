@@ -13,7 +13,7 @@ interface RelayEntry {
 const relays = new Map<string, RelayEntry>();
 const RECONNECT_DELAY_MS = 5000;
 
-export function startMeterRelay(productionId: string, flowId: string, mixerBlockId: string): void {
+export function startMeterRelay(productionId: string, flowId: string, mixerBlockId: string, loudnessBlockId?: string | null): void {
   const existing = relays.get(productionId);
   if (existing) {
     if (existing.flowId !== flowId || existing.mixerBlockId !== mixerBlockId) {
@@ -70,36 +70,46 @@ export function startMeterRelay(productionId: string, flowId: string, mixerBlock
 
       const closeCleanup = strom.connectWebSocket(
         (event) => {
-          if (event.type === 'MeterData') {
-            const { flow_id, element_id, rms, peak } = event.data;
-            if (flow_id !== flowId) return;
-            if (!element_id.startsWith(meterPrefix)) return;
-            const suffix = element_id.slice(meterPrefix.length);
-            if (suffix === 'main') {
-              broadcast(productionId, { type: 'METER_DATA', elementId: 'main', peak, rms });
-              return;
+          if (event.type === 'LoudnessData' && loudnessBlockId) {
+            const { flow_id, element_id, momentary, shortterm, integrated, loudness_range, true_peak } = event.data;
+            if (flow_id !== flowId || element_id !== loudnessBlockId) return;
+            broadcast(productionId, { type: 'LOUDNESS_DATA', elementId: 'main', momentary, shortterm, integrated, loudness_range, true_peak });
+            return;
+          }
+          if (event.type !== 'MeterData') return;
+          const { flow_id, element_id, rms, peak } = event.data;
+          if (flow_id !== flowId) return;
+          if (!element_id.startsWith(meterPrefix)) return;
+          const suffix = element_id.slice(meterPrefix.length);
+          if (suffix === 'main') {
+            broadcast(productionId, { type: 'METER_DATA', elementId: 'main', peak, rms });
+            return;
+          }
+          if (suffix === 'monitor') {
+            broadcast(productionId, { type: 'METER_DATA', elementId: 'monitor', peak, rms });
+            return;
+          }
+          // AUX bus master meters: Strom emits "meter:aux1", "meter:aux2" (1-indexed)
+          if (suffix.startsWith('aux')) {
+            const auxNum = parseInt(suffix.slice(3), 10);
+            if (Number.isFinite(auxNum)) {
+              broadcast(productionId, { type: 'METER_DATA', elementId: `aux${auxNum}`, peak, rms });
             }
-            if (suffix.startsWith('aux')) {
-              const auxNum = parseInt(suffix.slice(3), 10);
-              if (Number.isFinite(auxNum)) {
-                broadcast(productionId, { type: 'METER_DATA', elementId: `aux${auxNum}`, peak, rms });
-              }
-              return;
+            return;
+          }
+          if (suffix.startsWith('group')) {
+            const grpNum = parseInt(suffix.slice(5), 10);
+            if (Number.isFinite(grpNum)) {
+              broadcast(productionId, { type: 'METER_DATA', elementId: `grp${grpNum}`, peak, rms });
             }
-            if (suffix.startsWith('group')) {
-              const grpNum = parseInt(suffix.slice(5), 10);
-              if (Number.isFinite(grpNum)) {
-                broadcast(productionId, { type: 'METER_DATA', elementId: `grp${grpNum}`, peak, rms });
-              }
-              return;
-            }
-            const chNum = parseInt(suffix, 10);
-            if (Number.isFinite(chNum)) {
-              const chId = `ch${chNum}`;
-              chLastSeen.set(chId, Date.now());
-              chZeroed.delete(chId);
-              broadcast(productionId, { type: 'METER_DATA', elementId: chId, peak, rms });
-            }
+            return;
+          }
+          const chNum = parseInt(suffix, 10);
+          if (Number.isFinite(chNum)) {
+            const chId = `ch${chNum}`;
+            chLastSeen.set(chId, Date.now());
+            chZeroed.delete(chId);
+            broadcast(productionId, { type: 'METER_DATA', elementId: chId, peak, rms });
           }
         },
         () => {

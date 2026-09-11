@@ -6,6 +6,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { buildServer } from '../server.js';
+import { resetIceServersCache } from '../routes/ice-servers.js';
 
 // ---------------------------------------------------------------------------
 // Mock CouchDB
@@ -18,9 +19,9 @@ const mockFind = vi.fn();
 vi.mock('../db/index.js', () => ({
   getDb: () => ({ get: mockGet, insert: mockInsert, find: mockFind }),
   getSourcesDb: () => ({ get: mockGet }),
-  getTemplatesDb: () => ({ get: mockGet }),
   connectDb: vi.fn().mockResolvedValue(undefined),
   isDbReady: vi.fn().mockResolvedValue(true),
+  isDbConnected: vi.fn().mockReturnValue(true),
 }));
 
 // ---------------------------------------------------------------------------
@@ -29,6 +30,11 @@ vi.mock('../db/index.js', () => ({
 
 vi.mock('../ws/controller.js', () => ({
   default: async () => {},
+  // The deactivate route imports these live-state cleanup helpers; without them
+  // the mock is missing exports and the handler throws (→ 500) instead of 200.
+  clearAudioState: vi.fn(),
+  clearPipState: vi.fn(),
+  clearFxState: vi.fn(),
 }));
 
 // ---------------------------------------------------------------------------
@@ -37,10 +43,12 @@ vi.mock('../ws/controller.js', () => ({
 
 const mockActivateStromFlow = vi.fn();
 const mockDeactivateStromFlow = vi.fn();
+const mockDeactivateStromOutputFlows = vi.fn(() => Promise.resolve());
 
 vi.mock('../lib/flow-generator.js', () => ({
   activateStromFlow: (...args: unknown[]) => mockActivateStromFlow(...args),
   deactivateStromFlow: (...args: unknown[]) => mockDeactivateStromFlow(...args),
+  deactivateStromOutputFlows: (...args: unknown[]) => mockDeactivateStromOutputFlows(...args),
 }));
 
 // ---------------------------------------------------------------------------
@@ -113,7 +121,7 @@ describe('POST /api/v1/productions/:id/activate', () => {
   });
 
   it('returns 200 with status "activating" immediately', async () => {
-    const doc = makeProductionDoc({ templateId: 'tmpl-1' });
+    const doc = makeProductionDoc();
     mockGet.mockResolvedValue(doc);
     mockInsert.mockResolvedValue({ rev: '2-bcd', ok: true, id: doc._id });
     // The async polling loop will call activateStromFlow — we just let it
@@ -239,6 +247,10 @@ describe('GET /api/v1/ice-servers', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockFind.mockResolvedValue({ docs: [] });
+    // The ice-servers route keeps a module-level stale-on-error cache that
+    // survives across buildServer() instances. Clear it so a cached success
+    // from an earlier test can't be served in place of a mocked error (502).
+    resetIceServersCache();
   });
 
   it('returns 200 with iceServers array from Strom', async () => {

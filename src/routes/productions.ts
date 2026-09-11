@@ -1,13 +1,16 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
-import { getDb, getOutputsDb, getSourcesDb, getTemplatesDb } from '../db/index.js';
+import { getDb, getOutputsDb, getSourcesDb } from '../db/index.js';
 import type { ProductionDoc, ProductionSourceAssignment, ProductionGraphicAssignment, ProductionOutputAssignment, OutputDoc } from '../db/types.js';
 import { StromClient, StromClientError } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { activateStromFlow, deactivateStromFlow, deactivateStromOutputFlows } from '../lib/flow-generator.js';
-import { setTally } from '../services/tally.service.js';
+import { setTally, broadcast, getSubscriberCount } from '../services/tally.service.js';
+import { clearProductionPflState } from '../services/pfl-state.js';
+import { clearPipState, clearAudioState, clearFxState } from '../ws/controller.js';
 import { config } from '../config.js';
+import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 
 /** Extract device number from SDI address/url (handles "0", "sdi://decklink/1", etc.) */
 function normalizeSdiDevice(raw: string | undefined): string | null {
@@ -34,6 +37,86 @@ const activationAbortControllers = new Map<string, AbortController>();
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Error thrown when the WHIP callback base URL cannot be safely resolved from
+ * an incoming request (e.g. an untrusted X-Forwarded-Host was supplied and
+ * neither PUBLIC_BASE_URL nor a TRUSTED_HOSTS allow-list vouches for it).
+ * Carries statusCode 400 so Fastify's error handler surfaces it as a client
+ * error rather than a 500.
+ */
+export class UntrustedHostError extends Error {
+  statusCode = 400;
+  constructor(message: string) {
+    super(message);
+    this.name = 'UntrustedHostError';
+  }
+}
+
+/**
+ * Resolve the public base URL used to build WHIP callback URLs that get
+ * persisted in CouchDB.
+ *
+ * Security (#50): the previous implementation read the raw X-Forwarded-Proto /
+ * X-Forwarded-Host headers, bypassing Fastify's trustProxy mechanism and
+ * letting any client inject `X-Forwarded-Host: attacker.com` to persist an
+ * attacker-controlled WHIP callback endpoint.
+ *
+ * Resolution order:
+ *   1. If PUBLIC_BASE_URL is configured, always use it (never trust the request).
+ *   2. Otherwise derive proto/host from `req.protocol` / `req.hostname`, which
+ *      honour X-Forwarded-* only for trusted proxies (Fastify trustProxy).
+ *      - If a TRUSTED_HOSTS allow-list is configured, the derived host must be
+ *        on it, else the request is rejected (UntrustedHostError → 400).
+ *      - If no allow-list is configured, only loopback/localhost hosts are
+ *        accepted; any other (proxy-forwarded) host is rejected so an attacker
+ *        cannot persist an arbitrary host. This keeps local dev working while
+ *        refusing to trust an unvalidated forwarded host in a proxied setup.
+ */
+export function resolvePublicBaseUrl(
+  req: { protocol?: string; hostname?: string },
+  cfg: { publicBaseUrl?: string; trustedHosts: readonly string[] } = config,
+): string {
+  if (cfg.publicBaseUrl) return cfg.publicBaseUrl;
+
+  const proto = req.protocol ?? 'https';
+  // req.hostname respects trustProxy: it reflects X-Forwarded-Host only when the
+  // connecting peer is a trusted proxy. It still cannot vouch for *which* host is
+  // legitimate, so we validate it below.
+  const host = (req.hostname ?? '').toLowerCase();
+  if (!host) {
+    throw new UntrustedHostError(
+      'Cannot determine request host to build the WHIP callback URL. ' +
+      'Set PUBLIC_BASE_URL to the externally reachable URL of this service.',
+    );
+  }
+
+  const hostname = host.split(':')[0]!;
+  const isLoopback =
+    hostname === 'localhost' ||
+    hostname === '127.0.0.1' ||
+    hostname === '::1' ||
+    hostname === '[::1]';
+
+  if (cfg.trustedHosts.length > 0) {
+    if (!cfg.trustedHosts.includes(hostname)) {
+      throw new UntrustedHostError(
+        `Request host "${hostname}" is not in the TRUSTED_HOSTS allow-list. ` +
+        'Set PUBLIC_BASE_URL or add the host to TRUSTED_HOSTS to build WHIP callback URLs.',
+      );
+    }
+  } else if (!isLoopback) {
+    // No allow-list and a non-loopback (proxy-forwarded) host: refuse to persist
+    // it, since we have no way to distinguish a legitimate host from an injected one.
+    throw new UntrustedHostError(
+      `Refusing to build a WHIP callback URL from untrusted host "${hostname}". ` +
+      'Set PUBLIC_BASE_URL to the externally reachable URL of this service, ' +
+      'or list allowed hosts in TRUSTED_HOSTS.',
+    );
+  }
+
+  return `${proto}://${host}`;
+}
 
 /**
  * Write a partial update to ProductionDoc with retry-on-409.
@@ -83,6 +166,7 @@ async function runActivationFlow(
   let stromFlowId: string | undefined;
   let mixerBlockId: string | undefined;
   let audioMixerBlockId: string | undefined;
+  let loudnessMainBlockId: string | undefined;
   let whepOutputEntries: Array<{ outputId: string; endpointId: string }> | undefined;
   let pgmWhepEndpointId: string | undefined;
 
@@ -121,7 +205,7 @@ async function runActivationFlow(
           const padIndex = parseInt(padMatch[1], 10);
           const assignment = doc.sources?.find((s) => s.mixerInput === `video_in_${padIndex}`);
           if (!assignment) continue;
-          const srcDoc = await getSourcesDb().get(assignment.sourceId).catch(() => null) as { playlist?: string[] } | null;
+          const srcDoc = await getSourcesDb().get(assignment.sourceId).catch(() => null) as { playlist?: string[]; address?: string } | null;
           if (srcDoc?.playlist && srcDoc.playlist.length > 0) {
             const mediaRoot = '/host/media';
             const basePath = (srcDoc.address || '').replace(/^~\/media\//, '').replace(/^~\//, '').replace(/^\//, '').replace(/^media\//, '');
@@ -141,6 +225,7 @@ async function runActivationFlow(
     stromFlowId = activation.flowId;
     mixerBlockId = activation.mixerBlockId ?? undefined;
     audioMixerBlockId = activation.audioMixerBlockId ?? undefined;
+    loudnessMainBlockId = activation.loudnessMainBlockId ?? undefined;
     whepOutputEntries = activation.whepOutputEntries;
     pgmWhepEndpointId = activation.pgmWhepEndpointId;
     // mixerBlockId/audioMixerBlockId come directly from the flow generator — they are the
@@ -156,7 +241,9 @@ async function runActivationFlow(
       stromFlowId,
       ...(mixerBlockId !== undefined && { mixerBlockId }),
       ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
+      ...(loudnessMainBlockId !== undefined && { loudnessMainBlockId }),
       ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
+      ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
     });
 
     // Step 3: Poll until flow reaches 'playing' or we time out
@@ -177,8 +264,9 @@ async function runActivationFlow(
         // so always prefer the live flow value over the template-derived one.
         const runningAudioBlock = (flow.blocks ?? []).find(
           (b) => (b as unknown as { block_definition_id?: string }).block_definition_id === 'builtin.mixer',
-        ) as { id?: string } | undefined;
+        ) as { id?: string; properties?: Record<string, unknown> } | undefined;
         if (runningAudioBlock?.id) audioMixerBlockId = runningAudioBlock.id;
+
 
         // Re-resolve sourceOffsetBlockIds from the running flow — Strom may assign server-generated
         // IDs that differ from the template block IDs we stored at activation time.
@@ -190,17 +278,28 @@ async function runActivationFlow(
         );
         if (runningOffsetBlocks.length > 0) {
           const resolvedOffsetBlockIds: Record<string, string> = {};
+          const resolvedAudioOffsetBlockIds: Record<string, string> = {};
           for (const offsetBlock of runningOffsetBlocks) {
             if (!offsetBlock.id) continue;
-            // Name is "Offset V{N}" → mixerInput "video_in_{N}"
-            const nameMatch = /^Offset V(\d+)$/.exec(offsetBlock.name ?? '');
-            if (!nameMatch) continue;
-            const mixerInput = `video_in_${nameMatch[1]}`;
-            resolvedOffsetBlockIds[mixerInput] = offsetBlock.id;
+            // "Offset V{N}" → video_in_{N}
+            const videoMatch = /^Offset V(\d+)$/.exec(offsetBlock.name ?? '');
+            if (videoMatch) {
+              resolvedOffsetBlockIds[`video_in_${videoMatch[1]}`] = offsetBlock.id;
+              continue;
+            }
+            // "Offset A{N}" → video_in_{N} (audio delay, keyed by the same mixerInput)
+            const audioMatch = /^Offset A(\d+)$/.exec(offsetBlock.name ?? '');
+            if (audioMatch) {
+              resolvedAudioOffsetBlockIds[`video_in_${audioMatch[1]}`] = offsetBlock.id;
+            }
           }
           if (Object.keys(resolvedOffsetBlockIds).length > 0) {
             activation.sourceOffsetBlockIds = resolvedOffsetBlockIds;
             log.info({ productionId, resolvedOffsetBlockIds }, 'Re-resolved sourceOffsetBlockIds from running flow');
+          }
+          if (Object.keys(resolvedAudioOffsetBlockIds).length > 0) {
+            activation.sourceAudioOffsetBlockIds = resolvedAudioOffsetBlockIds;
+            log.info({ productionId, resolvedAudioOffsetBlockIds }, 'Re-resolved sourceAudioOffsetBlockIds from running flow');
           }
         }
 
@@ -274,8 +373,12 @@ async function runActivationFlow(
           whepOutputUrls: whepOutputUrls && whepOutputUrls.length > 0 ? whepOutputUrls : undefined,
           tally: initialTally,
           ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
+          ...(loudnessMainBlockId !== undefined && { loudnessMainBlockId }),
           ...(Object.keys(activation.sourceOffsetBlockIds).length > 0 && { sourceOffsetBlockIds: activation.sourceOffsetBlockIds }),
+          ...(Object.keys(activation.sourceAudioOffsetBlockIds).length > 0 && { sourceAudioOffsetBlockIds: activation.sourceAudioOffsetBlockIds }),
         });
+
+        notifyProductionActivated(productionId);
 
         // Stop media players after activation — they auto-start when the flow
         // reaches PLAYING, but the operator should start playback manually.
@@ -308,7 +411,7 @@ async function runActivationFlow(
 
     // Best-effort flow cleanup
     if (stromFlowId) {
-      const stromToken = await getStromToken(config.stromToken).catch((err) => { log.error({ err }, "SAT exchange failed — proceeding without auth"); return undefined; });
+      const stromToken = await getStromToken(config.stromToken).catch((err) => { log.error({ errMsg: err instanceof Error ? err.message : String(err) }, "SAT exchange failed — proceeding without auth"); return undefined; });
       const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
       await deactivateStromFlow(stromFlowId, strom).catch(() => undefined);
       await deactivateStromOutputFlows(productionId, strom).catch(() => {});
@@ -325,6 +428,8 @@ async function runActivationFlow(
     }).catch((resetErr) => {
       log.error({ resetErr, productionId }, 'Failed to reset production to inactive after activation failure');
     });
+
+    notifyProductionDeactivated(productionId);
   } finally {
     activationAbortControllers.delete(productionId);
   }
@@ -335,28 +440,87 @@ async function runActivationFlow(
 // ---------------------------------------------------------------------------
 
 const ProductionInput = z.object({
-  name: z.string().min(1),
+  name: z.string().min(1).max(256),
   sources: z.array(z.object({
     sourceId: z.string().min(1),
     mixerInput: z.string().min(1),
   })).optional(),
 });
 
+// Format-specific allowlists for production `values` that are forwarded verbatim
+// to Strom block properties by flow-generator.ts. Validated here so malformed
+// values are rejected with a 400 (via the global ZodError handler) rather than
+// being injected into Strom flow properties (issue #88).
+//
+// - resolution keys (pgm_resolution, multiview_resolution) → e.g. "1280x720"
+// - framerate keys  (pgm_framerate, multiview_framerate)   → e.g. "30" or "30000/1001"
+//   (fractions must allow NTSC-style rates like 30000/1001, so up to 6 digits/side)
+// - clock → forwarded as the flow-level `clock_type` property; fixed set only.
+const RESOLUTION_RE = /^\d{3,5}x\d{3,5}$/;
+const FRAMERATE_RE = /^\d{1,6}\/\d{1,6}$|^\d{1,3}$/;
+const CLOCK_TYPES = new Set(['ntp', 'gst', 'system']);
+
+const RESOLUTION_VALUE_KEYS = ['pgm_resolution', 'multiview_resolution'] as const;
+const FRAMERATE_VALUE_KEYS = ['pgm_framerate', 'multiview_framerate'] as const;
+
+const ProductionValues = z
+  .record(z.union([z.string(), z.number(), z.boolean()]))
+  .superRefine((values, ctx) => {
+    for (const key of RESOLUTION_VALUE_KEYS) {
+      const v = values[key];
+      if (typeof v === 'string' && !RESOLUTION_RE.test(v)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: `${key} must match <width>x<height> (e.g. "1280x720")`,
+        });
+      }
+    }
+    for (const key of FRAMERATE_VALUE_KEYS) {
+      const v = values[key];
+      if (typeof v === 'string' && !FRAMERATE_RE.test(v)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: `${key} must be an integer or fraction (e.g. "30" or "30000/1001")`,
+        });
+      }
+    }
+    const clock = values['clock'];
+    if (typeof clock === 'string' && clock !== '' && !CLOCK_TYPES.has(clock)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['clock'],
+        message: `clock must be one of: ${[...CLOCK_TYPES].join(', ')}`,
+      });
+    }
+  });
+
 const ProductionPatch = z.object({
-  name: z.string().min(1).optional(),
+  name: z.string().min(1).max(256).optional(),
   templateId: z.string().nullable().optional(),
-  values: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
+  values: ProductionValues.optional(),
   airTime: z.string().datetime().nullable().optional(),
 });
 
+// mixerInput must match the Strom pad naming convention (e.g. "video_in_0", "video_in_15")
+const mixerInputSchema = z.string().regex(/^video_in_\d{1,2}$/, 'mixerInput must match video_in_N format').max(20);
+
+// dskInput must match the Strom DSK pad naming convention (e.g. "dsk_in_0"). It is
+// forwarded verbatim into a Strom flow link `to` field by flow-generator.ts
+// (`${mixerBlockId}:${assignment.dskInput}`), so an unvalidated value containing a
+// `:` or other unexpected characters corrupts the flow topology (issue #61). Mirror
+// the mixerInput allowlist so only well-formed pad names reach the Strom pipeline.
+const dskInputSchema = z.string().regex(/^dsk_in_\d+$/, 'dskInput must match dsk_in_N format').max(20);
+
 const SourceAssignmentInput = z.object({
-  sourceId: z.string().min(1),
-  mixerInput: z.string().min(1),
+  sourceId: z.string().min(1).max(128),
+  mixerInput: mixerInputSchema,
 });
 
 const GraphicAssignmentInput = z.object({
   graphicId: z.string().min(1),
-  dskInput: z.string().min(1),
+  dskInput: dskInputSchema,
 });
 
 const OutputAssignmentInput = z.object({
@@ -371,8 +535,22 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
   // List all productions
   fastify.get('/api/v1/productions', async (_req, reply) => {
     const db = getDb();
-    const result = await db.find({ selector: { type: 'production' } });
-    return reply.send(result.docs.map((d: any) => ({ ...d, id: d._id })));
+    let result: Awaited<ReturnType<typeof db.find>>;
+    try {
+      result = await db.find({ selector: { type: 'production' } });
+    } catch (err) {
+      fastify.log.warn({ err }, 'GET /api/v1/productions — DB query failed');
+      return reply.status(503).send({ error: 'Database unavailable' });
+    }
+    const docs = (Array.isArray(result?.docs) ? (result.docs as ProductionDoc[]) : []).map((doc) => {
+      const base = { ...doc, id: doc._id };
+      if (doc.status !== 'active') return base;
+      const subscriberCount = getSubscriberCount(doc._id);
+      const idleSinceAt = getIdleSince(doc._id);
+      const idleExpiresAt = idleSinceAt !== undefined ? getIdleExpiresAt(idleSinceAt) : undefined;
+      return { ...base, subscriberCount, ...(idleExpiresAt !== undefined ? { idleExpiresAt } : {}) };
+    });
+    return reply.send(docs);
   });
 
   // Create a production
@@ -396,11 +574,13 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     return reply.status(201).send({ ...doc, _rev: response.rev });
   });
 
-  // Companion module controller endpoint — returns production with id field
+  // Companion module controller endpoint — returns the production with an `id`
+  // field plus the connected-controller `count` used by the companion module's
+  // "peers connected" indicator on the landing page.
   fastify.get<{ Params: { id: string } }>('/api/v1/productions/:id/controllers', async (req, reply) => {
     try {
       const doc = await getDb().get(req.params.id);
-      return reply.send({ ...doc, id: doc._id });
+      return reply.send({ ...doc, id: doc._id, count: getSubscriberCount(doc._id) });
     } catch {
       return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
     }
@@ -408,11 +588,23 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
 
   // Get a production
   fastify.get<{ Params: { id: string } }>('/api/v1/productions/:id', async (req, reply) => {
+    let doc: ProductionDoc;
     try {
-      const doc = await getDb().get(req.params.id);
-      return reply.send(doc);
+      doc = await getDb().get(req.params.id);
     } catch {
       return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+    }
+    if (doc.status !== 'active' || !doc.stromFlowId || !doc.mixerBlockId) {
+      return reply.send(doc);
+    }
+    try {
+      const stromToken = await getStromToken(config.stromToken);
+      const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
+      const mixerState = await strom.mixer.getState(doc.stromFlowId, doc.mixerBlockId);
+      return reply.send({ ...doc, inputResolutions: mixerState.input_resolutions });
+    } catch (err) {
+      fastify.log.warn({ err }, 'GET /api/v1/productions/:id — failed to fetch input_resolutions from Strom');
+      return reply.send(doc);
     }
   });
 
@@ -425,7 +617,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         ...doc,
         ...(body.name !== undefined && { name: body.name }),
         ...(body.templateId !== undefined && { templateId: body.templateId ?? undefined }),
-        ...(body.values !== undefined && { values: body.values }),
+        ...(body.values !== undefined && { values: { ...(doc.values ?? {}), ...body.values } }),
         ...(body.airTime !== undefined && { airTime: body.airTime ?? undefined }),
         updatedAt: new Date().toISOString(),
       };
@@ -465,7 +657,10 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
 
   // Activate a production — immediately returns 'activating', then polls Strom
   // for flow state in a fire-and-forget async loop.
-  fastify.post<{ Params: { id: string } }>('/api/v1/productions/:id/activate', async (req, reply) => {
+  fastify.post<{ Params: { id: string } }>(
+    '/api/v1/productions/:id/activate',
+    { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } },
+    async (req, reply) => {
     try {
       const doc = await getDb().get(req.params.id);
 
@@ -504,26 +699,29 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         }
       }
 
+      // Resolve the public base URL for WHIP callback URLs BEFORE mutating any
+      // state. Prefers the explicitly configured PUBLIC_BASE_URL; otherwise
+      // derives it from trustProxy-aware request fields and validates the host
+      // to prevent X-Forwarded-Host injection (#50). Throws UntrustedHostError
+      // (→ 400) rather than persisting an attacker-controlled host into CouchDB.
+      // Resolving here (before the 'activating' write) means a rejected host
+      // does not leave the production stuck mid-activation.
+      const publicBaseUrl = resolvePublicBaseUrl(req);
+
       // Transition to 'activating' immediately and respond; clear any deletion warnings
       const activatingDoc: ProductionDoc = {
         ...doc,
         status: 'activating',
         deletionWarnings: undefined,
+        autoDeactivated: undefined,
         updatedAt: new Date().toISOString(),
       };
       const insertResponse = await getDb().insert(activatingDoc);
+      notifyProductionActivated(doc._id);
 
       // Set up AbortController so deactivate can cancel the polling loop
       const abortController = new AbortController();
       activationAbortControllers.set(doc._id, abortController);
-
-      const proto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim()
-        ?? req.protocol
-        ?? 'https'
-      const host = (req.headers['x-forwarded-host'] as string | undefined)
-        ?? (req.headers.host as string | undefined)
-        ?? req.hostname
-      const publicBaseUrl = `${proto}://${host}`
 
       // Fire-and-forget — must never let a rejection escape to the global handler
       void runActivationFlow(doc._id, abortController.signal, fastify.log, publicBaseUrl).catch((err) => {
@@ -538,9 +736,14 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         _rev: insertResponse.rev,
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      fastify.log.error({ err }, 'Failed to initiate production activation');
-      return reply.status(500).send({ error: message, statusCode: 500 });
+      // Untrusted / missing host for the WHIP callback URL is a client-input
+      // problem (host-header injection attempt or misconfiguration), not a
+      // server fault — surface it as a 400 rather than a generic 500.
+      if (err instanceof UntrustedHostError) {
+        return reply.status(400).send({ error: err.message, statusCode: 400 });
+      }
+      req.log.error({ err }, 'Activation failed');
+      return reply.status(500).send({ error: 'Activation failed — check server logs', statusCode: 500 });
     }
   });
 
@@ -557,8 +760,16 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         activationAbortControllers.delete(doc._id);
       }
 
+      clearProductionPflState(doc._id);
+      clearAudioState(doc._id);
+      clearPipState(doc._id);
+      clearFxState(doc._id);
+      // Broadcast group-state reset so all connected clients clear their ephemeral
+      // group assignments — these are live-only and must not survive deactivation.
+      broadcast(doc._id, { type: 'GRP_STATE_RESET' });
+      broadcast(doc._id, { type: 'PRODUCTION_DEACTIVATED' });
       if (doc.stromFlowId) {
-        const stromToken = await getStromToken(config.stromToken).catch((err) => { req.log.error({ err }, "SAT exchange failed — proceeding without auth"); return undefined; });
+        const stromToken = await getStromToken(config.stromToken).catch((err) => { req.log.error({ errMsg: err instanceof Error ? err.message : String(err) }, "SAT exchange failed — proceeding without auth"); return undefined; });
         const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
         await deactivateStromFlow(doc.stromFlowId, strom);
         await deactivateStromOutputFlows(doc._id, strom).catch(() => {});
@@ -570,62 +781,68 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         stromFlowId: undefined,
         mixerBlockId: undefined,
         audioMixerBlockId: undefined,
+        loudnessMainBlockId: undefined,
         sourceOffsetBlockIds: undefined,
+        sourceAudioOffsetBlockIds: undefined,
         whepEndpoint: undefined,
         pgmWhepEndpoint: undefined,
         whipEndpoints: undefined,
         srtOutputUri: undefined,
         whepOutputUrls: undefined,
-        overlayAlpha: undefined,
-        dskLayers: undefined,
         tally: { pgm: null, pvw: null },
         updatedAt: new Date().toISOString(),
       };
       const response = await getDb().insert(updated);
+      notifyProductionDeactivated(doc._id);
       return reply.send({ id: updated._id, name: updated.name, status: updated.status, _rev: response.rev });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      fastify.log.error({ err }, 'Failed to deactivate production');
-      return reply.status(500).send({ error: message, statusCode: 500 });
+      req.log.error({ err }, 'Deactivation failed');
+      return reply.status(500).send({ error: 'Deactivation failed — check server logs', statusCode: 500 });
     }
   });
 
   // Assign a source to a mixer input
   fastify.post<{ Params: { id: string } }>('/api/v1/productions/:id/sources', async (req, reply) => {
     const body = SourceAssignmentInput.parse(req.body);
-    try {
-      const doc = await getDb().get(req.params.id);
-
-      // Prevent using the same DeckLink device as both source and output
+    const assignment: ProductionSourceAssignment = { sourceId: body.sourceId, mixerInput: body.mixerInput };
+    for (let attempt = 0; attempt < MAX_DB_WRITE_RETRIES; attempt++) {
       try {
-        const srcDoc = await getSourcesDb().get(body.sourceId) as any;
-        if (srcDoc.streamType === 'sdi' && srcDoc.address) {
-          const srcDev = normalizeSdiDevice(srcDoc.address);
-          for (const out of (doc.outputAssignments ?? [])) {
-            try {
-              const outDoc = await getOutputsDb().get(out.outputId) as any;
-              if (outDoc.outputType === 'sdi' && normalizeSdiDevice(outDoc.url) === srcDev) {
-                return reply.status(409).send({
-                  error: `DeckLink device ${srcDev} is already used as an output`,
-                  statusCode: 409,
-                });
-              }
-            } catch { /* output may not exist */ }
-          }
-        }
-      } catch { /* source may not exist */ }
+        const doc = await getDb().get(req.params.id);
 
-      // Replace existing assignment for the same mixerInput, or add new
-      const existing = doc.sources.findIndex((s) => s.mixerInput === body.mixerInput);
-      const assignment: ProductionSourceAssignment = { sourceId: body.sourceId, mixerInput: body.mixerInput };
-      const sources = existing !== -1
-        ? doc.sources.map((s, i) => (i === existing ? assignment : s))
-        : [...doc.sources, assignment];
-      const updated: ProductionDoc = { ...doc, sources, updatedAt: new Date().toISOString() };
-      const response = await getDb().insert(updated);
-      return reply.status(201).send({ ...assignment, _rev: response.rev });
-    } catch {
-      return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+        // Prevent using the same DeckLink device as both source and output
+        try {
+          const srcDoc = await getSourcesDb().get(body.sourceId) as any;
+          if (srcDoc.streamType === 'sdi' && srcDoc.address) {
+            const srcDev = normalizeSdiDevice(srcDoc.address);
+            for (const out of (doc.outputAssignments ?? [])) {
+              try {
+                const outDoc = await getOutputsDb().get(out.outputId) as any;
+                if (outDoc.outputType === 'sdi' && normalizeSdiDevice(outDoc.url) === srcDev) {
+                  return reply.status(409).send({
+                    error: `DeckLink device ${srcDev} is already used as an output`,
+                    statusCode: 409,
+                  });
+                }
+              } catch { /* output may not exist */ }
+            }
+          }
+        } catch { /* source may not exist */ }
+
+        // Replace existing assignment for the same mixerInput, or add new
+        const existing = doc.sources.findIndex((s) => s.mixerInput === body.mixerInput);
+        const unsorted = existing !== -1
+          ? doc.sources.map((s, i) => (i === existing ? assignment : s))
+          : [...doc.sources, assignment];
+        const sources = [...unsorted].sort((a, b) => a.mixerInput.localeCompare(b.mixerInput));
+        const updated: ProductionDoc = { ...doc, sources, updatedAt: new Date().toISOString() };
+        const response = await getDb().insert(updated);
+        return reply.status(201).send({ ...assignment, _rev: response.rev });
+      } catch (err) {
+        if (err instanceof Error && 'statusCode' in err && (err as { statusCode?: number }).statusCode === 409) {
+          if (attempt < MAX_DB_WRITE_RETRIES - 1) continue;
+        }
+        return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+      }
     }
   });
 
@@ -633,19 +850,28 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.delete<{ Params: { id: string; mixerInput: string } }>(
     '/api/v1/productions/:id/sources/:mixerInput',
     async (req, reply) => {
-      try {
-        const doc = await getDb().get(req.params.id);
-        const exists = doc.sources.some((s) => s.mixerInput === req.params.mixerInput);
-        if (!exists) return reply.status(404).send({ error: 'Source assignment not found', statusCode: 404 });
-        const updated: ProductionDoc = {
-          ...doc,
-          sources: doc.sources.filter((s) => s.mixerInput !== req.params.mixerInput),
-          updatedAt: new Date().toISOString(),
-        };
-        await getDb().insert(updated);
-        return reply.status(204).send();
-      } catch {
-        return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+      const mixerInputParsed = mixerInputSchema.safeParse(req.params.mixerInput);
+      if (!mixerInputParsed.success) {
+        return reply.status(400).send({ error: 'Invalid mixerInput format', statusCode: 400 });
+      }
+      for (let attempt = 0; attempt < MAX_DB_WRITE_RETRIES; attempt++) {
+        try {
+          const doc = await getDb().get(req.params.id);
+          const exists = doc.sources.some((s) => s.mixerInput === req.params.mixerInput);
+          if (!exists) return reply.status(404).send({ error: 'Source assignment not found', statusCode: 404 });
+          const updated: ProductionDoc = {
+            ...doc,
+            sources: doc.sources.filter((s) => s.mixerInput !== req.params.mixerInput),
+            updatedAt: new Date().toISOString(),
+          };
+          await getDb().insert(updated);
+          return reply.status(204).send();
+        } catch (err) {
+          if (err instanceof Error && 'statusCode' in err && (err as { statusCode?: number }).statusCode === 409) {
+            if (attempt < MAX_DB_WRITE_RETRIES - 1) continue;
+          }
+          return reply.status(404).send({ error: 'Production not found', statusCode: 404 });
+        }
       }
     }
   );
@@ -672,6 +898,10 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.delete<{ Params: { id: string; dskInput: string } }>(
     '/api/v1/productions/:id/graphics/:dskInput',
     async (req, reply) => {
+      const dskInputParsed = dskInputSchema.safeParse(req.params.dskInput);
+      if (!dskInputParsed.success) {
+        return reply.status(400).send({ error: 'Invalid dskInput format', statusCode: 400 });
+      }
       try {
         const doc = await getDb().get(req.params.id);
         const exists = (doc.graphicAssignments ?? []).some((g) => g.dskInput === req.params.dskInput);
@@ -761,7 +991,6 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         const playerBlocks = (flow.blocks ?? []).filter((b: { block_definition_id?: string }) =>
           b.block_definition_id === 'builtin.media_player'
         );
-        const endpointSuffix = doc._id.replace(/^prod-/, '').slice(0, 8);
         for (const pb of playerBlocks) {
           const padMatch = (pb.id as string).match(/b-input-(\d+)-/);
           if (!padMatch) continue;
@@ -772,7 +1001,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
             // Attach clip marks from the source doc for the current clip
             try {
               const srcDoc = await getSourcesDb().get(assignment.sourceId) as any;
-              const idx = state.current_file_index;
+              const idx = (state as any).current_file_index;
               const marks = srcDoc?.clipMarks?.[idx];
               if (marks) (state as any).clipMarks = marks;
               (state as any).allClipMarks = srcDoc?.clipMarks ?? [];

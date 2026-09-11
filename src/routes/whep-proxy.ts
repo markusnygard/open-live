@@ -1,6 +1,12 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { getStromToken } from '../lib/strom-token.js';
+import { assertSameStromOrigin } from '../lib/url-validation.js';
 import { config } from '../config.js';
+
+/** Validates a proxy target URL is on the configured Strom host (prevents SSRF + token exfiltration). */
+function validateProxyTarget(targetUrl: string): void {
+  assertSameStromOrigin(targetUrl, config.stromUrl, 'Target URL');
+}
 
 /**
  * WHEP signaling proxy — forwards SDP offer/answer and teardown to Strom.
@@ -25,27 +31,36 @@ const whepProxyRoutes: FastifyPluginAsync = async (fastify) => {
     done(null, body)
   })
 
-  fastify.post<{ Querystring: { target: string } }>('/api/v1/whep-proxy', async (req, reply) => {
+  fastify.post<{ Querystring: { target: string } }>(
+    '/api/v1/whep-proxy',
+    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
+    async (req, reply) => {
     const target = req.query.target
     if (!target) return reply.status(400).send({ error: 'Missing target query parameter' })
 
     let targetUrl: string
     try {
       targetUrl = decodeURIComponent(target)
-      new URL(targetUrl) // validate
-    } catch {
-      return reply.status(400).send({ error: 'Invalid target URL' })
+      validateProxyTarget(targetUrl)
+    } catch (err) {
+      return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid target URL' })
     }
 
     const token = await getStromToken(config.stromToken).catch(() => undefined)
     const headers: Record<string, string> = { 'Content-Type': 'application/sdp' }
     if (token) headers['Authorization'] = `Bearer ${token}`
 
-    const upstream = await fetch(targetUrl, {
-      method: 'POST',
-      headers,
-      body: req.body as string,
-    })
+    let upstream: Response
+    try {
+      upstream = await fetch(targetUrl, {
+        method: 'POST',
+        headers,
+        body: req.body as string,
+      })
+    } catch (err) {
+      fastify.log.warn({ err }, 'WHEP proxy: upstream unreachable')
+      return reply.status(502).send({ error: 'Upstream unreachable' })
+    }
 
     if (!upstream.ok) {
       const text = await upstream.text()
@@ -76,9 +91,9 @@ const whepProxyRoutes: FastifyPluginAsync = async (fastify) => {
     let targetUrl: string
     try {
       targetUrl = decodeURIComponent(target)
-      new URL(targetUrl)
-    } catch {
-      return reply.status(400).send({ error: 'Invalid target URL' })
+      validateProxyTarget(targetUrl)
+    } catch (err) {
+      return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid target URL' })
     }
 
     const token = await getStromToken(config.stromToken).catch(() => undefined)

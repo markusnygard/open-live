@@ -21,9 +21,9 @@ const mockInsert = vi.fn();
 vi.mock('../db/index.js', () => ({
   getDb: () => ({ get: mockGet, insert: mockInsert, find: vi.fn().mockResolvedValue({ docs: [] }) }),
   getSourcesDb: () => ({ get: mockGet, insert: mockInsert, find: vi.fn().mockResolvedValue({ docs: [] }) }),
-  getTemplatesDb: () => ({ get: mockGet, insert: mockInsert, find: vi.fn().mockResolvedValue({ docs: [] }) }),
   connectDb: vi.fn().mockResolvedValue(undefined),
   isDbReady: vi.fn().mockResolvedValue(true),
+  isDbConnected: vi.fn().mockReturnValue(true),
 }));
 
 // Prevent the WebSocket controller from doing anything at startup

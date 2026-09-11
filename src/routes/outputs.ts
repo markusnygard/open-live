@@ -4,9 +4,12 @@ import { z } from 'zod';
 import { getOutputsDb, getDb } from '../db/index.js';
 import type { OutputDoc, ProductionDoc } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
+import { srtUrl } from '../lib/url-validation.js';
+
+const SRT_OUTPUT_TYPES = new Set(['mpegtssrt', 'efpsrt']);
 
 const OutputInput = z.object({
-  name: z.string().min(1),
+  name: z.string().min(1).max(256),
   outputType: z.enum(['mpegtssrt', 'efpsrt', 'whep', 'ndi', 'sdi', 'recorder']),
   url: z.string().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
@@ -15,10 +18,18 @@ const OutputInput = z.object({
   outputDir: z.string().optional(),
   container: z.string().optional(),
   preset: z.string().optional(),
+}).superRefine((data, ctx) => {
+  if (SRT_OUTPUT_TYPES.has(data.outputType) && data.url) {
+    try {
+      srtUrl(data.url);
+    } catch (err) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['url'], message: err instanceof Error ? err.message : 'Invalid SRT URL' });
+    }
+  }
 });
 
 const OutputPatch = z.object({
-  name: z.string().min(1).optional(),
+  name: z.string().min(1).max(256).optional(),
   url: z.string().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
   videoSource: z.string().optional(),
@@ -58,8 +69,14 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
   });
   fastify.get('/api/v1/outputs', async (_req, reply) => {
     const db = getOutputsDb();
-    const result = await db.find({ selector: { type: 'output' } });
-    return reply.send(result.docs.map(toApi));
+    let result: Awaited<ReturnType<typeof db.find>>;
+    try {
+      result = await db.find({ selector: { type: 'output' } });
+    } catch (err) {
+      fastify.log.warn({ err }, 'GET /api/v1/outputs — DB query failed');
+      return reply.status(503).send({ error: 'Database unavailable' });
+    }
+    return reply.send((Array.isArray(result?.docs) ? result.docs : []).map(toApi));
   });
 
   fastify.post('/api/v1/outputs', async (req, reply) => {
@@ -97,11 +114,23 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
     const body = OutputPatch.parse(req.body);
     try {
       const doc = await getOutputsDb().get(req.params.id);
+      // Validate the effective URL if output type is SRT-based
+      const effectiveUrl = body.url ?? doc.url;
+      if (SRT_OUTPUT_TYPES.has(doc.outputType) && effectiveUrl) {
+        try {
+          srtUrl(effectiveUrl);
+        } catch (err) {
+          return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid SRT URL' });
+        }
+      }
       const updated: OutputDoc = { ...doc, ...body, updatedAt: new Date().toISOString() };
       await getOutputsDb().insert(updated);
       return reply.send(toApi(updated));
-    } catch {
-      return reply.status(404).send({ error: 'Output not found', statusCode: 404 });
+    } catch (err: unknown) {
+      if (err && typeof err === 'object' && 'statusCode' in err && (err as { statusCode: number }).statusCode === 404) {
+        return reply.status(404).send({ error: 'Output not found', statusCode: 404 });
+      }
+      throw err;
     }
   });
 

@@ -37,9 +37,11 @@ Audio mixer with channel strips, aux buses, and groups.
 | `num_aux_buses` | integer | Number of aux buses, **non-live** |
 | `num_groups` | integer | Number of group buses, **non-live** |
 
-**Pads**:
+**Pads** (verified from live `GET /api/blocks` — authoritative):
 - Inputs: `input_1` … `input_{num_channels}` (1-indexed)
-- Outputs: `main_out`, `pfl_out`
+- Outputs: `main_out` (programme mix), `monitor_out` (headphone/PFL bus)
+
+**Note**: AUX and GRP buses are internal to the block; they have no external output pads and cannot be wired to downstream blocks. Only `main_out` and `monitor_out` are externally connectable. The previously documented `pfl_out` pad does not exist — the correct name is `monitor_out`.
 
 **Wiring note**: Set `num_channels` = number of SRT/EFP sources at activation. Wire each SRT source `audio_out_0` → `input_{N}` (1-indexed).
 
@@ -60,27 +62,55 @@ Receives an MPEG-TS stream over SRT.
 
 ## `builtin.mpegtssrt_output`
 
-Sends MPEG-TS program output over SRT.
+Sends MPEG-TS program output over SRT. Supports multiple audio tracks as separate PIDs in the transport stream. Auto-encodes raw audio to AAC.
 
 | Property | Type | Notes |
 |---|---|---|
 | `srt_uri` | string | Full SRT URI, e.g. `srt://:6000?mode=listener` |
+| `num_audio_tracks` | uint | Number of audio input tracks. Default 1 |
+| `num_video_tracks` | uint | Number of video input tracks. Default 1 |
+| `latency` | int (ms) | SRT latency. Default 125 |
 
-**Pads**: inputs `video_in`, `audio_in_0`
+**Pads** (verified from live `GET /api/blocks`):
+- Video input: `video_in` (V0)
+- Audio inputs: `audio_in_0` (A0), `audio_in_1` (A1) … one per track
+
+---
+
+## `builtin.efpsrt_output`
+
+Sends EFP-muxed audio/video over SRT. Supports multiple audio tracks.
+
+| Property | Type | Notes |
+|---|---|---|
+| `srt_uri` | string | Full SRT URI |
+| `num_audio_tracks` | uint | Number of audio input tracks. Default 1 |
+| `num_video_tracks` | uint | Number of video input tracks. Default 1 |
+| `latency` | int (ms) | SRT latency. Default 125 |
+
+**Pads** (verified from live `GET /api/blocks`):
+- Video input: `video_in` (V0)
+- Audio inputs: `audio_in_0` (A0), `audio_in_1` (A1) … one per track
 
 ---
 
 ## `builtin.whep_output`
 
-WebRTC WHEP output endpoint for browser playback.
+WebRTC WHEP output endpoint for browser playback. Supports multiple audio tracks — each track is a separate WebRTC audio track in the stream.
 
 | Property | Type | Notes |
 |---|---|---|
 | `endpoint_id` | string | Unique endpoint name; flow-generator appends a per-production suffix |
-| `mode` | string (enum) | `"video_only"`, `"audio_video"` |
-| `low_latency` | boolean | Enable low-latency mode (for multiview) |
+| `num_video_tracks` | uint | Number of video input tracks; 0 disables video. Default 1 |
+| `num_audio_tracks` | uint | Number of audio input tracks; 0 disables audio. Default 1 |
+| `ts_offset_ms` | int | Timestamp offset for playout timing (negative = earlier release) |
 
-**Pads**: inputs `video_in`, `audio_in` (when `mode == "audio_video"`)
+**Pads** (verified from live `GET /api/blocks`):
+- Video inputs: `video_in` (V0), `video_in_1` (V1) … for each video track
+- Audio inputs: `audio_in` (A0), `audio_in_1` (A1) … for each audio track
+- No outputs
+
+**Multi-track audio**: set `num_audio_tracks: 2` to carry programme + monitor bus on the same WHEP endpoint. Connect `main_out` (via loudness) → `audio_in`, `monitor_out` → `audio_in_1`.
 
 ---
 
@@ -117,6 +147,20 @@ Receives a WebRTC stream via WHIP protocol.
 | `endpoint_id` | string | Unique WHIP endpoint name |
 
 **Pads**: output `video_out`
+
+---
+
+## `builtin.loudness`
+
+EBU R128 loudness meter. Audio passes through unchanged — use as an in-line measurement tap.
+
+| Property | Type | Notes |
+|---|---|---|
+| `interval` | string (enum) | `"100"`, `"200"`, `"500"`, `"1000"` (ms) — **must be a string**, not a number |
+
+**Pads** (verified from live `GET /api/blocks`):
+- Input: `audio_in`
+- Output: `audio_out`
 
 ---
 

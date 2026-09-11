@@ -1,6 +1,49 @@
+[![Try on OSC](https://img.shields.io/badge/Try%20on-Open%20Source%20Cloud-blue)](https://openlive.apps.osaas.io)
+
 # open-live
 
-Central API server for the Open Live broadcast production platform. Built with Node.js, TypeScript, and Fastify. Persists data to CouchDB.
+Open Live is a cloud-native live broadcast production suite that replaces traditional hardware — vision mixers, audio consoles, and multiviewers — with a fully browser-based solution. This repository is the central API server. The browser-based production controller lives in [open-live-studio](https://github.com/Eyevinn/open-live-studio).
+
+## Try it on OSC
+
+The fastest way to try Open Live — no Kubernetes required.
+
+Visit **[openlive.apps.osaas.io](https://openlive.apps.osaas.io)** to spin up a managed Open Live instance on Open Source Cloud. Start for an event, tear down after. No infrastructure to manage and no monthly minimum.
+
+- 14-day free trial, free plan available
+- 15 EUR/month (self-hosted Strom) or 69 EUR/month (shared GPU in Frankfurt)
+
+The in-app **Create New Open Live** flow provisions CouchDB for you and generates its admin
+password automatically. You do not choose or handle that password yourself on this path.
+The `COUCHDB_URL` environment variable documented under [Environment variables](#environment-variables)
+below is only for a self-hosted deployment where you run CouchDB yourself; it does not apply
+to the managed OSC flow above.
+
+**Before you start, two things that are not obvious from the pricing line above:**
+
+- **Shared Strom (the 69 EUR/month option) requires the Professional plan or above.** If your
+  account is not eligible, the app shows this up front when you open the environment, not as a
+  failed submission after you try to create one.
+- **Your own ("BYO") Strom instance has no plan requirement, but its URL must be publicly
+  reachable.** A plain local-network or loopback address is rejected, and so is any address
+  that is not reachable from OSC, including a plain Tailscale or other mesh-VPN address in the
+  `100.64.0.0/10` range even though it clears the initial check. To expose a locally hosted
+  Strom instance without port-forwarding, use a public ingress feature such as
+  [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) (opt-in, off by default; also
+  implemented by self-hosted [Headscale](https://github.com/juanfont/headscale)), which gives
+  the instance a genuinely public `ts.net` hostname. On the free plan this path is metered by
+  your one-time token allowance rather than gated by plan, so budget for that if you are
+  testing rather than running on a paid plan.
+
+## Features
+
+- **Vision mixing** — cuts, auto transitions, DSK layers, picture-in-picture, graphics overlays, and fade-to-black
+- **Audio mixer** — per-channel faders with EBU R128 loudness metering
+- **Multiviewer** — sub-500ms WebRTC glass-to-glass latency
+- **Stream Deck control** — hardware button panel integration
+- **Up to 16 sources** per production
+- **REMI / remote production** — crews work from anywhere via browser; eliminates travel and equipment shipping
+- **Self-hostable** on any Kubernetes cluster, zero vendor lock-in
 
 ## Requirements
 
@@ -28,9 +71,32 @@ Copy `.env.example` to `.env` and fill in the values:
 | `CORS_ORIGIN` | Allowed CORS origin (URL of the studio frontend) | `http://localhost:5173` |
 | `STROM_URL` | Base URL of the Strom pipeline engine | `http://localhost:7000` |
 | `STROM_TOKEN` | OSC Personal Access Token for authenticating against an OSC-hosted Strom instance | _(empty — not needed for local Strom)_ |
+| `API_KEY` | Static API key protecting all `/api/v1` routes, the WebSocket controller, and the Swagger UI. **Required for any network-accessible deployment** (see below) | _(empty — routes unauthenticated)_ |
 | `LOG_LEVEL` | Fastify log level (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
 
 > **Never commit `.env`** — it is gitignored. Use `.env.example` as the reference.
+
+### API authentication
+
+All `/api/v1` routes, the WebSocket controller (`/ws/`), and the Swagger UI
+(`/documentation`) are protected by a static API key when `API_KEY` is set. Clients
+must send it as a bearer token:
+
+```
+Authorization: Bearer <API_KEY>
+```
+
+WebSocket clients pass the key via the `?key=<API_KEY>` query parameter on the upgrade
+request, since the browser WebSocket API does not support custom headers.
+
+> **`API_KEY` must be set for any network-accessible deployment.** When `API_KEY` is
+> unset, every API route is unauthenticated — any client that can reach the service can
+> create, modify, delete, and activate productions. The server **refuses to start** when
+> `NODE_ENV=production` and `API_KEY` is unset, and logs a prominent warning otherwise.
+> Leave it unset **only** when running behind a trusted external auth layer (e.g. the OSC
+> reverse proxy). The reference `docker-compose.yml` requires `API_KEY` to be set in your
+> `.env` before the stack will start — generate a strong random value with
+> `openssl rand -base64 32`.
 
 ### Strom authentication
 
@@ -73,9 +139,15 @@ pnpm start
 | `GET/PATCH/DELETE` | `/api/v1/templates/:id` | Get / update / delete a template |
 | `WS` | `/ws/productions/:id/controller` | WebSocket controller channel |
 
+The REST API is documented in `docs/openapi.yaml` (also served at `/documentation`). The
+WebSocket controller channel — its authentication, inbound message types, and outbound
+broadcasts — is documented separately in [`docs/controller-websocket.md`](docs/controller-websocket.md).
+
 ### Source model
 
 Sources represent individual video/audio feeds. Each source has a `streamType` (`srt` or `whip`) and an `address` (SRT URI or WHIP endpoint URL).
+
+SRT passphrases are embedded in the source `address` and encrypted at rest before being stored in CouchDB. For rotating a passphrase or responding to a suspected compromise, see the operator runbook in [`docs/srt-passphrase-rotation.md`](docs/srt-passphrase-rotation.md).
 
 ### Template model
 

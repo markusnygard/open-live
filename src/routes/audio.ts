@@ -7,7 +7,8 @@ import { config } from '../config.js';
 
 const AudioPatch = z.object({
   property: z.enum(['volume', 'mute']),
-  value: z.unknown(),
+  // volume: 0.0–10.0 (Strom mixer ceiling); mute: boolean
+  value: z.union([z.number().min(0).max(10), z.boolean()]),
 });
 
 const MIXER_BLOCK_TYPE = 'builtin.mixer';
@@ -48,13 +49,14 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
         );
         if (!mixerBlock) return reply.send([]);
 
-        const numChannels = typeof mixerBlock.properties?.num_channels === 'number'
-          ? mixerBlock.properties.num_channels as number
+        const rawNumCh = mixerBlock.properties?.num_channels;
+        const numChannels = typeof rawNumCh === 'number' ? rawNumCh as number
+          : typeof rawNumCh === 'string' ? parseInt(rawNumCh, 10)
           : 0;
-        if (numChannels === 0) return reply.send([]);
+        if (!numChannels || isNaN(numChannels)) return reply.send([]);
 
         // Build audio-channel-index → source name map.
-        // Audio channels are assigned to SRT/EFP/WHIP sources (not test or HTML),
+        // Audio channels are assigned to SRT/EFP/WHIP/HTML sources (not test),
         // in mixerInput order — matching the flow-generator audioChannelIndex logic exactly.
         // Virtual source IDs (__test1__, __test2__) are not in the sources DB and are
         // silently skipped via the catch block.
@@ -74,7 +76,6 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
           for (const assignment of sortedAssignments) {
             try {
               const src = VIRTUAL_SOURCES[assignment.sourceId] ?? await sourcesDb.get(assignment.sourceId);
-              if (src.streamType === 'html') continue;
               if (src.streamType === 'test1' || src.streamType === 'test2') continue;
               audioChannelNameMap.set(audioIdx, src.name);
               audioChannelMixerInputMap.set(audioIdx, assignment.mixerInput);

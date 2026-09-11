@@ -1,7 +1,10 @@
 import { randomUUID } from 'crypto';
-import type { ProductionDoc, SourceDoc, GraphicDoc, StromFlowTemplate, OutputDoc } from '../db/types.js';
-import { getSourcesDb, getTemplatesDb, getGraphicsDb } from '../db/index.js';
+import type { ProductionDoc, SourceDoc, GraphicDoc, OutputDoc } from '../db/types.js';
+import { getSourcesDb, getGraphicsDb } from '../db/index.js';
 import { StromClient, type CreateFlowRequest } from './strom.js';
+import { DEFAULT_FLOW, type FlowTopology } from './default-flow.js';
+import { decryptAddressPassphrase } from './srt-passphrase-crypto.js';
+import { safeFlowProjection } from './log-redact.js';
 
 /**
  * Generates a Strom flow from a template + source assignments,
@@ -14,15 +17,21 @@ export interface ActivationResult {
   flowId: string;
   mixerBlockId: string | null;
   audioMixerBlockId: string | null;
+  /** ID of the builtin.loudness block inserted after the audio mixer main_out — used by meter relay */
+  loudnessMainBlockId: string | null;
   whepOutputEntries?: Array<{ outputId: string; endpointId: string }>;
   pgmWhepEndpointId?: string;
+  /** WHEP endpoint ID for the mixer's monitor_out (headphone/monitor bus) — undefined if no audio mixer */
+  monitorWhepEndpointId?: string;
   /** Maps mixerInput (e.g. 'video_in_1') → time_offset block ID — so the WS layer can apply live offset changes */
   sourceOffsetBlockIds: Record<string, string>;
   /** Maps outputId → stromFlowId for output flows created during activation */
   outputFlowIds?: Record<string, string>;
+  /** Maps mixerInput → audio time_offset block ID (one per source with audio, keyed same as sourceOffsetBlockIds) */
+  sourceAudioOffsetBlockIds: Record<string, string>;
 }
 
-function findPgmFeedPad(flow: StromFlowTemplate['flow']): string | null {
+function findPgmFeedPad(flow: FlowTopology): string | null {
   // Find the format block that feeds the PGM encoder.
   // This block outputs raw NV12 video at PGM resolution, suitable for
   // raw video sinks (SDI/NDI outputs).
@@ -49,7 +58,7 @@ function findPgmFeedPad(flow: StromFlowTemplate['flow']): string | null {
 }
 
 function insertPreEncoderFormat(
-  flow: StromFlowTemplate['flow'],
+  flow: FlowTopology,
   endpointSuffix: string,
 ): void {
   const mixer = flow.blocks.find((b) =>
@@ -103,15 +112,6 @@ export async function activateStromFlow(
   outputDocs?: OutputDoc[],
   onBeforeStart?: (flowId: string) => Promise<void>,
 ): Promise<ActivationResult> {
-  if (!production.templateId) {
-    // Fall back to the default vision mixer template.
-    production.templateId = 'tmpl-default-vision-mixer';
-  }
-
-  // Load template
-  const templatesDb = getTemplatesDb();
-  const template = await templatesDb.get(production.templateId) as unknown as StromFlowTemplate;
-
   // Virtual source IDs for test streams — no DB lookup needed
   const VIRTUAL_SOURCES: Record<string, Pick<SourceDoc, 'streamType' | 'address' | 'name'>> = {
     'Whip': { streamType: 'whip', address: '', name: 'WHIP Input' },
@@ -119,17 +119,25 @@ export async function activateStromFlow(
     '__test2__': { streamType: 'test2', address: '', name: 'Test - Colors' },
   };
 
-  // Load all assigned real sources
+  // Load all assigned real sources — skip any whose source doc no longer exists
+  // (e.g. source was deleted while assigned to this production).
   const sourcesDb = getSourcesDb();
   const sourceMap = new Map<string, SourceDoc>();
   for (const assignment of production.sources) {
     if (assignment.sourceId in VIRTUAL_SOURCES) continue;
-    const src = await sourcesDb.get(assignment.sourceId) as unknown as SourceDoc;
-    sourceMap.set(assignment.sourceId, src);
+    try {
+      const src = await sourcesDb.get(assignment.sourceId) as unknown as SourceDoc;
+      // Decrypt the at-rest SRT passphrase so Strom receives a usable srt_uri.
+      // Legacy plaintext addresses pass through unchanged (issue #160).
+      src.address = decryptAddressPassphrase(src.address);
+      sourceMap.set(assignment.sourceId, src);
+    } catch {
+      console.warn(`[flow-generator] Source ${assignment.sourceId} (${assignment.mixerInput}) not found — skipping`);
+    }
   }
 
-  // Deep-clone the template flow so we don't mutate the stored template
-  const flow = JSON.parse(JSON.stringify(template.flow)) as StromFlowTemplate['flow'];
+  // Deep-clone the default flow so we don't mutate the module-level constant
+  const flow = JSON.parse(JSON.stringify(DEFAULT_FLOW)) as FlowTopology;
 
   // Derive a per-production suffix from the production ID so that WHEP endpoint
   // names and SRT output ports are unique — multiple productions can run
@@ -177,10 +185,29 @@ export async function activateStromFlow(
   })();
 
   const pgmBitrate = typeof production.values?.bitrate === 'number' ? production.values.bitrate : undefined;
+  const multiviewBitrate = typeof production.values?.multiview_bitrate === 'number' ? production.values.multiview_bitrate : undefined;
   const pgmFramerate = typeof production.values?.pgm_framerate === 'string' ? production.values.pgm_framerate : undefined;
   const multiviewResolution = typeof production.values?.multiview_resolution === 'string' ? production.values.multiview_resolution : undefined;
   const multiviewFramerate = typeof production.values?.multiview_framerate === 'string' ? production.values.multiview_framerate : undefined;
-  const numPips = production.values?.num_pips !== undefined ? String(production.values.num_pips) : undefined;
+  const numAuxBuses = (() => {
+    const v = production.values?.num_aux_buses;
+    if (typeof v === 'number') return v;
+    if (typeof v === 'string') { const n = parseInt(v, 10); return isNaN(n) ? undefined : n; }
+    return undefined;
+  })();
+  const numGroups = (() => {
+    const v = production.values?.num_groups;
+    if (typeof v === 'number') return v;
+    if (typeof v === 'string') { const n = parseInt(v, 10); return isNaN(n) ? undefined : n; }
+    return undefined;
+  })();
+  const mixLatency = (() => {
+    const v = production.values?.mix_latency;
+    if (typeof v === 'number' && Number.isFinite(v)) return Math.max(0, Math.round(v));
+    if (typeof v === 'string') { const n = parseInt(v, 10); return isNaN(n) ? 100 : Math.max(0, n); }
+    return 100;
+  })();
+  const clockType = typeof production.values?.clock === 'string' && production.values.clock !== '' ? production.values.clock : undefined;
 
   for (const block of flow.blocks) {
     const b = block as Record<string, unknown>;
@@ -188,10 +215,13 @@ export async function activateStromFlow(
 
     if (b['block_definition_id'] === 'builtin.vision_mixer') {
       props['pgm_resolution'] = pgmResolution;
+      // num_inputs and input labels are set after source assignment is known (see below).
       if (pgmFramerate !== undefined) props['pgm_framerate'] = pgmFramerate;
       if (multiviewResolution !== undefined) props['multiview_resolution'] = multiviewResolution;
       if (multiviewFramerate !== undefined) props['multiview_framerate'] = multiviewFramerate;
-      if (numPips !== undefined) props['num_pips'] = numPips;
+      // swap_pvw_pgm (PR #637): non-live property — only applied at pipeline build time.
+      const swapPvwPgm = production.values?.swap_pvw_pgm === true || production.values?.swap_pvw_pgm === 'true';
+      if (swapPvwPgm) props['swap_pvw_pgm'] = true;
       b['properties'] = props;
     }
 
@@ -200,11 +230,22 @@ export async function activateStromFlow(
       b['properties'] = props;
     }
 
-    if (b['block_definition_id'] === 'builtin.videoenc' && pgmBitrate !== undefined) {
-      if ((b['name'] as string | undefined) === 'Enc PGM') {
+    if (b['block_definition_id'] === 'builtin.videoenc') {
+      const name = b['name'] as string | undefined;
+      if (name === 'Enc PGM' && pgmBitrate !== undefined) {
         props['bitrate'] = pgmBitrate;
         b['properties'] = props;
       }
+      if (name === 'Enc MV' && multiviewBitrate !== undefined) {
+        props['bitrate'] = multiviewBitrate;
+        b['properties'] = props;
+      }
+    }
+
+    if (b['block_definition_id'] === 'builtin.mixer') {
+      if (numAuxBuses !== undefined) props['num_aux_buses'] = numAuxBuses;
+      if (numGroups !== undefined) props['num_groups'] = numGroups;
+      b['properties'] = props;
     }
 
     // Uniquify WHEP endpoint_ids per production so concurrent productions don't
@@ -275,19 +316,49 @@ export async function activateStromFlow(
   ) as Record<string, unknown> | undefined;
   const audioMixerBlockId = typeof audioMixerBlock?.['id'] === 'string' ? audioMixerBlock['id'] : null;
 
-  // Re-wire all WHEP outputs to the audio mixer main_out (AFV-controlled program mix).
-  // AUX 1 / AUX 2 are independent monitor buses routed to their own aux_out pads —
-  // they are not exposed via WHEP (Strom's whepserversink only supports a single
-  // audio track). When Strom adds multi-track WHEP, route aux buses as separate tracks.
-  if (audioMixerBlockId) {
-    for (const block of flow.blocks) {
-      const b = block as Record<string, unknown>;
-      if (b['block_definition_id'] !== 'builtin.whep_output') continue;
-      const whepId = b['id'] as string;
-      flow.links = (flow.links as Array<Record<string, unknown>>).filter(
-        (l) => !((l['to'] as string | undefined) ?? '').startsWith(`${whepId}:audio`),
-      );
-      flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${whepId}:audio_in` });
+  // Inject a builtin.loudness block as a parallel tap on the audio mixer main_out.
+  // The loudness block is NOT in series — main audio flows directly to all consumers.
+  // loudness:audio_out drains into a raw fakesink element so Strom doesn't stall.
+  // The block is pushed to flow.blocks after the output loop so its y position
+  // lands below the output/encoder blocks in the same Strom GUI column.
+  let loudnessMainBlockId: string | null = null;
+  const ebuMainEnabled = production.values?.ebu_main === true;
+  if (audioMixerBlockId && ebuMainEnabled) {
+    loudnessMainBlockId = `b-loudness-main-${endpointSuffix}`;
+  }
+  // Main audio goes directly from the mixer — loudness is a side tap, not in the chain.
+  const mainAudioSource = audioMixerBlockId ? `${audioMixerBlockId}:main_out` : null;
+
+  // Wire all template WHEP outputs:
+  //   audio_in   (track 0) ← main programme mix
+  //   audio_in_1 (track 1) ← monitor_out (headphone/monitor bus) when audio mixer present
+  // num_audio_tracks=2 creates the second audio input pad on the WHEP output block.
+  const monitorAudioSource = audioMixerBlockId ? `${audioMixerBlockId}:monitor_out` : null;
+  for (const block of flow.blocks) {
+    const b = block as Record<string, unknown>;
+    if (b['block_definition_id'] !== 'builtin.whep_output') continue;
+    const whepId = b['id'] as string;
+    const props = ((b['properties'] ?? {}) as Record<string, unknown>);
+    // Remove any existing audio links to this block — we rebuild them below.
+    flow.links = (flow.links as Array<Record<string, unknown>>).filter(
+      (l) => !((l['to'] as string | undefined) ?? '').startsWith(`${whepId}:audio`),
+    );
+    if (mainAudioSource) {
+      const auxCount = numAuxBuses ?? 0;
+      props['num_audio_tracks'] = 1 + (monitorAudioSource ? 1 : 0) + auxCount;
+      b['properties'] = props;
+      flow.links.push({ from: mainAudioSource, to: `${whepId}:audio_in` });
+      let audioTrack = 1;
+      if (monitorAudioSource) {
+        flow.links.push({ from: monitorAudioSource, to: `${whepId}:audio_in_${audioTrack}` });
+        audioTrack++;
+      }
+      for (let i = 1; i <= auxCount; i++) {
+        if (audioMixerBlockId) {
+          flow.links.push({ from: `${audioMixerBlockId}:aux_out_${i}`, to: `${whepId}:audio_in_${audioTrack}` });
+          audioTrack++;
+        }
+      }
     }
   }
 
@@ -347,11 +418,22 @@ export async function activateStromFlow(
   // Allowed values: 2, 4, 6, 8, 10 (non-live property — must be set at creation).
   // Also set input_{N}_label for each assigned source so Strom renders the name
   // in the multiview overlay (verified: property format from strom/backend/src/blocks/builtin/vision_mixer/properties.rs).
-  if (mixerBlock && mixerBlockId) {
-    const numInputs = Math.max(2, sortedAssignments.length);
-    const props = (mixerBlock['properties'] ?? {}) as Record<string, unknown>;
-    props['num_inputs'] = numInputs;
+  const numSourceInputs = Math.max(2, sortedAssignments.length);
 
+  if (mixerBlock && mixerBlockId) {
+    // num_inputs = real sources only, rounded up to Strom's allowed range (2..16).
+    // PiPs are a separate first-class concept in Strom 0.5+ — set via num_pips, NOT
+    // by expanding num_inputs. max num_inputs is 16 per Strom's MAX_NUM_INPUTS constant.
+    const numTotalInputs = Math.max(2, Math.min(16, numSourceInputs));
+    const props = (mixerBlock['properties'] ?? {}) as Record<string, unknown>;
+    props['num_inputs'] = String(numTotalInputs);
+
+    // num_pips: 0–4 (Strom MAX_NUM_PIPS = 4, DEFAULT_NUM_PIPS = 0).
+    // Taken directly from production config — validated against the max at runtime by Strom.
+    const configuredPips = Number(production.values?.num_pips ?? 0);
+    props['num_pips'] = String(Math.min(4, Math.max(0, configuredPips)));
+
+    // Label source inputs
     for (const assignment of sortedAssignments) {
       const padMatch = /video_in_(\d+)$/.exec(assignment.mixerInput);
       if (!padMatch) continue;
@@ -365,19 +447,34 @@ export async function activateStromFlow(
     mixerBlock['properties'] = props;
   }
 
-  // Set num_channels on the audio mixer = number of SRT/EFP/WHIP sources
-  // (test1/test2/html sources don't carry audio in this template).
-  // num_channels is a Strom enum: valid values are 2, 4, 8, 12, 16, 24, 32.
-  // Round up to the nearest valid value; never set it below 2.
+  // Set num_channels on the audio mixer = number of audio-bearing sources.
+  // test1/test2 sources get a silent audiotestsrc below, so they count here too.
+  // num_channels is a UInt — set it to exactly the number of audio-bearing sources.
   if (audioMixerBlock) {
-    const ALLOWED_CHANNEL_COUNTS = [2, 4, 8, 12, 16, 24, 32];
-    const srtEfpCount = sortedAssignments.filter((a) => {
+    const audioSourceCount = sortedAssignments.filter((a) => {
       const src = sourceMap.get(a.sourceId) ?? (VIRTUAL_SOURCES[a.sourceId] as SourceDoc | undefined);
-      return src && src.streamType !== 'test1' && src.streamType !== 'test2' && src.streamType !== 'html';
+      return src != null;
     }).length;
-    const numChannels = ALLOWED_CHANNEL_COUNTS.find((n) => n >= srtEfpCount) ?? 32;
+    const numChannels = Math.max(1, audioSourceCount);
     const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
     props['num_channels'] = numChannels;
+    // ch{N}_aux{M}_pre is a build-time topology property — must be set here at flow
+    // generation time; attempts to change it on a running pipeline are rejected by Strom.
+    // Per-bus setting: aux1_pre, aux2_pre, … (boolean, default true = pre-fader).
+    // Falls back to the legacy aux_pre_fader key for older productions.
+    if (typeof numAuxBuses === 'number' && numAuxBuses > 0) {
+      const legacyPre = production.values?.aux_pre_fader;
+      for (let aux = 1; aux <= numAuxBuses; aux++) {
+        const perBusKey = `aux${aux}_pre`;
+        const perBusValue = production.values?.[perBusKey];
+        const isPre = typeof perBusValue === 'boolean' ? perBusValue
+          : typeof legacyPre === 'boolean' ? legacyPre
+          : true; // default pre-fader
+        for (let ch = 1; ch <= numChannels; ch++) {
+          props[`ch${ch}_aux${aux}_pre`] = isPre;
+        }
+      }
+    }
     audioMixerBlock['properties'] = props;
   }
 
@@ -392,13 +489,13 @@ export async function activateStromFlow(
 
   if (mixerBlock) {
     const props = (mixerBlock['properties'] ?? {}) as Record<string, unknown>;
-    props['latency'] = 100;
+    props['latency'] = mixLatency;
     props['min_upstream_latency'] = maxSourceLatency;
     mixerBlock['properties'] = props;
   }
   if (audioMixerBlock) {
     const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
-    props['latency'] = 100;
+    props['latency'] = mixLatency;
     props['min_upstream_latency'] = maxSourceLatency;
     audioMixerBlock['properties'] = props;
   }
@@ -413,6 +510,7 @@ export async function activateStromFlow(
 
   // Maps mixerInput → time_offset block ID — returned so the WS layer can apply live changes.
   const sourceOffsetBlockIds: Record<string, string> = {};
+  const sourceAudioOffsetBlockIds: Record<string, string> = {};
 
   for (const assignment of sortedAssignments) {
     const padMatch = /video_in_(\d+)$/.exec(assignment.mixerInput);
@@ -441,8 +539,11 @@ export async function activateStromFlow(
 
     const TEST_PATTERNS: Record<string, string> = { test1: 'Pinwheel', test2: 'Colors' }
     if (source.streamType === 'test1' || source.streamType === 'test2') {
+      const audioChannel = audioChannelIndex++;
       const elemId = `e-test-${padIndex}-${endpointSuffix}`;
       const fmtId = `b-fmt-${padIndex}-${endpointSuffix}`;
+      const audioElemId = `e-test-audio-${padIndex}-${endpointSuffix}`;
+      const audioOffsetId = `b-audio-offset-${padIndex}-${endpointSuffix}`;
       flow.elements.push({
         id: elemId,
         element_type: 'videotestsrc',
@@ -460,18 +561,74 @@ export async function activateStromFlow(
         { from: `${elemId}:src`, to: `${fmtId}:video_in` },
         { from: `${fmtId}:video_out`, to: `${offsetId}:in` },
       );
+      // Add a silent audio branch so every test pattern has a linked audio producer.
+      // Without this, the audio mixer ends up with channels that have no source,
+      // causing the aggregator to stall waiting for buffers that never arrive.
+      flow.elements.push({
+        id: audioElemId,
+        element_type: 'audiotestsrc',
+        properties: { wave: 'silence', 'is-live': true },
+        position: [COL_ELEM, yPos - 80],
+      });
+      flow.blocks.push({
+        id: audioOffsetId,
+        block_definition_id: 'builtin.time_offset',
+        name: `Offset A${padIndex}`,
+        properties: { offset_ms: 0.0 },
+        position: { x: COL_OFFSET, y: yPos - 80 },
+      });
+      sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
+      flow.links.push({ from: `${audioElemId}:src`, to: `${audioOffsetId}:in` });
+      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      if (audioMixerBlock && audioMixerBlockId) {
+        flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
+        if (source.name) {
+          const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
+          props[`ch${audioChannel + 1}_label`] = source.name;
+          audioMixerBlock['properties'] = props;
+        }
+      }
     } else if (source.streamType === 'html') {
+      const audioChannel = audioChannelIndex++;
       const elemId = `e-html-${padIndex}-${endpointSuffix}`;
+      const demuxId = `e-cefdemux-${padIndex}-${endpointSuffix}`;
       flow.elements.push({
         id: elemId,
         element_type: 'cefsrc',
         properties: { url: source.address },
         position: [COL_ELEM, yPos],
       });
-      // Connect directly to offset block — same pattern as before but via offset.
+      flow.elements.push({
+        id: demuxId,
+        element_type: 'cefdemux',
+        properties: {},
+        position: [COL_INPUT, yPos],
+      });
+      // cefsrc:src → cefdemux:sink; cefdemux splits into video and audio pads.
       // Skipping builtin.videoformat avoids autovideoconvert trying to use GL,
       // which conflicts with cefsrc's X11/Xvfb rendering context on GPU hosts.
-      flow.links.push({ from: `${elemId}:src`, to: `${offsetId}:in` });
+      flow.links.push({ from: `${elemId}:src`, to: `${demuxId}:sink` });
+      flow.links.push({ from: `${demuxId}:video`, to: `${offsetId}:in` });
+      const audioOffsetId = `b-audio-offset-${padIndex}-${endpointSuffix}`;
+      flow.blocks.push({
+        id: audioOffsetId,
+        block_definition_id: 'builtin.time_offset',
+        name: `Offset A${padIndex}`,
+        properties: { offset_ms: 0.0 },
+        position: { x: COL_OFFSET, y: yPos - 80 },
+      });
+      sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
+      flow.links.push({ from: `${demuxId}:audio`, to: `${audioOffsetId}:in` });
+      // Audio to vision mixer and audio mixer both come from the delay block.
+      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      if (audioMixerBlock && audioMixerBlockId) {
+        flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
+        if (source.name) {
+          const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
+          props[`ch${audioChannel + 1}_label`] = source.name;
+          audioMixerBlock['properties'] = props;
+        }
+      }
     } else if (source.streamType === 'whip') {
       const audioChannel = audioChannelIndex++;
       const endpointId = `whip-${padIndex}-${endpointSuffix}`;
@@ -483,9 +640,19 @@ export async function activateStromFlow(
         position: { x: COL_INPUT, y: yPos },
       });
       flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
-      flow.links.push({ from: `${inputId}:audio_out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      const audioOffsetIdWhip = `b-audio-offset-${padIndex}-${endpointSuffix}`;
+      flow.blocks.push({
+        id: audioOffsetIdWhip,
+        block_definition_id: 'builtin.time_offset',
+        name: `Offset A${padIndex}`,
+        properties: { offset_ms: 0.0 },
+        position: { x: COL_OFFSET, y: yPos + 80 },
+      });
+      sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetIdWhip;
+      flow.links.push({ from: `${inputId}:audio_out`, to: `${audioOffsetIdWhip}:in` });
+      flow.links.push({ from: `${audioOffsetIdWhip}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
       if (audioMixerBlock && audioMixerBlockId) {
-        flow.links.push({ from: `${inputId}:audio_out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
+        flow.links.push({ from: `${audioOffsetIdWhip}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
         if (source.name) {
           const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
           props[`ch${audioChannel + 1}_label`] = source.name;
@@ -595,13 +762,21 @@ export async function activateStromFlow(
         position: { x: COL_INPUT, y: yPos },
       });
       flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
-      // Wire audio:
-      //  - Vision mixer: audio_in_N must match the video pad index N so the mixer
-      //    correlates audio with the correct video source (a3 for video_in_3, etc.).
-      //  - Audio mixer: sequential 1-indexed inputs (it doesn't know about video pads).
-      flow.links.push({ from: `${inputId}:audio_out_0`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      // Audio goes via the delay block to both vision mixer and audio mixer so
+      // operators can trim lipsync and vision mixer audio stays in sync.
+      const audioOffsetId = `b-audio-offset-${padIndex}-${endpointSuffix}`;
+      flow.blocks.push({
+        id: audioOffsetId,
+        block_definition_id: 'builtin.time_offset',
+        name: `Offset A${padIndex}`,
+        properties: { offset_ms: 0.0 },
+        position: { x: COL_OFFSET, y: yPos + 80 },
+      });
+      sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
+      flow.links.push({ from: `${inputId}:audio_out_0`, to: `${audioOffsetId}:in` });
+      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
       if (audioMixerBlock && audioMixerBlockId) {
-        flow.links.push({ from: `${inputId}:audio_out_0`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
+        flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
         if (source.name) {
           const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
           props[`ch${audioChannel + 1}_label`] = source.name;
@@ -680,8 +855,14 @@ export async function activateStromFlow(
         properties: { url: graphic.url },
         position: [COL_ELEM, dskY],
       });
+      // Resolution only — deliberately no framerate. cefsrc advertises
+      // framerate=0/1 (variable), and builtin.videoformat is
+      // videoscale -> videoconvert -> capsfilter with no videorate, so pinning
+      // a fixed framerate here cannot be satisfied: the capsfilter fails to
+      // negotiate, cefsrc's task pauses on not-negotiated, and the DSK renders
+      // nothing at all. The source-side format blocks above already pass
+      // resolution only. The mixer still emits pgm_framerate downstream.
       const fmtProps: Record<string, unknown> = { resolution: pgmResolution };
-      if (pgmFramerate !== undefined) fmtProps['framerate'] = pgmFramerate;
       flow.blocks.push({
         id: fmtId,
         block_definition_id: 'builtin.videoformat',
@@ -805,16 +986,32 @@ export async function activateStromFlow(
       const blockId = `b-out-${idSlug}-${endpointSuffix}`;
       if (outputDoc.outputType === 'whep') {
         const endpointId = `whep-out-${idSlug}-${endpointSuffix}`;
+        const auxCount = numAuxBuses ?? 0;
         flow.blocks.push({
           id: blockId,
           block_definition_id: 'builtin.whep_output',
           name: outputDoc.name,
-          properties: { endpoint_id: endpointId, mode: 'audio_video' },
+          properties: {
+            endpoint_id: endpointId,
+            ...(mainAudioSource && { num_audio_tracks: 1 + (monitorAudioSource ? 1 : 0) + auxCount }),
+          },
           position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
         });
         if (pgmFeedPad) flow.links.push({ from: pgmFeedPad, to: `${blockId}:video_in` });
-        // Wire audio from the audio mixer main_out — required for audio_video mode
-        if (audioMixerBlockId) flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${blockId}:audio_in` });
+        if (mainAudioSource) {
+          flow.links.push({ from: mainAudioSource, to: `${blockId}:audio_in` });
+          let audioTrack = 1;
+          if (monitorAudioSource) {
+            flow.links.push({ from: monitorAudioSource, to: `${blockId}:audio_in_${audioTrack}` });
+            audioTrack++;
+          }
+          for (let i = 1; i <= auxCount; i++) {
+            if (audioMixerBlockId) {
+              flow.links.push({ from: `${audioMixerBlockId}:aux_out_${i}`, to: `${blockId}:audio_in_${audioTrack}` });
+              audioTrack++;
+            }
+          }
+        }
         whepOutputEntries.push({ outputId: outputDoc._id, endpointId });
         outputBlockIndex++;
       } else if (outputDoc.outputType === 'ndi') {
@@ -846,6 +1043,58 @@ export async function activateStromFlow(
     }
   }
 
+  // Compute encoder block positions — shared by loudness block and group drain placement.
+  const encBlocks = flow.blocks.filter(
+    (b) => (b as Record<string, unknown>)['block_definition_id'] === 'builtin.videoenc',
+  ) as Record<string, unknown>[];
+  const encX = encBlocks.length > 0
+    ? (encBlocks[0]!['position'] as { x: number; y: number }).x
+    : COL_OUTPUT;
+  const maxEncY = encBlocks.reduce((max, b) => {
+    const y = (b['position'] as { x: number; y: number }).y;
+    return y > max ? y : max;
+  }, ROW_START);
+
+  // Loudness block — parallel tap, NOT in series. Placed below the video encoders.
+  // mixer:main_out → loudness:audio_in → loudness:audio_out → fakesink (drain).
+  if (loudnessMainBlockId && audioMixerBlockId) {
+    flow.blocks.push({
+      id: loudnessMainBlockId,
+      block_definition_id: 'builtin.loudness',
+      name: 'Main Loudness',
+      properties: { interval: '100' },
+      position: { x: encX, y: maxEncY + ROW_H },
+    });
+    const fakesinkId = `e-loudness-sink-${endpointSuffix}`;
+    flow.elements.push({
+      id: fakesinkId,
+      element_type: 'fakesink',
+      properties: { sync: false },
+      position: [encX, maxEncY + ROW_H * 2],
+    } as unknown as typeof flow.elements[number]);
+    flow.links.push({ from: `${audioMixerBlockId}:main_out`, to: `${loudnessMainBlockId}:audio_in` });
+    flow.links.push({ from: `${loudnessMainBlockId}:audio_out`, to: `${fakesinkId}:sink` });
+  }
+
+  // Group output drains — must be wired regardless of whether EBU metering is enabled.
+  // Strom crashes at pipeline startup (502) if any group_out_N pad is left unconnected.
+  if (audioMixerBlockId && numGroups && numGroups > 0) {
+    // Place drains below the loudness block if present, otherwise below the encoders.
+    const drainBaseY = maxEncY + ROW_H * (loudnessMainBlockId ? 3 : 2);
+    for (let i = 1; i <= numGroups; i++) {
+      const drainId = `e-grp-drain-${i}-${endpointSuffix}`;
+      flow.elements.push({
+        id: drainId,
+        element_type: 'fakesink',
+        // async: false — this drain may never receive a buffer (group bus with
+        // nothing routed to it), so it must not block pipeline preroll.
+        properties: { sync: false, async: false },
+        position: [encX, drainBaseY + ROW_H * (i - 1)],
+      } as unknown as typeof flow.elements[number]);
+      flow.links.push({ from: `${audioMixerBlockId}:group_out_${i}`, to: `${drainId}:sink` });
+    }
+  }
+
   // POST /api/flows takes the full Flow struct. The server requires 'id' in the
   // body but overwrites it with a new UUID — always use created.flow.id for
   // all subsequent calls.
@@ -856,6 +1105,7 @@ export async function activateStromFlow(
     properties: {
       description: `prod:${production._id}`,
       ephemeral: true,
+      ...(clockType ? { clock_type: clockType } : {}),
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     elements: flow.elements as any,
@@ -872,9 +1122,10 @@ export async function activateStromFlow(
   try {
     await strom.flows.start(flowId);
   } catch (err) {
-    // Log the full flow JSON so we can see what topology failed at GStreamer READY
-    console.error('[flow-generator] Flow start failed. Generated flow JSON:',
-      JSON.stringify({ blocks: flow.blocks, links: flow.links, elements: flow.elements }, null, 2));
+    // Log a sanitized flow projection — never log block properties (may contain SRT URIs, tokens, passphrases)
+    const safeFlow = safeFlowProjection(flow as unknown as Record<string, unknown>);
+    console.error('[flow-generator] Flow start failed. Flow topology (properties redacted):',
+      JSON.stringify(safeFlow, null, 2));
     // Start failed — clean up the created flow so the endpoint isn't left registered
     try {
       await strom.flows.delete(flowId);
@@ -893,7 +1144,7 @@ export async function activateStromFlow(
     );
   }
 
-  return { flowId, mixerBlockId, audioMixerBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined, pgmWhepEndpointId, sourceOffsetBlockIds, outputFlowIds };
+  return { flowId, mixerBlockId, audioMixerBlockId, loudnessMainBlockId, whepOutputEntries: whepOutputEntries.length > 0 ? whepOutputEntries : undefined, pgmWhepEndpointId, sourceOffsetBlockIds, sourceAudioOffsetBlockIds, outputFlowIds };
 }
 
 // ---------------------------------------------------------------------------
